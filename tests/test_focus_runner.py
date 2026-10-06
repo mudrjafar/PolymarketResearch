@@ -172,3 +172,14 @@ def test_corrupt_persisted_focus_state_fails_closed(monkeypatch, tmp_path):
 
     assert paths["state"].read_text(encoding="utf-8") == "{not-json"
     assert not paths["events"].exists()
+
+
+def test_main_runtime_keeps_risk_and_focus_as_separate_ordered_workers():
+    import run_machine
+
+    names = [name for name, _ in run_machine.SERVICES]
+    assert names.index("diamond") < names.index("risk") < names.index("focus") < names.index("telegram")
+
+    commands = dict(run_machine.SERVICES)
+    assert any("risk_worker.py" in str(part) for part in commands["risk"])
+    assert any("focus_runner.py" in str(part) for part in commands["focus"])
