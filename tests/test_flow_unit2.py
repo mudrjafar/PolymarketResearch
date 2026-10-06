@@ -81,6 +81,25 @@ def test_v4_missing_log_index_does_not_affect_flow():
     assert result["total_volume"] == 0.0
 
 
+def test_v4_noncanonical_transaction_hash_is_rejected_before_flow():
+    now = datetime.now(timezone.utc)
+    invalid_hashes = (
+        "0xa",
+        "0xabc",
+        "ab" * 32,
+        "0x" + "ab" * 31,
+        "0x" + "ab" * 33,
+        "0x" + "ag" * 32,
+    )
+    for transaction_hash in invalid_hashes:
+        row = _canonical_v4(now, transaction_hash=transaction_hash)
+        assert flow.evidence_identity(row) is None
+        assert flow.is_flow_eligible_trade(row) is False
+        result = flow.analyze_flow([row], now, "5m")
+        assert result["trade_count"] == 0
+        assert result["total_volume"] == 0.0
+
+
 def test_v4_missing_block_timestamp_does_not_use_detected_at():
     now = datetime.now(timezone.utc)
     row = _canonical_v4(now, detected_at=now.isoformat())
@@ -122,8 +141,8 @@ def test_v4_future_timestamp_does_not_enter_window():
 def test_canonical_v4_rows_keep_existing_flow_math():
     now = datetime.now(timezone.utc)
     rows = [
-        _canonical_v4(now, transaction_hash="0xa", log_index=1, block=101, trade_usd=100.0, side_label="BUY"),
-        _canonical_v4(now, transaction_hash="0xb", log_index=2, block=102, trade_usd=40.0, side_label="SELL"),
+        _canonical_v4(now, transaction_hash="0x" + "aa" * 32, log_index=1, block=101, trade_usd=100.0, side_label="BUY"),
+        _canonical_v4(now, transaction_hash="0x" + "bb" * 32, log_index=2, block=102, trade_usd=40.0, side_label="SELL"),
     ]
     result = flow.analyze_flow(rows, now, "5m")
     assert result["trade_count"] == 2
