@@ -310,6 +310,23 @@ def test_evidence_never_crosses_between_yes_and_no_tokens(pipeline):
 # 3. EVIDENCE ADVANCES ONLY WITH NEW CONFIRMING TRADES
 # ============================================================
 
+def test_confirmation_b_replaces_entire_evidence_triple_from_same_event(pipeline):
+    rows = [pipeline.trade(n) for n in range(10)]
+    pipeline.add(*rows)
+    first = pipeline.run_cycle()[TOKEN_YES]
+    assert_evidence_from(first, rows[-1])
+
+    confirmation_b = pipeline.trade(10)
+    pipeline.add(confirmation_b)
+    second = pipeline.run_cycle()[TOKEN_YES]
+
+    assert_evidence_from(second, confirmation_b)
+    assert second["evidence_at"] == confirmation_b["block_timestamp"]
+    assert second["evidence_id"] != first["evidence_id"]
+    assert second["evidence_cursor"] != first["evidence_cursor"]
+    assert second["evidence_at"] != first["evidence_at"]
+
+
 def test_evidence_advances_only_with_new_confirming_trades(pipeline):
     rows = [pipeline.trade(n) for n in range(10)]
     pipeline.add(*rows)
