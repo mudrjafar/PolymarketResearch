@@ -34,6 +34,7 @@ NEUTRAL_CODES = frozenset({
     "STALE_DIAMOND",
     "STALE_TRADE",
     "STALE_FLOW",
+    "STALE_FLOW_TRADE",
     "FLOW_MISSING",
 })
 
@@ -58,13 +59,6 @@ def new_state():
 
 def _text(value):
     return "" if value is None else str(value).strip()
-
-
-def _score(candidate):
-    try:
-        return float(candidate.get("score") or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
 
 
 def _parse_time(value):
@@ -181,7 +175,6 @@ def _snapshot(candidate):
         "question": candidate.get("question"),
         "direction": _text(candidate.get("direction")).upper(),
         "price": candidate.get("price"),
-        "score": _score(candidate),
     }
 
 
@@ -255,8 +248,13 @@ def _eligible(candidate, state):
 
 
 def _best_candidate(candidates, state, exclude_token=None):
-    eligible = []
+    """
+    Return the first eligible candidate in upstream order.
 
+    Risk deliberately does not create a Focus score. Its results preserve the
+    authoritative Diamond V3 ranking, so Focus must not re-rank or synthesize
+    a numeric score.
+    """
     for candidate in candidates:
         token_id = _text(candidate.get("token_id"))
 
@@ -264,21 +262,9 @@ def _best_candidate(candidates, state, exclude_token=None):
             continue
 
         if _eligible(candidate, state):
-            eligible.append(candidate)
+            return candidate
 
-    if not eligible:
-        return None
-
-    # Highest score wins.
-    # Tie -> token_id ascending.
-    eligible.sort(
-        key=lambda candidate: (
-            -_score(candidate),
-            _text(candidate.get("token_id")),
-        )
-    )
-
-    return eligible[0]
+    return None
 
 
 def _build_current_by_token(candidates):
@@ -354,7 +340,6 @@ def _lock(state, candidate, now):
         "absent_since": None,
 
         "price_at_lock": candidate.get("price"),
-        "score_at_lock": _score(candidate),
     })
 
     state["focus"] = focus
@@ -673,7 +658,6 @@ def step(state, candidates, now=None):
     focus["fresh_silence_seconds"] = 0.0
 
     focus["price"] = current.get("price")
-    focus["score"] = _score(current)
 
     # ========================================================
     # PASS
@@ -861,7 +845,7 @@ def self_test():
     )
 
     # --------------------------------------------------------
-    # 1. Lock strongest candidate
+    # 1. Lock first eligible upstream candidate
     # --------------------------------------------------------
 
     state, events = step(
@@ -1003,7 +987,7 @@ def self_test():
     assert events[-1]["type"] == "READY"
 
     # --------------------------------------------------------
-    # 8. Stronger B cannot steal Focus
+    # 8. B cannot steal active Focus
     # --------------------------------------------------------
 
     state, events = step(
