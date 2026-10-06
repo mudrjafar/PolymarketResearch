@@ -22,7 +22,7 @@ def _canonical_v4(now=None, **overrides):
         "condition_id": "condition",
         "token_id": "yes-token",
         "outcome": "Yes",
-        "transaction_hash": "0xabc",
+        "transaction_hash": "0x" + "ab" * 32,
         "log_index": 4,
         "block": 123,
         "block_timestamp": now.isoformat(),
@@ -31,6 +31,35 @@ def _canonical_v4(now=None, **overrides):
     }
     row.update(overrides)
     return row
+
+
+def test_collector_version_contract_fails_closed_for_unknown_future_versions():
+    now = datetime.now(timezone.utc)
+
+    assert flow.is_flow_eligible_trade(_canonical_v4(now)) is True
+
+    for version in (5, 999, 2, "4", "future", True):
+        row = _canonical_v4(now, collector_version=version)
+        assert flow.is_flow_eligible_trade(row) is False
+
+    legacy_v3 = _canonical_v4(now, collector_version=3)
+    legacy_v3.pop("block")
+    assert flow.is_flow_eligible_trade(legacy_v3) is True
+
+    missing_version = _canonical_v4(now)
+    missing_version.pop("collector_version")
+    missing_version.pop("block")
+    assert flow.is_flow_eligible_trade(missing_version) is True
+
+
+def test_v4_missing_block_is_rejected():
+    now = datetime.now(timezone.utc)
+    row = _canonical_v4(now)
+    row.pop("block")
+    assert flow.is_flow_eligible_trade(row) is False
+    result = flow.analyze_flow([row], now, "5m")
+    assert result["trade_count"] == 0
+    assert result["total_volume"] == 0.0
 
 
 def test_v4_missing_transaction_hash_does_not_affect_flow():
