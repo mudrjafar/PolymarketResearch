@@ -3,6 +3,12 @@
 No network, no file I/O, no order submission, no wallet access.
 """
 
+import sys
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE_DIR))
+
 from machine_common import finite_number
 
 TARGET_NOTIONALS_USD = (25.0, 50.0, 100.0)
