@@ -160,6 +160,8 @@ class Pipeline:
             except InterruptedError:
                 pass
 
+        if not self.flow_file.exists():
+            return {}
         return json.loads(self.flow_file.read_text(encoding="utf-8"))
 
 
@@ -271,7 +273,7 @@ def test_unverified_flow_never_stores_evidence(pipeline):
     assert_no_evidence(entry)
 
 
-def test_rows_without_chain_identity_never_produce_evidence(pipeline):
+def test_rows_without_chain_identity_never_enter_v4_flow(pipeline):
     rows = []
     for n in range(10):
         row = pipeline.trade(n)
@@ -280,11 +282,12 @@ def test_rows_without_chain_identity_never_produce_evidence(pipeline):
         rows.append(row)
     pipeline.add(*rows)
 
-    entry = pipeline.run_cycle()[TOKEN_YES]
+    pipeline.run_cycle()
 
-    assert entry["verification_check_passed"] is True
-    assert entry["confirmations"] == 0
-    assert_no_evidence(entry)
+    # Incomplete V4 rows are rejected before market aggregation, so they
+    # cannot create flow, confirmations, or an evidence triple at all.
+    assert TOKEN_YES not in flow.flow_states
+    assert TOKEN_YES not in flow.market_states
 
 
 def test_evidence_never_crosses_between_yes_and_no_tokens(pipeline):
