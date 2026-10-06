@@ -14,6 +14,7 @@ SERVICES=[
     ("risk", [PY,"-u",str(BASE/"scripts"/"risk_worker.py"),"--interval","5"]),
     ("focus", [PY,"-u",str(BASE/"scripts"/"focus_runner.py"),"--interval","5"]),
     ("book", [PY,"-u",str(BASE/"scripts"/"book_worker.py"),"--interval","5"]),
+    ("paper", [PY,"-u",str(BASE/"scripts"/"paper_worker.py"),"--interval","5"]),
     ("telegram", [PY,"-u",str(BASE/"telegram_bot.py")]),
     ("dashboard", [PY,"-m","streamlit","run",str(BASE/"dashboard.py"),"--server.headless=true","--server.port=8501"]),
 ]
@@ -23,7 +24,7 @@ def validate():
     missing=[]
     for var in ["POLYMARKET_RPC_URL","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"]:
         if not os.getenv(var,"").strip(): missing.append(var)
-    files=[BASE/"scripts"/"live_active_trades.py",BASE/"scripts"/"flow_tracker.py",BASE/"scripts"/"diamond_filter_v3.py",BASE/"scripts"/"risk_engine.py",BASE/"scripts"/"risk_worker.py",BASE/"scripts"/"focus_engine.py",BASE/"scripts"/"focus_runner.py",BASE/"scripts"/"book_engine.py",BASE/"scripts"/"book_worker.py",BASE/"telegram_bot.py",BASE/"dashboard.py",BASE/"collector_storage_v4"/"storage.py",BASE/"collector_storage_v4"/"bridge.py"]
+    files=[BASE/"scripts"/"live_active_trades.py",BASE/"scripts"/"flow_tracker.py",BASE/"scripts"/"diamond_filter_v3.py",BASE/"scripts"/"risk_engine.py",BASE/"scripts"/"risk_worker.py",BASE/"scripts"/"focus_engine.py",BASE/"scripts"/"focus_runner.py",BASE/"scripts"/"book_engine.py",BASE/"scripts"/"book_worker.py",BASE/"scripts"/"paper_engine.py",BASE/"scripts"/"paper_worker.py",BASE/"telegram_bot.py",BASE/"dashboard.py",BASE/"collector_storage_v4"/"storage.py",BASE/"collector_storage_v4"/"bridge.py"]
     for f in files:
         if not f.exists(): missing.append(str(f.relative_to(BASE)))
     if missing:
@@ -43,6 +44,8 @@ def self_test():
         [PY,"-B",str(BASE/"scripts"/"focus_runner.py"),"--self-test"],
         [PY,"-B",str(BASE/"scripts"/"book_engine.py")],
         [PY,"-B",str(BASE/"scripts"/"book_worker.py"),"--self-test"],
+        [PY,"-B",str(BASE/"scripts"/"paper_engine.py")],
+        [PY,"-B",str(BASE/"scripts"/"paper_worker.py"),"--self-test"],
     ]:
         t=subprocess.run(cmd,cwd=BASE)
         if t.returncode: return t.returncode
@@ -55,7 +58,7 @@ def main():
     subprocess.run([PY,str(BASE/"scripts"/"prepare_v3_data.py")],cwd=BASE,check=True)
     children=[]
     print("="*70); print("DIAMOND INTELLIGENCE V3 - ONE START MACHINE"); print("="*70)
-    print("Pipeline: LIVE V2 SCAN -> FLOW -> DIAMOND V3 -> RISK -> FOCUS -> BOOK -> TELEGRAM + DASHBOARD")
+    print("Pipeline: LIVE V2 SCAN -> FLOW -> DIAMOND V3 -> RISK -> FOCUS -> BOOK -> PAPER + TELEGRAM + DASHBOARD")
     print("Dashboard: http://localhost:8501")
     try:
         for name,cmd in SERVICES:
