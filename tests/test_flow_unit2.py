@@ -162,7 +162,7 @@ def test_event_time_prefers_block_timestamp():
 
 
 def test_confirmation_evidence_only_when_canonical_and_supporting():
-    trade = {"side_label": "SELL", "transaction_hash": "0xabc", "log_index": 4}
+    trade = {"side_label": "SELL", "transaction_hash": "0x" + "ab" * 32, "log_index": 4}
     evidence = flow.market_evidence_id(trade)
     assert flow.confirmation_evidence_id(trade, evidence, True, "BUY") is None
     assert flow.confirmation_evidence_id(trade, evidence, True, "SELL") == evidence
