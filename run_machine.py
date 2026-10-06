@@ -39,6 +39,7 @@ def self_test():
         t=subprocess.run([PY,"-B",str(test_path)],cwd=BASE)
         if t.returncode: return t.returncode
     for cmd in [
+        [PY,"-m","pytest","-q",str(BASE/"tests"/"test_collector_legacy_schema_migration.py")],
         [PY,"-B",str(BASE/"scripts"/"risk_engine.py"),"--self-test"],
         [PY,"-B",str(BASE/"scripts"/"focus_engine.py")],
         [PY,"-B",str(BASE/"scripts"/"focus_runner.py"),"--self-test"],
