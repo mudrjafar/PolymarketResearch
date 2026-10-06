@@ -10,9 +10,99 @@ from scripts import flow_tracker as flow
 
 
 def test_trade_size_never_treats_shares_as_usd():
-    assert flow.get_trade_size({"token_amount": 100}) == 0.0
+    assert flow.get_trade_size({"token_amount": 100}) is None
     assert flow.get_trade_size({"token_amount": 100, "fill_price": 0.42}) == 42.0
     assert flow.get_trade_size({"trade_usd": 12.5, "token_amount": 100, "fill_price": 0.42}) == 12.5
+
+
+def _canonical_v4(now=None, **overrides):
+    now = now or datetime.now(timezone.utc)
+    row = {
+        "collector_version": 4,
+        "condition_id": "condition",
+        "token_id": "yes-token",
+        "outcome": "Yes",
+        "transaction_hash": "0xabc",
+        "log_index": 4,
+        "block": 123,
+        "block_timestamp": now.isoformat(),
+        "side_label": "BUY",
+        "trade_usd": 100.0,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_v4_missing_transaction_hash_does_not_affect_flow():
+    now = datetime.now(timezone.utc)
+    row = _canonical_v4(now)
+    row.pop("transaction_hash")
+    result = flow.analyze_flow([row], now, "5m")
+    assert result["trade_count"] == 0
+    assert result["total_volume"] == 0.0
+    assert result["net_flow"] == 0.0
+
+
+def test_v4_missing_log_index_does_not_affect_flow():
+    now = datetime.now(timezone.utc)
+    row = _canonical_v4(now)
+    row.pop("log_index")
+    result = flow.analyze_flow([row], now, "5m")
+    assert result["trade_count"] == 0
+    assert result["total_volume"] == 0.0
+
+
+def test_v4_missing_block_timestamp_does_not_use_detected_at():
+    now = datetime.now(timezone.utc)
+    row = _canonical_v4(now, detected_at=now.isoformat())
+    row.pop("block_timestamp")
+    assert flow.is_flow_eligible_trade(row) is False
+    result = flow.analyze_flow([row], now, "5m")
+    assert result["trade_count"] == 0
+    assert result["total_volume"] == 0.0
+
+
+def test_v4_unknown_usd_size_is_none_and_does_not_affect_flow():
+    now = datetime.now(timezone.utc)
+    row = _canonical_v4(now)
+    row.pop("trade_usd")
+    row["token_amount"] = 100
+    row["fill_price"] = 0.42
+    assert flow.get_trade_size(row) is None
+    result = flow.analyze_flow([row], now, "5m")
+    assert result["trade_count"] == 0
+    assert result["total_volume"] == 0.0
+    assert result["net_flow"] == 0.0
+
+
+def test_v4_legitimate_zero_usd_is_known_not_unknown():
+    now = datetime.now(timezone.utc)
+    row = _canonical_v4(now, trade_usd=0)
+    assert flow.get_trade_size(row) == 0.0
+    assert flow.is_flow_eligible_trade(row) is True
+
+
+def test_v4_future_timestamp_does_not_enter_window():
+    now = datetime.now(timezone.utc)
+    row = _canonical_v4(now, block_timestamp=(now + timedelta(seconds=1)).isoformat())
+    result = flow.analyze_flow([row], now, "5m")
+    assert result["trade_count"] == 0
+    assert result["total_volume"] == 0.0
+
+
+def test_canonical_v4_rows_keep_existing_flow_math():
+    now = datetime.now(timezone.utc)
+    rows = [
+        _canonical_v4(now, transaction_hash="0xa", log_index=1, block=101, trade_usd=100.0, side_label="BUY"),
+        _canonical_v4(now, transaction_hash="0xb", log_index=2, block=102, trade_usd=40.0, side_label="SELL"),
+    ]
+    result = flow.analyze_flow(rows, now, "5m")
+    assert result["trade_count"] == 2
+    assert result["buy_volume"] == 100.0
+    assert result["sell_volume"] == 40.0
+    assert result["total_volume"] == 140.0
+    assert result["net_flow"] == 60.0
+    assert result["direction"] == "BUY"
 
 def test_event_time_prefers_block_timestamp():
     now = datetime.now(timezone.utc)
