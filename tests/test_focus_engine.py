@@ -88,18 +88,22 @@ def make_ready():
     return state
 
 
-def test_lock_strongest_candidate_and_deterministic_tie_break():
+def test_lock_preserves_upstream_candidate_order_without_reranking():
     state, _ = step(
         new_state(),
         [
-            candidate("B", 100, 1, T0, score=90),
-            candidate("A", 100, 2, T0, score=90),
+            candidate("B", 100, 1, T0, score=10),
+            candidate("A", 100, 2, T0, score=99),
             candidate("C", 100, 3, T0, score=80),
         ],
         T0,
     )
 
-    assert state["focus"]["token_id"] == "A"
+    # Risk preserves authoritative Diamond order. Focus must not synthesize
+    # or re-rank on a numeric score.
+    assert state["focus"]["token_id"] == "B"
+    assert "score" not in state["focus"]
+    assert "score_at_lock" not in state["focus"]
     assert label(state["focus"]) == "LOCKED"
 
 
@@ -217,6 +221,31 @@ def test_stronger_challenger_cannot_steal_focus():
 
     assert state["focus"]["token_id"] == "A"
     assert state["challenger"]["token_id"] == "B"
+    assert events == []
+
+
+def test_stale_flow_trade_is_neutral_and_does_not_consume_evidence():
+    state = make_ready()
+    previous_cursor = list(state["focus"]["last_evidence_cursor"])
+
+    state, events = step(
+        state,
+        [
+            candidate(
+                "A",
+                104,
+                1,
+                T0 + timedelta(seconds=240),
+                risk_ok=False,
+                codes=["STALE_FLOW_TRADE"],
+            )
+        ],
+        T0 + timedelta(seconds=240),
+    )
+
+    assert state["focus"]["fail_count"] == 0
+    assert label(state["focus"]) == "READY"
+    assert state["focus"]["last_evidence_cursor"] == previous_cursor
     assert events == []
 
 
