@@ -15,6 +15,7 @@ CANDIDATES_FILE = DATA_DIR / "diamond_candidates.json"
 RISK_FILE = DATA_DIR / "risk_assessment.json"
 FOCUS_STATE_FILE = DATA_DIR / "focus_state.json"
 FOCUS_FILE = DATA_DIR / "focused_market.json"
+BOOK_FILE = DATA_DIR / "book_assessment.json"
 
 REFRESH_SECONDS = 5
 TAIL_LINES = 50000
@@ -146,6 +147,7 @@ def main():
         print(f"risk_assessment.json      : {file_age(RISK_FILE)}")
         print(f"focus_state.json          : {file_age(FOCUS_STATE_FILE)}")
         print(f"focused_market.json       : {file_age(FOCUS_FILE)}")
+        print(f"book_assessment.json      : {file_age(BOOK_FILE)}")
         print()
         print(f"Refresh: {REFRESH_SECONDS}s | CTRL+C to stop this window")
         print("=" * 72)
