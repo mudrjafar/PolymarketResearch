@@ -108,8 +108,8 @@ class RegressionTests(unittest.TestCase):
     def test_token_separation_full_cycle_and_empty_cleanup(self):
         now=datetime.now(timezone.utc).isoformat()
         rows=[{'condition_id':'same','token_id':token,'outcome':outcome,'side_label':'BUY',
-            'trade_usd':100,'detected_at':now,'transaction_hash':token,'log_index':1}
-            for token,outcome in [('yes','Yes'),('no','No')]]
+            'trade_usd':100,'detected_at':now,'transaction_hash':tx_hash,'log_index':1}
+            for token,outcome,tx_hash in [('yes','Yes','0x'+'aa'*32),('no','No','0x'+'bb'*32)]]
         flow.TRADES_FILE.write_text('\n'.join(json.dumps(x) for x in rows+rows)+'\n',encoding='utf-8')
         with patch.object(flow.time,'sleep',side_effect=InterruptedError),contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(InterruptedError):flow.main()
