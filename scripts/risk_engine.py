@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -70,16 +71,16 @@ def flow_for(row, flow_state):
     return candidate if isinstance(candidate, dict) else None
 
 
+_EVIDENCE_ID_RE = re.compile(r"^0x[0-9a-fA-F]{64}:([0-9]+)$")
+
+
 def _valid_evidence_id(value):
     if not isinstance(value, str):
         return False
-    value = value.strip()
-    if not value or ":" not in value:
+    match = _EVIDENCE_ID_RE.fullmatch(value.strip())
+    if match is None:
         return False
-    transaction_hash, log_index = value.rsplit(":", 1)
-    if not transaction_hash.strip() or not log_index.isdigit():
-        return False
-    return int(log_index) >= 0
+    return int(match.group(1)) >= 0
 
 
 def _valid_evidence_cursor(value):
