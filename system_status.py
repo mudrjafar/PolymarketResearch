@@ -12,6 +12,8 @@ TRADES_FILE = DATA_DIR / "live_trades.jsonl"
 FLOW_FILE = DATA_DIR / "flow_state.json"
 DIAMONDS_FILE = DATA_DIR / "diamonds.json"
 CANDIDATES_FILE = DATA_DIR / "diamond_candidates.json"
+RISK_FILE = DATA_DIR / "risk_assessment.json"
+FOCUS_STATE_FILE = DATA_DIR / "focus_state.json"
 FOCUS_FILE = DATA_DIR / "focused_market.json"
 
 REFRESH_SECONDS = 5
@@ -84,6 +86,14 @@ def flow_records(data):
 def focused_label(focus):
     if not isinstance(focus, dict) or not focus:
         return "NONE"
+
+    if str(focus.get("state") or "").upper() == "IDLE":
+        return "NONE"
+
+    nested = focus.get("focus")
+    if isinstance(nested, dict):
+        focus = nested
+
     market = focus.get("market")
     if isinstance(market, dict):
         q = market.get("question") or market.get("title")
@@ -133,6 +143,9 @@ def main():
         print(f"live_trades.jsonl         : {file_age(TRADES_FILE)}")
         print(f"flow_state.json           : {file_age(FLOW_FILE)}")
         print(f"diamonds.json             : {file_age(DIAMONDS_FILE)}")
+        print(f"risk_assessment.json      : {file_age(RISK_FILE)}")
+        print(f"focus_state.json          : {file_age(FOCUS_STATE_FILE)}")
+        print(f"focused_market.json       : {file_age(FOCUS_FILE)}")
         print()
         print(f"Refresh: {REFRESH_SECONDS}s | CTRL+C to stop this window")
         print("=" * 72)
