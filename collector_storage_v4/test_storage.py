@@ -47,7 +47,7 @@ class CollectorStoreTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.store = CollectorStore(self.root / "collector.sqlite3")
-        self.addCleanup(self.store.close)
+        self.addCleanup(lambda: self.store.close() if self.store else None)
         self.store.initialize(100, h(100))
 
     def test_initialize_is_durable_and_does_not_reset(self):
