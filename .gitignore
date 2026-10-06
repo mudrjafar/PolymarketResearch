@@ -13,7 +13,6 @@ __pycache__/
 *.sqlite
 *.sqlite3
 data/
-collector_storage_v4/
 *.parquet
 *.feather
 *.pkl
