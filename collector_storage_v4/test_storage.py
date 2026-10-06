@@ -4,8 +4,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from collector_storage_v4.storage import CollectorStore, StorageError
-from collector_storage_v4.bridge import CollectorLock, publish_snapshot
+try:
+    from collector_storage_v4.storage import CollectorStore, StorageError
+    from collector_storage_v4.bridge import CollectorLock, publish_snapshot
+except ModuleNotFoundError:
+    # run_machine.py executes this file directly; in that mode Python places
+    # collector_storage_v4/ (not the repository root) on sys.path.
+    from storage import CollectorStore, StorageError
+    from bridge import CollectorLock, publish_snapshot
 
 
 def h(n):
