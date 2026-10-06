@@ -1363,7 +1363,7 @@ print(json.dumps({'map':dict(fresh),'fallbacks':fresh.fallback_identities}))
         flow = {'schema_version': 4, 'token_id': '123', 'condition_id': 'condition',
                 'outcome': 'Yes', 'direction': 'BUY', 'verified': True, 'confirmations': 3,
                 'source_updated_at': stamp, 'last_trade_at': stamp, 'remaining_seconds': 86400,
-                'evidence_id': '0xabc:4', 'evidence_cursor': [123, 4],
+                'evidence_id': '0xabababababababababababababababababababababababababababababababab:4', 'evidence_cursor': [123, 4],
                 'evidence_at': stamp,
                 'market': {'active': True, 'closed': False, 'accepting_orders': True}}
         self.assertEqual(assess(row, {'123': flow}, now=now)['decision'], 'PASS')
