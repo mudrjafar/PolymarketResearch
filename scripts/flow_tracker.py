@@ -182,8 +182,27 @@ def format_remaining(seconds):
 # FILE LOADING
 # ============================================================
 
+CURRENT_COLLECTOR_VERSION = 4
+SUPPORTED_LEGACY_COLLECTOR_VERSIONS = {3}
+
+
+def _collector_version_class(trade):
+    if not isinstance(trade, dict):
+        return "UNKNOWN"
+    if "collector_version" not in trade or trade.get("collector_version") is None:
+        return "LEGACY"
+    version = trade.get("collector_version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        return "UNKNOWN"
+    if version == CURRENT_COLLECTOR_VERSION:
+        return "V4"
+    if version in SUPPORTED_LEGACY_COLLECTOR_VERSIONS:
+        return "LEGACY"
+    return "UNKNOWN"
+
+
 def _is_v4_trade(trade):
-    return isinstance(trade, dict) and trade.get("collector_version") == 4
+    return _collector_version_class(trade) == "V4"
 
 
 def _real_nonnegative_int(value):
@@ -237,9 +256,13 @@ def evidence_identity(trade):
 def is_flow_eligible_trade(trade):
     """
     Strict gate for current collector V4 rows before they can affect live
-    flow mathematics. Legacy rows retain their historical compatibility path.
+    flow mathematics. Only explicitly supported legacy schemas retain their
+    historical compatibility path. Unknown/future versions fail closed.
     """
-    if not _is_v4_trade(trade):
+    version_class = _collector_version_class(trade)
+    if version_class == "UNKNOWN":
+        return False
+    if version_class == "LEGACY":
         return True
 
     if not isinstance(trade.get("condition_id"), str) or not trade["condition_id"].strip():
@@ -914,6 +937,31 @@ def confirmation_evidence_id(latest_trade, evidence_id, new_evidence, flow_direc
     return None
 
 
+def confirmation_evidence_triple(latest_trade, confirming_evidence):
+    """
+    Flow is the producer authority for the evidence triple. All three fields
+    are derived together from the exact same confirming trade event.
+    """
+    if not confirming_evidence:
+        return None
+    identity = evidence_identity(latest_trade)
+    if identity != confirming_evidence:
+        return None
+    block = latest_trade.get("block")
+    log_index = latest_trade.get("log_index")
+    if not _real_nonnegative_int(block) or not _real_nonnegative_int(log_index):
+        return None
+    try:
+        evidence_at = event_time(latest_trade).isoformat()
+    except (TypeError, ValueError):
+        return None
+    return {
+        "evidence_id": identity,
+        "evidence_cursor": [block, log_index],
+        "evidence_at": evidence_at,
+    }
+
+
 
 def far_market_wake_trigger(
     profile,
@@ -1503,20 +1551,27 @@ def main():
                 flow_5m["direction"],
             )
 
+            evidence_triple = confirmation_evidence_triple(
+                latest_trade,
+                confirming_evidence,
+            )
+
             state_data = update_market_state(
                 token_id,
                 candidate,
                 verified,
-                confirming_evidence,
+                (
+                    evidence_triple["evidence_id"]
+                    if evidence_triple else None
+                ),
                 flow_5m["direction"],
                 evidence_cursor=(
-                    [latest_trade.get("block"), latest_trade.get("log_index")]
-                    if confirming_evidence else None
+                    evidence_triple["evidence_cursor"]
+                    if evidence_triple else None
                 ),
                 evidence_at=(
-                    latest_trade.get("block_timestamp")
-                    or latest_trade.get("detected_at")
-                    if confirming_evidence else None
+                    evidence_triple["evidence_at"]
+                    if evidence_triple else None
                 ),
             )
 
