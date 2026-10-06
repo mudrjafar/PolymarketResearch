@@ -195,7 +195,7 @@ def test_rf4a_4_root_flow_y_cannot_replace_generation_x_evidence(monkeypatch, tm
     paths = _configure_paths(monkeypatch, tmp_path)
     flow_x = {
         "token-a": _flow_row(
-            evidence_id="X-evidence",
+            evidence_id="0xaaa:1",
             evidence_cursor=[100, 1],
             evidence_at="2026-10-05T12:00:00+00:00",
         )
@@ -206,7 +206,7 @@ def test_rf4a_4_root_flow_y_cannot_replace_generation_x_evidence(monkeypatch, tm
         paths["root_flow"],
         {
             "token-a": _flow_row(
-                evidence_id="Y-evidence",
+                evidence_id="0xbbb:99",
                 evidence_cursor=[999, 99],
                 evidence_at="2026-10-05T12:59:59+00:00",
             )
@@ -215,7 +215,7 @@ def test_rf4a_4_root_flow_y_cannot_replace_generation_x_evidence(monkeypatch, tm
 
     result = _run_and_output(paths)["results"][0]
 
-    assert result["evidence_id"] == "X-evidence"
+    assert result["evidence_id"] == "0xaaa:1"
     assert result["evidence_cursor"] == [100, 1]
     assert result["evidence_at"] == "2026-10-05T12:00:00+00:00"
 
@@ -313,7 +313,9 @@ def test_rf4a_10_missing_flow_evidence_does_not_fabricate_evidence(monkeypatch, 
 
     result = _run_and_output(paths)["results"][0]
 
-    assert result["risk_ok"] is True
+    assert result["risk_ok"] is False
+    assert result["decision"] == "BLOCK"
+    assert "EVIDENCE_MISSING" in result["reason_codes"]
     assert result.get("evidence_id") is None
     assert result.get("evidence_cursor") is None
     assert result.get("evidence_at") is None
