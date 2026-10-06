@@ -121,7 +121,10 @@ class CollectorStoreTests(unittest.TestCase):
         self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()), 1)
 
     def test_failed_snapshot_replace_keeps_original(self):
-        from collector_storage_v4 import bridge
+        try:
+            from collector_storage_v4 import bridge
+        except ModuleNotFoundError:
+            import bridge
 
         path = self.root / "live_trades.jsonl"
         original = b'{"legacy":true}\n'
