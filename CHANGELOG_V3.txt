@@ -1,0 +1,21 @@
+
+- 2026-10-02: Collector uses SQLite transactions for trades and durable block checkpoints.
+- Both exchange scans complete before commit; failed batches do not leave partial history.
+- Startup resumes saved block; first-run default scans last 500 confirmed blocks (20-block lag).
+- Collector retrieves block headers and uses actual block timestamps.
+- Atomic 20-minute JSON compatibility view; prior JSON preserved before first live replacement.
+- JSON is repaired from SQLite after interrupted publication; competing collectors are locked out.
+- Added offline collector integration/restart tests and included storage tests in --self-test.
+- RPC error logging avoids credential-bearing endpoint exception text.
+
+- V2 BUY/SELL amount normalization corrected.
+- Flow uses taker/aggressor OrderFilled only, avoiding maker+taker cancellation/double counting in normal matches.
+- Both V2 standard and V2 NegRisk exchanges are scanned.
+- Market metadata refreshes every 5 minutes.
+- Confirmation count increases only when new trade evidence appears; rescanning unchanged data does not create confirmations.
+- V3 reads flow_state directly; old signal_engine is no longer in the active pipeline.
+- Old components are preserved under archive/legacy, not deleted.
+- Pre-V3 live-trade data is automatically archived rather than mixed with the corrected V3 format.
+
+PAPER WARNING:
+Paper prices use the latest observed blockchain fill, not guaranteed executable bid/ask quotes. TP/SL/time exits are test rules, not calibrated profitability rules.

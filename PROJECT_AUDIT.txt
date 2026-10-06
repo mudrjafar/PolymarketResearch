@@ -1,0 +1,47 @@
+DIAMOND INTELLIGENCE V3 - PROJECT AUDIT
+
+SQLITE COLLECTOR INTEGRATION (2026-10-02)
+- Collector commits block headers, normalized trades and checkpoint atomically.
+- New storage: collector_storage_v4/storage.py; JSON bridge and collector lock: bridge.py.
+- Both exchange requests and complete decoding must succeed before advancing the cursor.
+- Actual block timestamps replace detection time for the new flow inputs.
+- JSON is a rebuildable 20-minute view; old JSON is backed up before first replacement.
+- Restart and abrupt-process-death recovery verified offline; live operation not yet verified.
+- Reorg/hash conflicts stop collection; automatic reorg repair remains outstanding.
+- All existing tests plus storage and collector integration tests are in --self-test.
+- Gamma token lookup checks open and closed markets; unresolved metadata holds the cursor.
+- The previous audit sections below document the unchanged V3 analysis layer.
+
+ACTIVE FILES
+- run_machine.py: single launcher / process supervisor
+- scripts/live_active_trades.py: live Polygon V2 scanner (standard + NegRisk)
+- scripts/flow_tracker.py: 1m/5m/15m mathematics + new-evidence verification
+- scripts/diamond_filter_v3.py: Signal / Verification / Entry / Resolution / Cashflow logic
+- telegram_bot.py: selective alerts + Analyze + manual PAPER entry + paper exit alerts
+- dashboard.py: HTML tracker on localhost:8501
+- scripts/prepare_v3_data.py: safe pre-V3 data archiver/migration
+
+REMOVED FROM ACTIVE PIPELINE (PRESERVED IN archive/legacy)
+- old scripts/diamond_filter.py
+- old scripts/signal_engine.py
+- old scripts/signal_evaluator.py
+- old telegram_bot.py
+- old run_machine.py / start_machine.bat / tests
+
+WHY SIGNAL_ENGINE IS NOT ACTIVE
+Diamond V3 consumes fresh flow_state.json directly. The old signal_engine only repackaged the same flow state into signals.json and could introduce stale duplication.
+
+CRITICAL AUDIT FIXES
+1. Corrected V2 BUY/SELL amount semantics. BUY makerAmount is collateral/USD and takerAmount is shares; SELL is the reverse.
+2. Directional flow now keeps taker/aggressor OrderFilled events only, preventing normal maker+aggressor matches from cancelling/double-counting the same settlement.
+3. Added V2 NegRisk exchange coverage.
+4. Added active-market metadata refresh every five minutes.
+5. Confirmations only increment on new trade evidence; repeated scans of unchanged data no longer produce fake confirmations.
+6. FAR timing now uses exactly the flow_tracker boundary (>24h), so 67.7h is FAR and no false metadata conflict is created.
+7. Entry Quality remains separate from Signal Quality. A high-price market can have excellent flow but still fail Diamond entry quality.
+8. Huge cashflow is a separate attention signal and cannot override verification, entry, concentration or resolution gates.
+
+CAUTION
+- Paper current price is the latest observed blockchain fill, not a guaranteed executable CLOB quote.
+- Gamma endDate is used as timing metadata; it is not treated as a guarantee of the written resolution rules.
+- Paper TP/SL/time limits are test settings and are not historically calibrated yet.

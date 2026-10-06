@@ -1,0 +1,1835 @@
+===== scripts/live_active_trades.py =====
+import json
+import os
+import math
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE))
+from collector_storage_v4.storage import CollectorStore, StorageError
+from collector_storage_v4.bridge import CollectorLock, publish_snapshot
+
+import requests
+from eth_abi import decode
+
+RPC_URL = os.getenv("POLYMARKET_RPC_URL", "").strip()
+if not RPC_URL:
+    raise SystemExit("Missing POLYMARKET_RPC_URL environment variable.")
+
+GAMMA_API = "https://gamma-api.polymarket.com"
+
+# Polymarket CTF Exchange V2 + NegRisk CTF Exchange V2 (Polygon).
+EXCHANGES = [
+    "0xE111180000d2663C0091e4f400237545B87B996B",
+    "0xe2222d279d744050d28e00520010520000310F59",
+]
+
+# V2: OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)
+ORDER_FILLED_TOPIC = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
+
+CHECK_INTERVAL = 1.5
+MARKET_LIMIT = 100
+MARKET_REFRESH_INTERVAL = 300
+LIVE_TRADES_FILE = BASE / "data/live_trades.jsonl"
+DATABASE_FILE = BASE / "data/collector.sqlite3"
+COLLECTOR_VERSION = 4
+CONFIRMATION_BLOCKS = int(os.getenv('COLLECTOR_CONFIRMATION_BLOCKS', '20'))
+INITIAL_LOOKBACK_BLOCKS = int(os.getenv('COLLECTOR_INITIAL_LOOKBACK_BLOCKS', '500'))
+START_BLOCK = os.getenv('COLLECTOR_START_BLOCK', '').strip()
+if CONFIRMATION_BLOCKS < 1 or INITIAL_LOOKBACK_BLOCKS < 1:
+    raise SystemExit('Collector confirmation depth and initial lookback must be positive')
+
+
+class RetryableCollectorError(RuntimeError):
+    pass
+
+
+class FatalConfigError(RuntimeError):
+    pass
+
+
+BATCH_BACKOFF_SECONDS = (1, 2, 5, 10, 30)
+
+
+def _http_status(exc):
+    return getattr(getattr(exc, 'response', None), 'status_code', None)
+
+
+def _sqlite_busy(exc):
+    code = getattr(exc, 'sqlite_errorcode', None)
+    return isinstance(code, int) and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
+def _checkpoint_block(store):
+    checkpoint = store.checkpoint()
+    return None if checkpoint is None else checkpoint['block_number']
+
+
+def rpc_call(method, params):
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(RPC_URL, json={"jsonrpc":"2.0","method":method,"params":params,"id":1}, timeout=30)
+            r.raise_for_status()
+            payload = r.json()
+            if not isinstance(payload, dict) or ("result" not in payload and "error" not in payload):
+                raise RetryableCollectorError(f"RPC {method} returned an invalid response")
+            if "error" in payload:
+                error = payload.get("error")
+                code = error.get("code") if isinstance(error, dict) else None
+                if code in (-32000, -32603):
+                    raise RetryableCollectorError(
+                        f"RPC {method} returned a temporary provider error ({code})"
+                    )
+                raise RuntimeError(
+                    f"RPC {method} returned a fatal JSON-RPC error ({code})"
+                )
+            return payload["result"]
+        except (RetryableCollectorError, FatalConfigError):
+            raise
+        except requests.HTTPError as exc:
+            status = _http_status(exc)
+            if status in (401, 403):
+                raise FatalConfigError(f"RPC {method} authentication/authorization failed (HTTP {status})") from None
+            if status != 429 and not (isinstance(status, int) and 500 <= status <= 599):
+                raise RuntimeError(f"RPC {method} returned non-retryable HTTP {status}") from None
+            last_exc = exc
+        except (requests.RequestException, ValueError) as exc:
+            last_exc = exc
+        if attempt < 3:
+            print(f"[COLLECTOR] RPC {method} retry {attempt}/3 after {type(last_exc).__name__}")
+            time.sleep(attempt)
+    raise RetryableCollectorError(
+        f"RPC {method} request failed after 3 attempts ({type(last_exc).__name__})"
+    ) from None
+
+def get_latest_block():
+    return int(rpc_call("eth_blockNumber", []), 16)
+
+
+def get_block_header(number):
+    result = rpc_call('eth_getBlockByNumber', [hex(number), False])
+    if not result:
+        raise RetryableCollectorError('RPC block header is unavailable')
+    if int(result['number'], 16) != number:
+        raise StorageError('RPC block header number mismatch')
+    return {'block_number': number, 'block_hash': result['hash'],
+            'parent_hash': result['parentHash'],
+            'block_timestamp': int(result['timestamp'], 16)}
+
+
+def get_order_filled_logs(from_block, to_block):
+    def fetch_exchange(exchange):
+        result = rpc_call("eth_getLogs", [{
+            "address": exchange,
+            "fromBlock": hex(from_block),
+            "toBlock": hex(to_block),
+            "topics": [ORDER_FILLED_TOPIC],
+        }])
+        if not isinstance(result, list):
+            raise RetryableCollectorError("RPC log response must be a list")
+        for log in result:
+            if log.get("address", "").lower() != exchange.lower():
+                raise StorageError("RPC returned a log from an unexpected exchange")
+            log["_exchange_address"] = exchange
+        return result
+
+    with __import__("concurrent.futures").futures.ThreadPoolExecutor(max_workers=2) as pool:
+        batches = list(pool.map(fetch_exchange, EXCHANGES))
+    logs = [log for batch in batches for log in batch]
+    logs.sort(key=lambda x: (int(x["blockNumber"], 16), int(x["logIndex"], 16)))
+    return logs
+
+def get_active_markets():
+    """Load active markets with Gamma keyset pagination.
+
+    Legacy offset pagination now hard-stops around offset 2000. The current
+    keyset endpoint continues with `after_cursor`. A bounded legacy fallback
+    prevents a temporary keyset failure from killing the whole machine.
+    """
+    all_markets=[]
+    seen_market_ids=set()
+    seen_cursors=set()
+    after_cursor=None
+
+    try:
+        for _page in range(100):
+            params={
+                "limit": MARKET_LIMIT,
+                "active": True,
+                "closed": False,
+            }
+            if after_cursor:
+                params["after_cursor"]=after_cursor
+
+            r=requests.get(
+                f"{GAMMA_API}/markets/keyset",
+                params=params,
+                timeout=30,
+            )
+            r.raise_for_status()
+            payload=r.json()
+
+            if isinstance(payload, dict):
+                markets=payload.get("markets", [])
+                next_cursor=payload.get("next_cursor") or payload.get("nextCursor")
+            elif isinstance(payload, list):
+                markets=payload
+                next_cursor=None
+            else:
+                markets=[]
+                next_cursor=None
+
+            if not markets:
+                break
+
+            for market in markets:
+                market_id=str(market.get("id", ""))
+                dedupe_key=market_id or str(market.get("conditionId", ""))
+                if dedupe_key and dedupe_key in seen_market_ids:
+                    continue
+                if dedupe_key:
+                    seen_market_ids.add(dedupe_key)
+                all_markets.append(market)
+
+            if not next_cursor:
+                break
+            if next_cursor in seen_cursors:
+                print("[COLLECTOR] Keyset cursor repeated; stopping pagination safely.")
+                break
+
+            seen_cursors.add(next_cursor)
+            after_cursor=next_cursor
+
+        if all_markets:
+            print(f"[COLLECTOR] Gamma keyset discovery loaded {len(all_markets)} active markets.")
+            return all_markets
+
+    except requests.RequestException as exc:
+        print(
+            "[COLLECTOR] Keyset market discovery warning: "
+            f"{exc}. Falling back to bounded offset pagination."
+        )
+
+    all_markets=[]
+    seen_market_ids=set()
+
+    for offset in range(0, 2001, MARKET_LIMIT):
+        r=requests.get(
+            f"{GAMMA_API}/markets",
+            params={
+                "limit": MARKET_LIMIT,
+                "offset": offset,
+                "active": True,
+                "closed": False,
+            },
+            timeout=30,
+        )
+
+        if r.status_code == 422:
+            print(
+                f"[COLLECTOR] Gamma offset limit reached at {offset}; "
+                "using markets collected so far."
+            )
+            break
+
+        r.raise_for_status()
+        markets=r.json()
+        if not markets:
+            break
+
+        for market in markets:
+            market_id=str(market.get("id", ""))
+            dedupe_key=market_id or str(market.get("conditionId", ""))
+            if dedupe_key and dedupe_key in seen_market_ids:
+                continue
+            if dedupe_key:
+                seen_market_ids.add(dedupe_key)
+            all_markets.append(market)
+
+        if len(markets) < MARKET_LIMIT:
+            break
+
+    return all_markets
+
+
+def parse_json_field(value, default):
+    if isinstance(value, list): return value
+    if value is None: return default
+    try: return json.loads(value)
+    except (json.JSONDecodeError, TypeError): return default
+
+
+def build_token_map(markets):
+    token_map={}
+    for market in markets:
+        token_ids=parse_json_field(market.get("clobTokenIds"), [])
+        outcomes=parse_json_field(market.get("outcomes"), [])
+        prices=parse_json_field(market.get("outcomePrices"), [])
+        for i, token_id in enumerate(token_ids):
+            token_map[str(token_id)]={
+                "market_id": market.get("id"),
+                "condition_id": market.get("conditionId"),
+                "question": market.get("question"),
+                "outcome": outcomes[i] if i < len(outcomes) else None,
+                "price": prices[i] if i < len(prices) else None,
+                "volume24hr": market.get("volume24hr"),
+                "volume": market.get("volume"),
+                "end_date": market.get("endDate"),
+                "start_date": market.get("startDate"),
+                "closed": market.get("closed"),
+                "active": market.get("active"),
+                "accepting_orders": market.get("acceptingOrders"),
+            }
+    return token_map
+
+
+def decode_order_filled(log):
+    data=bytes.fromhex(log["data"][2:])
+    decoded=decode(["uint256","uint256","uint256","uint256","uint256","bytes32","bytes32"], data)
+    topics=log["topics"]
+    if len(topics) != 4 or topics[0].lower() != ORDER_FILLED_TOPIC:
+        raise RuntimeError('Unexpected OrderFilled event topics')
+    return {
+        "order_hash": topics[1],
+        "maker": "0x" + topics[2][-40:],
+        "taker": "0x" + topics[3][-40:],
+        "side": int(decoded[0]),
+        "token_id": str(decoded[1]),
+        "maker_amount": int(decoded[2]),
+        "taker_amount": int(decoded[3]),
+        "fee": int(decoded[4]),
+    }
+
+
+def calculate_trade_metrics(trade):
+    """Normalize V2 OrderFilled amounts into USD, token shares and price.
+
+    V2 BUY:  makerAmount = collateral/USD, takerAmount = outcome shares.
+    V2 SELL: makerAmount = outcome shares, takerAmount = collateral/USD.
+    """
+    maker_amount=trade["maker_amount"] / 1_000_000
+    taker_amount=trade["taker_amount"] / 1_000_000
+    side=trade["side"]
+
+    if side == 0:  # BUY
+        side_label="BUY"
+        trade_usd=maker_amount
+        token_amount=taker_amount
+    elif side == 1:  # SELL
+        side_label="SELL"
+        token_amount=maker_amount
+        trade_usd=taker_amount
+    else:
+        return {"maker_amount":maker_amount,"taker_amount":taker_amount,"fill_price":None,"trade_usd":None,"token_amount":None,"side_label":"UNKNOWN"}
+
+    fill_price=(trade_usd/token_amount) if token_amount and token_amount > 0 else None
+    return {
+        "maker_amount": maker_amount,
+        "taker_amount": taker_amount,
+        "fill_price": fill_price,
+        "trade_usd": trade_usd,
+        "token_amount": token_amount,
+        "side_label": side_label,
+    }
+
+
+def safe_float(value):
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else None
+    except (TypeError, ValueError): return None
+
+
+def lookup_market(token_id):
+    # Explicitly try open and closed markets: downtime can span market closure.
+    for closed in (False, True):
+        response = requests.get(f'{GAMMA_API}/markets',
+            params={'clob_token_ids': [token_id], 'closed': closed, 'limit': 100}, timeout=30)
+        response.raise_for_status()
+        markets = response.json()
+        if not isinstance(markets, list):
+            raise RuntimeError('Gamma token lookup returned an invalid response')
+        market = build_token_map(markets).get(token_id)
+        if market:
+            return market
+    raise RuntimeError('Aggressor token metadata unavailable; batch will be retried')
+
+
+def load_market_map():
+    markets=get_active_markets()
+    token_map=build_token_map(markets)
+    print(f"[COLLECTOR] Active markets: {len(markets)} | token mappings: {len(token_map)}")
+    return token_map
+
+
+def normalize_trade(log, trade, market, header):
+    metrics = calculate_trade_metrics(trade)
+    if metrics['side_label'] == 'UNKNOWN' or not metrics['token_amount'] or not (0 < metrics['fill_price'] < 1):
+        raise RuntimeError('Invalid decoded trade metrics; batch will be retried')
+    exchange = log['_exchange_address']
+    trade_usd = metrics['trade_usd']
+    volume24hr = safe_float(market.get('volume24hr'))
+    ratio = trade_usd / volume24hr if volume24hr and volume24hr > 0 else None
+    saved={
+        "collector_version": COLLECTOR_VERSION,
+        "flow_role": "TAKER_AGGRESSOR",
+        "detected_at": datetime.now(timezone.utc).isoformat(),
+        "block": int(log["blockNumber"],16),
+        "transaction_hash": log["transactionHash"],
+        "log_index": int(log["logIndex"],16),
+        "exchange_address": exchange,
+        "market_id": market["market_id"],
+        "condition_id": market["condition_id"],
+        "question": market["question"],
+        "outcome": market["outcome"],
+        "start_date": market.get("start_date"),
+        "end_date": market.get("end_date"),
+        "active": market.get("active"),
+        "closed": market.get("closed"),
+        "accepting_orders": market.get("accepting_orders"),
+        "price": market.get("price"),
+        "volume24hr": volume24hr,
+        "volume": market.get("volume"),
+        "token_id": trade["token_id"],
+        "order_hash": trade["order_hash"],
+        "maker": trade["maker"],
+        "taker": trade["taker"],
+        "side": trade["side"],
+        "side_label": metrics["side_label"],
+        "maker_amount_raw": trade["maker_amount"],
+        "taker_amount_raw": trade["taker_amount"],
+        "maker_amount": metrics["maker_amount"],
+        "taker_amount": metrics["taker_amount"],
+        "token_amount": metrics["token_amount"],
+        "fill_price": metrics["fill_price"],
+        "trade_usd": trade_usd,
+        "trade_to_volume_ratio": ratio,
+        "fee": trade["fee"],
+    }
+    saved['block_hash'] = log['blockHash']
+    saved['block_timestamp'] = header['block_timestamp']
+    return saved
+
+
+def initialize_store(store, latest_block):
+    checkpoint = store.checkpoint()
+    if checkpoint is None:
+        safe_tip = latest_block - CONFIRMATION_BLOCKS
+        if safe_tip < 1:
+            raise RuntimeError('Not enough confirmed blocks to initialize collector')
+        try:
+            start = int(START_BLOCK) if START_BLOCK else max(1, safe_tip - INITIAL_LOOKBACK_BLOCKS + 1)
+        except ValueError:
+            raise FatalConfigError('COLLECTOR_START_BLOCK must be an integer') from None
+        if start < 1 or start > safe_tip:
+            raise FatalConfigError('COLLECTOR_START_BLOCK must be within confirmed chain history')
+        anchor = get_block_header(start - 1)
+        store.initialize(start - 1, anchor['block_hash'])
+        checkpoint = store.checkpoint()
+        print(f"[COLLECTOR] First-run range begins at block {start}")
+    current = get_block_header(checkpoint['block_number'])
+    if current['block_hash'].lower() != checkpoint['block_hash']:
+        raise StorageError('Checkpoint hash changed; manual chain-reorganization recovery required')
+    return checkpoint
+
+
+def scan_once(store, token_map):
+    # Repair a failed/missed JSON publication BEFORE accepting another batch.
+    checkpoint = store.checkpoint()
+    safe_tip = get_latest_block() - CONFIRMATION_BLOCKS
+    if safe_tip <= checkpoint['block_number']:
+        return 0
+    from_block = checkpoint['block_number'] + 1
+    to_block = min(from_block + 4, safe_tip)
+    with __import__("concurrent.futures").futures.ThreadPoolExecutor(max_workers=5) as pool:
+        headers = list(pool.map(get_block_header, range(from_block, to_block + 1)))
+    by_number = {header['block_number']: header for header in headers}
+    # get_order_filled_logs returns only after BOTH exchanges succeed.
+    logs = get_order_filled_logs(from_block, to_block)
+    rows = []
+    for log in logs:
+        n = int(log['blockNumber'], 16)
+        header = by_number.get(n)
+        if header is None or log.get('removed') or log['blockHash'].lower() != header['block_hash'].lower():
+            raise StorageError('Log does not match the requested canonical block range')
+        trade = decode_order_filled(log)
+        exchange = log['_exchange_address']
+        if trade['taker'].lower() != exchange.lower():
+            continue
+        market = token_map.get(trade['token_id'])
+        if market is None:
+            market = lookup_market(trade['token_id'])
+            token_map[trade['token_id']] = market
+        rows.append(normalize_trade(log, trade, market, header))
+    # Recheck the final header after RPC/metadata calls to detect a changed range.
+    if get_block_header(to_block)['block_hash'].lower() != headers[-1]['block_hash'].lower():
+        raise StorageError('Block range changed while scanning; refusing to commit')
+    inserted = store.commit_batch(headers, rows)
+    publish_snapshot(store, LIVE_TRADES_FILE)
+    age_min = max(0.0, (time.time() - headers[-1]['block_timestamp']) / 60.0)
+    print(f'[COLLECTOR] Committed blocks {from_block}-{to_block}: {inserted} new trades - DATA AGE: {age_min:.1f} min')
+    return inserted
+
+
+def main():
+    print('[COLLECTOR] SQLite checkpoint + block timestamps + JSON compatibility view')
+    try:
+        with CollectorLock(DATABASE_FILE.with_suffix('.lock')):
+            if int(rpc_call('eth_chainId', []), 16) != 137:
+                raise FatalConfigError('Configured RPC is not Polygon chain 137')
+            with CollectorStore(DATABASE_FILE) as store:
+                checkpoint = initialize_store(store, get_latest_block())
+                publish_snapshot(store, LIVE_TRADES_FILE)
+                print(f"[COLLECTOR] Resume after block {checkpoint['block_number']}")
+                token_map = load_market_map()
+                last_market_refresh = time.time()
+                retry_index = 0
+
+                while True:
+                    before_checkpoint = _checkpoint_block(store)
+                    try:
+                        if time.time() - last_market_refresh >= MARKET_REFRESH_INTERVAL:
+                            token_map = load_market_map()
+                            last_market_refresh = time.time()
+
+                        scan_once(store, token_map)
+                        after_checkpoint = _checkpoint_block(store)
+
+                        if (before_checkpoint is not None and after_checkpoint is not None
+                                and after_checkpoint > before_checkpoint):
+                            retry_index = 0
+
+                        time.sleep(CHECK_INTERVAL)
+
+                    except StorageError:
+                        raise
+                    except FatalConfigError:
+                        raise
+                    except RetryableCollectorError as exc:
+                        delay = BATCH_BACKOFF_SECONDS[min(retry_index, len(BATCH_BACKOFF_SECONDS) - 1)]
+                        retry_index += 1
+                        print(f'[COLLECTOR] RETRYABLE_BATCH ({type(exc).__name__}); retrying in {delay}s')
+                        time.sleep(delay)
+                    except sqlite3.OperationalError as exc:
+                        if not _sqlite_busy(exc):
+                            raise
+                        delay = BATCH_BACKOFF_SECONDS[min(retry_index, len(BATCH_BACKOFF_SECONDS) - 1)]
+                        retry_index += 1
+                        print(f'[COLLECTOR] RETRYABLE_BATCH (SQLite busy/locked); retrying in {delay}s')
+                        time.sleep(delay)
+                    except requests.RequestException as exc:
+                        status = _http_status(exc)
+                        if status in (401, 403):
+                            raise FatalConfigError(
+                                f'HTTP {status} authentication/authorization failure'
+                            ) from None
+                        retryable = (
+                            isinstance(exc, (requests.Timeout, requests.ConnectionError))
+                            or status == 429
+                            or (isinstance(status, int) and 500 <= status <= 599)
+                        )
+                        if not retryable:
+                            raise
+                        delay = BATCH_BACKOFF_SECONDS[min(retry_index, len(BATCH_BACKOFF_SECONDS) - 1)]
+                        retry_index += 1
+                        print(f'[COLLECTOR] RETRYABLE_BATCH ({type(exc).__name__}); retrying in {delay}s')
+                        time.sleep(delay)
+                    except Exception as exc:
+                        after_checkpoint = _checkpoint_block(store)
+                        if (before_checkpoint is not None and after_checkpoint is not None
+                                and after_checkpoint > before_checkpoint):
+                            retry_index = 0
+                            print(f'[COLLECTOR] LOCAL_DEGRADE ({type(exc).__name__}); core batch committed')
+                            time.sleep(CHECK_INTERVAL)
+                            continue
+                        raise
+
+    except KeyboardInterrupt:
+        print('[COLLECTOR] Stopped')
+    except FatalConfigError as exc:
+        print(f'[COLLECTOR] Fatal configuration: {exc}')
+        raise SystemExit(1) from None
+    except StorageError as exc:
+        print(f'[COLLECTOR] Storage/chain history conflict: {exc}')
+        raise SystemExit(1) from None
+    except RuntimeError as exc:
+        print(f'[COLLECTOR] RuntimeError: {exc}')
+        raise SystemExit(1) from None
+    except Exception as exc:
+        print(
+            f'[COLLECTOR] Stopped safely ({type(exc).__name__}); '
+            'check connectivity, configuration or stored chain history'
+        )
+        raise SystemExit(1) from None
+
+
+
+_LIVE1C_CURRENT=None
+
+def _live1c_flag(r,f):
+    if f and f not in r["flags"]: r["flags"].append(f)
+
+def _live1c_begin(store,outer_retries=0):
+    global _LIVE1C_CURRENT
+    cp=store.checkpoint() or {}
+    n=cp.get("block_number")
+    r={"_started":time.perf_counter(),"status":None,"from_block":None,"to_block":None,"blocks":0,
+       "safe_tip":None,"checkpoint_before":n,"checkpoint_after":n,"lag_before":0,"lag_after":0,
+       "batch_ms":0.0,"blocks_per_second":0.0,"get_logs_ms":0.0,"timestamp_ms":0.0,
+       "decode_ms":0.0,"enrichment_ms":0.0,"sqlite_ms":0.0,"compatibility_ms":0.0,
+       "compatibility_rows":0,"rpc_calls":0,"rpc_retries":0,"outer_retries":int(outer_retries),
+       "backoff_ms":0,"raw_log_count":0,"trade_count":0,"unique_tx_count":0,
+       "gamma_lookup_count":0,"gamma_lookup_ms":0.0,"gamma_refresh_ms":0.0,"rpc_ms":0.0,"flags":[]}
+    _LIVE1C_CURRENT=r
+    return r
+
+def _emit_live1c_record(r):
+    print("[LIVE-1C] "+json.dumps({k:v for k,v in r.items() if not k.startswith("_")},
+          sort_keys=True,separators=(",",":")))
+
+def _live1c_finish(r,status,store,backoff_ms=0,flag=None):
+    global _LIVE1C_CURRENT
+    cp=store.checkpoint() or {}
+    r["checkpoint_after"]=cp.get("block_number",r["checkpoint_before"])
+    if r["safe_tip"] is None and r.get("_latest") is not None:
+        r["safe_tip"]=int(r["_latest"])-CONFIRMATION_BLOCKS
+    if r["safe_tip"] is not None and r["checkpoint_before"] is not None:
+        r["lag_before"]=max(0,int(r["safe_tip"])-int(r["checkpoint_before"]))
+        r["lag_after"]=max(0,int(r["safe_tip"])-int(r["checkpoint_after"]))
+    r["status"]=status;r["backoff_ms"]=max(0,int(backoff_ms));_live1c_flag(r,flag)
+    r["batch_ms"]=max(0.0,(time.perf_counter()-r["_started"])*1000.0)
+    if r["blocks"] and r["batch_ms"]>0:r["blocks_per_second"]=r["blocks"]/(r["batch_ms"]/1000.0)
+    try:_emit_live1c_record(r)
+    except Exception:pass
+    if _LIVE1C_CURRENT is r:_LIVE1C_CURRENT=None
+    return r
+
+_live1c_rpc_impl=rpc_call
+def rpc_call(method,params):
+    r=_LIVE1C_CURRENT
+    if r is None:return _live1c_rpc_impl(method,params)
+    post=requests.post;n=[0];t=time.perf_counter()
+    def observed(*a,**k):n[0]+=1;return post(*a,**k)
+    requests.post=observed
+    try:return _live1c_rpc_impl(method,params)
+    finally:
+        requests.post=post;r["rpc_calls"]+=n[0];r["rpc_retries"]+=max(0,n[0]-1)
+        r["rpc_ms"]+=max(0.0,(time.perf_counter()-t)*1000.0)
+        if n[0]>1:_live1c_flag(r,"RPC_RETRY")
+
+_live1c_scan_impl=scan_once
+def scan_once(store,token_map):
+    r=_LIVE1C_CURRENT
+    if r is None:return _live1c_scan_impl(store,token_map)
+    g=globals();saved={};names=("get_latest_block","get_block_header","get_order_filled_logs","lookup_market","publish_snapshot","decode_order_filled","normalize_trade")
+    for n in names:
+        if n in g:saved[n]=g[n]
+    commit=store.commit_batch
+    def latest():
+        v=saved["get_latest_block"]();r["_latest"]=v;r["safe_tip"]=int(v)-CONFIRMATION_BLOCKS
+        return v
+    def hdr(n):
+        t=time.perf_counter()
+        try:return saved["get_block_header"](n)
+        finally:r["timestamp_ms"]+=max(0.0,(time.perf_counter()-t)*1000.0)
+    def logs(a,b):
+        t=time.perf_counter()
+        try:
+            v=saved["get_order_filled_logs"](a,b);r["raw_log_count"]=len(v);r["from_block"]=int(a);r["to_block"]=int(b);r["blocks"]=max(0,int(b)-int(a)+1);return v
+        finally:r["get_logs_ms"]+=max(0.0,(time.perf_counter()-t)*1000.0)
+    def lookup(token):
+        t=time.perf_counter();r["gamma_lookup_count"]+=1;_live1c_flag(r,"TOKEN_LOOKUP")
+        try:return saved["lookup_market"](token)
+        finally:r["gamma_lookup_ms"]+=max(0.0,(time.perf_counter()-t)*1000.0)
+    def publish(st,dst):
+        t=time.perf_counter()
+        try:
+            v=saved["publish_snapshot"](st,dst);r["compatibility_rows"]=v;return v
+        finally:r["compatibility_ms"]+=max(0.0,(time.perf_counter()-t)*1000.0)
+    def dec(*a,**k):
+        t=time.perf_counter()
+        try:return saved["decode_order_filled"](*a,**k)
+        finally:r["decode_ms"]+=max(0.0,(time.perf_counter()-t)*1000.0)
+    def norm(*a,**k):
+        t=time.perf_counter()
+        try:return saved["normalize_trade"](*a,**k)
+        finally:r["enrichment_ms"]+=max(0.0,(time.perf_counter()-t)*1000.0)
+    def commit_obs(blocks,trades):
+        t=time.perf_counter()
+        try:
+            v=commit(blocks,trades);r["trade_count"]=len(trades);r["unique_tx_count"]=len({x.get("transaction_hash") or x.get("tx_hash") for x in trades if isinstance(x,dict) and (x.get("transaction_hash") or x.get("tx_hash"))});return v
+        finally:r["sqlite_ms"]+=max(0.0,(time.perf_counter()-t)*1000.0)
+    g["get_latest_block"]=latest;g["get_block_header"]=hdr;g["get_order_filled_logs"]=logs;g["lookup_market"]=lookup;g["publish_snapshot"]=publish
+    if "decode_order_filled" in saved:g["decode_order_filled"]=dec
+    g["normalize_trade"]=norm
+    store.commit_batch=commit_obs
+    try:return _live1c_scan_impl(store,token_map)
+    finally:
+        store.commit_batch=commit
+        for n,v in saved.items():g[n]=v
+
+_live1c_main_impl=main
+def main():
+    g=globals();scan0=g["scan_once"];refresh0=g["load_market_map"];sleep0=time.sleep
+    st={"outer":0,"pending":None,"refresh":None,"startup":True}
+    def refresh(*a,**k):
+        t=time.perf_counter()
+        try:return refresh0(*a,**k)
+        finally:
+            ms=max(0.0,(time.perf_counter()-t)*1000.0)
+            if st["startup"]:st["startup"]=False
+            else:st["refresh"]=ms
+    def scan(sto,tok):
+        r=_live1c_begin(sto,st["outer"])
+        if st["refresh"] is not None:r["gamma_refresh_ms"]=st["refresh"];_live1c_flag(r,"GAMMA_REFRESH");st["refresh"]=None
+        try:v=scan0(sto,tok)
+        except KeyboardInterrupt:
+            global _LIVE1C_CURRENT
+            _LIVE1C_CURRENT=None
+            raise
+        except Exception as e:
+            if isinstance(e,StorageError) or "Fatal" in type(e).__name__:_live1c_finish(r,"FATAL_FAILURE",sto)
+            else:st["pending"]=(r,sto)
+            raise
+        else:
+            _live1c_finish(r,"SUCCESS",sto);st["outer"]=0;return v
+    def sleep(sec):
+        if st["pending"] is not None:
+            r,sto=st["pending"];_live1c_finish(r,"RETRYABLE_FAILURE",sto,backoff_ms=float(sec)*1000.0);st["pending"]=None;st["outer"]+=1
+        return sleep0(sec)
+    g["scan_once"]=scan;g["load_market_map"]=refresh;time.sleep=sleep
+    try:return _live1c_main_impl()
+    finally:g["scan_once"]=scan0;g["load_market_map"]=refresh0;time.sleep=sleep0
+
+
+
+# ============================================================
+# LIVE-1D GAMMA MISS + RPC METHOD ATTRIBUTION
+# Instrumentation only. This layer observes existing LIVE-1C
+# calls and must not change collector decisions or I/O shape.
+# ============================================================
+
+_LIVE1D_MISS_HISTORY = {}
+_LIVE1D_REFRESH_GENERATION = 0
+
+def _live1d_market_classification(market_value):
+    if not isinstance(market_value, dict):
+        return "LOOKUP_FAILED"
+    active = market_value.get("active")
+    closed = market_value.get("closed")
+    accepting = market_value.get(
+        "accepting_orders",
+        market_value.get("acceptingOrders"),
+    )
+    if active is True and closed is not True and accepting is not False:
+        return "ACTIVE_OPEN"
+    return "CLOSED_INACTIVE_HISTORICAL"
+
+def _live1d_note_refresh():
+    global _LIVE1D_REFRESH_GENERATION
+    _LIVE1D_REFRESH_GENERATION += 1
+    return _LIVE1D_REFRESH_GENERATION
+
+def _live1d_note_gamma_miss(record, token_id, market_value, lookup_succeeded=True):
+    token = str(token_id)
+    history = _LIVE1D_MISS_HISTORY.get(token)
+    miss_number = int(history.get("miss_number", 0)) + 1 if history else 1
+    generation = int(_LIVE1D_REFRESH_GENERATION)
+    classification = (
+        _live1d_market_classification(market_value)
+        if lookup_succeeded
+        else "LOOKUP_FAILED"
+    )
+    previous_generation = history.get("refresh_generation") if history else None
+    previous_classification = (
+        history.get("market_classification") if history else None
+    )
+    repeated = history is not None
+    after_refresh = generation > 0
+    fallback_lost = bool(
+        repeated
+        and previous_generation is not None
+        and generation > int(previous_generation)
+    )
+    item = {
+        "token_id": token,
+        "timestamp": float(time.time()),
+        "repeated_miss": repeated,
+        "miss_number": miss_number,
+        "repeated_miss_count": max(0, miss_number - 1),
+        "refresh_generation": generation,
+        "after_refresh": after_refresh,
+        "fallback_lost_after_refresh": fallback_lost,
+        "previous_refresh_generation": previous_generation,
+        "previous_market_classification": previous_classification,
+        "market_classification": classification,
+        "lookup_succeeded": bool(lookup_succeeded),
+    }
+    record.setdefault("gamma_misses", []).append(item)
+    _LIVE1D_MISS_HISTORY[token] = {
+        "miss_number": miss_number,
+        "refresh_generation": generation,
+        "market_classification": classification,
+    }
+    return item
+
+_live1d_begin_impl = _live1c_begin
+def _live1c_begin(store, outer_retries=0):
+    record = _live1d_begin_impl(store, outer_retries=outer_retries)
+    record.setdefault("gamma_misses", [])
+    record.setdefault("rpc_methods", {})
+    record.setdefault(
+        "live1d_refresh_generation",
+        int(_LIVE1D_REFRESH_GENERATION),
+    )
+    return record
+
+_live1d_rpc_impl = rpc_call
+def rpc_call(method, params):
+    record = _LIVE1C_CURRENT
+    if record is None:
+        return _live1d_rpc_impl(method, params)
+    calls_before = int(record.get("rpc_calls", 0))
+    retries_before = int(record.get("rpc_retries", 0))
+    try:
+        return _live1d_rpc_impl(method, params)
+    finally:
+        calls_delta = max(
+            0, int(record.get("rpc_calls", 0)) - calls_before
+        )
+        retries_delta = max(
+            0, int(record.get("rpc_retries", 0)) - retries_before
+        )
+        try:
+            methods = record.setdefault("rpc_methods", {})
+            entry = methods.setdefault(
+                str(method),
+                {"calls": 0, "retries": 0},
+            )
+            entry["calls"] += calls_delta
+            entry["retries"] += retries_delta
+        except Exception:
+            pass
+
+_live1d_scan_impl = scan_once
+def scan_once(store, token_map):
+    record = _LIVE1C_CURRENT
+    if record is None:
+        return _live1d_scan_impl(store, token_map)
+    original_lookup = globals()["lookup_market"]
+
+    def observed_lookup(token_id):
+        try:
+            value = original_lookup(token_id)
+        except Exception:
+            try:
+                _live1d_note_gamma_miss(
+                    record,
+                    token_id,
+                    None,
+                    lookup_succeeded=False,
+                )
+            except Exception:
+                pass
+            raise
+        try:
+            _live1d_note_gamma_miss(
+                record,
+                token_id,
+                value,
+                lookup_succeeded=True,
+            )
+        except Exception:
+            pass
+        return value
+
+    globals()["lookup_market"] = observed_lookup
+    try:
+        return _live1d_scan_impl(store, token_map)
+    finally:
+        globals()["lookup_market"] = original_lookup
+
+_live1d_main_impl = main
+def main():
+    original_refresh = globals()["load_market_map"]
+    state = {"startup": True}
+
+    def observed_refresh(*args, **kwargs):
+        value = original_refresh(*args, **kwargs)
+        if state["startup"]:
+            state["startup"] = False
+        else:
+            try:
+                _live1d_note_refresh()
+            except Exception:
+                pass
+        return value
+
+    globals()["load_market_map"] = observed_refresh
+    try:
+        return _live1d_main_impl()
+    finally:
+        globals()["load_market_map"] = original_refresh
+
+
+if __name__ == '__main__':
+    main()
+
+===== tests/test_collector_sqlite.py =====
+"""Offline integration: real ABI decoding/SQLite; mocked RPC and Gamma."""
+import importlib.util
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch, Mock
+from eth_abi import encode
+
+BASE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE))
+os.environ.setdefault('POLYMARKET_RPC_URL', 'http://127.0.0.1:1')
+spec = importlib.util.spec_from_file_location('collector_sqlite_test', BASE/'scripts/live_active_trades.py')
+collector = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(collector)
+REAL_GET_LOGS = collector.get_order_filled_logs
+from collector_storage_v4.storage import CollectorStore, StorageError
+from collector_storage_v4.bridge import CollectorLock, publish_snapshot
+
+
+def h(n):
+    return '0x'+f'{n:064x}'
+
+
+def header(n):
+    return {'block_number':n,'block_hash':h(n),'parent_hash':h(n-1),
+            'block_timestamp':int(time.time())-30+(n-101)*2}
+
+
+def market(token='123'):
+    return {'market_id':'1','condition_id':h(999),'question':'Offline fixture',
+            'outcome':'Yes' if token=='123' else 'No','price':'.5',
+            'volume24hr':1000,'volume':10000,'active':True,'closed':False,
+            'accepting_orders':True,'end_date':'2027-01-01T00:00:00Z'}
+
+
+def event(n=101, token=123, exchange=None, side=0, maker_event=False):
+    exchange=exchange or collector.EXCHANGES[0]
+    taker='0x'+'b'*40 if maker_event else exchange
+    data=encode(['uint256']*5+['bytes32']*2,
+                [side,token,25_000_000 if side==0 else 50_000_000,
+                 50_000_000 if side==0 else 25_000_000,0,b'\0'*32,b'\0'*32])
+    return {'blockNumber':hex(n),'blockHash':h(n),'transactionHash':h(n+1000),
+            'logIndex':'0x0','data':'0x'+data.hex(), 'removed':False,'address':exchange,
+            'topics':[collector.ORDER_FILLED_TOPIC,h(42),'0x'+'0'*24+'a'*40,
+                      '0x'+'0'*24+taker[2:]],'_exchange_address':exchange}
+
+
+class CollectorIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name)
+        self.path=self.root/'collector.db'
+        self.json_path=self.root/'live_trades.jsonl'
+        self.store=CollectorStore(self.path)
+        self.store.initialize(100,h(100))
+        self.addCleanup(lambda:self.store.close() if self.store else None)
+        self.token_map={'123':market(),'456':market('456')}
+        for p in [patch.object(collector,'LIVE_TRADES_FILE',self.json_path),
+                  patch.object(collector,'get_latest_block',return_value=123),
+                  patch.object(collector,'get_block_header',side_effect=header),
+                  patch.object(collector,'get_order_filled_logs',return_value=[event()]),
+                  patch.object(collector,'CONFIRMATION_BLOCKS',20),
+                  patch.object(collector,'INITIAL_LOOKBACK_BLOCKS',500),
+                  patch.object(collector,'START_BLOCK',''),
+                  patch.object(collector.requests,'post',side_effect=AssertionError('No real RPC in tests')),
+                  patch.object(collector.requests,'get',side_effect=AssertionError('No real Gamma in tests'))]:
+            p.start();self.addCleanup(p.stop)
+
+    def reopen(self):
+        self.store.close()
+        self.store=CollectorStore(self.path)
+
+    def rows(self):
+        return self.store.recent_trades(0)
+
+    def test_real_decoding_both_exchanges_and_json_contract(self):
+        logs=[event(),event(102,456,collector.EXCHANGES[1],side=1),event(103,maker_event=True)]
+        with patch.object(collector,'get_order_filled_logs',return_value=logs):
+            self.assertEqual(collector.scan_once(self.store,self.token_map),2)
+        rows=[json.loads(line) for line in self.json_path.read_text().splitlines()]
+        self.assertEqual([r['side_label'] for r in rows],['BUY','SELL'])
+        self.assertEqual([r['trade_usd'] for r in rows],[25,25])
+        self.assertEqual([r['token_amount'] for r in rows],[50,50])
+        self.assertEqual([r['token_id'] for r in rows],['123','456'])
+        self.assertEqual(self.store.checkpoint()['block_number'],103)
+        self.assertTrue(all(r['block_timestamp'] and r['collector_version']==4 for r in rows))
+
+    def test_second_exchange_rpc_failure_does_not_commit(self):
+        # Exercise the real two-exchange implementation, bypassing setup mock.
+        responses=Mock(side_effect=[[event()],RuntimeError('Second exchange failed')])
+        with patch.object(collector,'get_order_filled_logs',side_effect=REAL_GET_LOGS), \
+             patch.object(collector,'rpc_call',responses):
+            with self.assertRaises(RuntimeError):collector.scan_once(self.store,self.token_map)
+        self.assertEqual(responses.call_count,2)
+        self.assertEqual(self.store.checkpoint()['block_number'],100)
+        self.assertEqual(self.rows(),[])
+
+    def test_bad_decode_mid_batch_retries_without_partial_history(self):
+        bad=event(102);bad['data']='0x00'
+        with patch.object(collector,'get_order_filled_logs',return_value=[event(),bad]):
+            with self.assertRaises(Exception):collector.scan_once(self.store,self.token_map)
+        self.assertEqual(self.store.checkpoint()['block_number'],100)
+        self.assertEqual(self.rows(),[])
+        self.assertEqual(collector.scan_once(self.store,self.token_map),1)
+
+    def test_resume_uses_saved_block_and_waits_for_confirmations(self):
+        collector.scan_once(self.store,self.token_map)
+        self.reopen()
+        collector.initialize_store(self.store,2000)
+        self.assertEqual(self.store.checkpoint()['block_number'],103)
+        with patch.object(collector,'get_latest_block',return_value=126), \
+             patch.object(collector,'get_order_filled_logs',return_value=[]) as logs:
+            collector.scan_once(self.store,self.token_map)
+        logs.assert_called_once_with(104,106)
+        self.assertEqual(self.store.checkpoint()['block_number'],106)
+
+    def test_first_run_anchor_and_existing_cursor_not_reset(self):
+        with CollectorStore(self.root/'first.db') as other:
+            collector.initialize_store(other,1000)
+            self.assertEqual(other.checkpoint()['block_number'],480)
+            with patch.object(collector,'START_BLOCK','900'):
+                collector.initialize_store(other,1000)
+            self.assertEqual(other.checkpoint()['block_number'],480)
+
+    def test_metadata_lookup_and_missing_metadata_hold_cursor(self):
+        with patch.object(collector,'lookup_market',return_value=market()) as lookup:
+            collector.scan_once(self.store,{})
+            lookup.assert_called_once_with('123')
+        with patch.object(collector,'get_latest_block',return_value=126), \
+             patch.object(collector,'get_order_filled_logs',return_value=[event(104,789)]), \
+             patch.object(collector,'lookup_market',side_effect=RuntimeError('Unavailable')):
+            with self.assertRaises(RuntimeError):collector.scan_once(self.store,self.token_map)
+        self.assertEqual(self.store.checkpoint()['block_number'],103)
+
+    def test_lookup_closed_market_and_validate_token(self):
+        response=Mock();response.raise_for_status.return_value=None
+        response.json.side_effect=[[],[{'id':'1','conditionId':h(999),'clobTokenIds':'["123"]',
+                                      'outcomes':'["Yes"]','closed':True}]]
+        with patch.object(collector.requests,'get',return_value=response) as get:
+            self.assertTrue(collector.lookup_market('123')['closed'])
+        self.assertEqual(get.call_args_list[0].kwargs['params']['closed'],False)
+        self.assertEqual(get.call_args_list[1].kwargs['params']['closed'],True)
+
+    def test_reorg_or_log_hash_conflict_stops_batch(self):
+        bad=event();bad['blockHash']=h(765)
+        with patch.object(collector,'get_order_filled_logs',return_value=[bad]):
+            with self.assertRaises(StorageError):collector.scan_once(self.store,self.token_map)
+        self.assertEqual(self.store.checkpoint()['block_number'],100)
+        changed=header(100);changed['block_hash']=h(765)
+        with patch.object(collector,'get_block_header',return_value=changed):
+            with self.assertRaises(StorageError):collector.initialize_store(self.store,123)
+
+    def test_json_publish_failure_recovers_from_committed_sqlite(self):
+        real=collector.publish_snapshot
+        calls=0
+        def interrupted(*args):
+            nonlocal calls
+            calls+=1
+            if calls==1:raise OSError('Interrupted JSON publication')
+            return real(*args)
+        with patch.object(collector,'publish_snapshot',side_effect=interrupted):
+            with self.assertRaises(OSError):collector.scan_once(self.store,self.token_map)
+        self.assertEqual(self.store.checkpoint()['block_number'],103)
+        self.assertFalse(self.json_path.exists())
+        self.reopen()
+        collector.initialize_store(self.store,123)
+        collector.publish_snapshot(self.store,self.json_path)
+        self.assertEqual(len(self.json_path.read_text().splitlines()),1)
+        self.assertEqual(len(self.rows()),1)
+
+    def test_abrupt_collector_death_after_commit_repairs_json_on_restart(self):
+        source='''
+import os,sys
+from pathlib import Path
+from unittest.mock import patch
+sys.path.insert(0,str(Path.cwd()/'tests'))
+from test_collector_sqlite import collector,header,event,market,CollectorStore
+real=collector.publish_snapshot
+calls=0
+def crash_after_commit(*args):
+    global calls
+    calls+=1
+    if calls==1:os._exit(75)
+    return real(*args)
+with CollectorStore(sys.argv[1]) as store:
+    with patch.object(collector,'LIVE_TRADES_FILE',Path(sys.argv[2])), \\
+         patch.object(collector,'get_latest_block',return_value=123), \\
+         patch.object(collector,'get_block_header',side_effect=header), \\
+         patch.object(collector,'get_order_filled_logs',return_value=[event()]), \\
+         patch.object(collector,'CONFIRMATION_BLOCKS',20), \\
+         patch.object(collector,'publish_snapshot',side_effect=crash_after_commit):
+        collector.scan_once(store,{'123':market()})
+'''
+        result=subprocess.run([sys.executable,'-B','-c',source,str(self.path),str(self.json_path)],
+                              cwd=BASE,capture_output=True,text=True)
+        self.assertEqual(result.returncode,75,result.stderr)
+        self.reopen()
+        self.assertEqual(self.store.checkpoint()['block_number'],103)
+        self.assertFalse(self.json_path.exists())
+        collector.initialize_store(self.store,123)
+        collector.publish_snapshot(self.store,self.json_path)
+        self.assertEqual(len(self.json_path.read_text().splitlines()),1)
+        self.assertEqual(len(self.rows()),1)
+
+    def test_atomic_json_preserves_original_on_failed_replace(self):
+        original=b'{"old_history":true}\n'
+        self.json_path.write_bytes(original)
+        # Backup replacement succeeds; snapshot replacement then fails.
+        from collector_storage_v4 import bridge
+        real=bridge.replace_file
+        def replace(temp,dest):
+            if Path(dest)==self.json_path:raise PermissionError('Locked file')
+            real(temp,dest)
+        with patch.object(bridge,'replace_file',side_effect=replace):
+            with self.assertRaises(PermissionError):publish_snapshot(self.store,self.json_path)
+        self.assertEqual(self.json_path.read_bytes(),original)
+        self.assertEqual((self.root/'live_trades_before_sqlite.jsonl').read_bytes(),original)
+        collector.scan_once(self.store,self.token_map)
+        publish_snapshot(self.store,self.json_path)
+        self.assertEqual((self.root/'live_trades_before_sqlite.jsonl').read_bytes(),original)
+
+    def test_second_collector_lock_refused_and_released(self):
+        path=self.root/'collector.lock'
+        with CollectorLock(path):
+            with self.assertRaises(RuntimeError):
+                with CollectorLock(path):pass
+        with CollectorLock(path):pass
+
+    def test_rpc_exception_never_exposes_url(self):
+        secret_url='https://example.invalid/PRIVATE_ENDPOINT_TEST'
+        with patch.object(collector.requests,'post',side_effect=collector.requests.ConnectionError(secret_url)):
+            with self.assertRaises(RuntimeError) as error:
+                collector.rpc_call('eth_blockNumber',[])
+        self.assertNotIn('PRIVATE_ENDPOINT_TEST',str(error.exception))
+
+    def test_old_blocks_excluded_from_json_but_retained_in_database(self):
+        old=header(101);old['block_timestamp']=1700000000
+        row=collector.normalize_trade(event(),collector.decode_order_filled(event()),market(),old)
+        self.store.commit_batch([old],[row])
+        publish_snapshot(self.store,self.json_path)
+        self.assertEqual(self.json_path.read_text(),'')
+        self.assertEqual(len(self.rows()),1)
+
+
+
+    def test_retryable_collector_error_uses_first_outer_backoff_before_retry(self):
+        with (
+            patch.object(collector, "CollectorLock"),
+            patch.object(collector, "CollectorStore") as store_cls,
+            patch.object(collector, "rpc_call", return_value="0x89"),
+            patch.object(collector, "initialize_store", return_value={"block_number": 100}),
+            patch.object(collector, "publish_snapshot"),
+            patch.object(collector, "load_market_map", return_value={}),
+            patch.object(collector, "scan_once", side_effect=[collector.RetryableCollectorError("temporary failure"), KeyboardInterrupt]) as scan,
+            patch.object(collector.time, "sleep") as sleep_mock,
+        ):
+            store_cls.return_value.__enter__.return_value = self.store
+            collector.main()
+
+        self.assertEqual(scan.call_count, 2)
+        sleep_mock.assert_called_once_with(1)
+
+
+    def _run_main_retry_case(self, scan_effect, checkpoint=None):
+        cp = checkpoint if checkpoint is not None else {'block_number': 100}
+        store = Mock()
+        store.checkpoint.side_effect = lambda: dict(cp)
+        with (
+            patch.object(collector, 'CollectorLock'),
+            patch.object(collector, 'CollectorStore') as store_cls,
+            patch.object(collector, 'rpc_call', return_value='0x89'),
+            patch.object(collector, 'initialize_store', return_value={'block_number': 100}),
+            patch.object(collector, 'publish_snapshot'),
+            patch.object(collector, 'load_market_map', return_value={}),
+            patch.object(collector, 'scan_once', side_effect=scan_effect) as scan,
+            patch.object(collector.time, 'sleep') as sleep_mock,
+        ):
+            store_cls.return_value.__enter__.return_value = store
+            self._a2b_scan = scan
+            self._a2b_sleep = sleep_mock
+            collector.main()
+        return scan, sleep_mock, store
+
+    def test_a2b_rpc_retryable_transport_and_http_errors_keep_classification(self):
+        cases = [
+            collector.requests.ConnectionError('offline'),
+            collector.requests.HTTPError(response=Mock(status_code=429)),
+            collector.requests.HTTPError(response=Mock(status_code=503)),
+        ]
+        for exc in cases:
+            with self.subTest(exc=type(exc).__name__, status=getattr(getattr(exc, 'response', None), 'status_code', None)):
+                post = Mock(side_effect=exc)
+                with patch.object(collector.requests, 'post', post), patch.object(collector.time, 'sleep') as sleep_mock:
+                    with self.assertRaises(Exception) as error:
+                        collector.rpc_call('eth_blockNumber', [])
+                self.assertEqual(type(error.exception).__name__, 'RetryableCollectorError')
+                self.assertEqual(post.call_count, 3)
+                self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [1, 2])
+
+    def test_a2b_rpc_401_403_are_fatal_config_without_inner_retry(self):
+        for status in (401, 403):
+            with self.subTest(status=status):
+                exc = collector.requests.HTTPError(response=Mock(status_code=status))
+                post = Mock(side_effect=exc)
+                with patch.object(collector.requests, 'post', post), patch.object(collector.time, 'sleep') as sleep_mock:
+                    with self.assertRaises(Exception) as error:
+                        collector.rpc_call('eth_blockNumber', [])
+                self.assertEqual(type(error.exception).__name__, 'FatalConfigError')
+                self.assertEqual(post.call_count, 1)
+                sleep_mock.assert_not_called()
+
+    def test_a2b_temporary_jsonrpc_provider_error_is_retryable_batch(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {'jsonrpc': '2.0', 'id': 1, 'error': {'code': -32000, 'message': 'temporary'}}
+        with patch.object(collector.requests, 'post', return_value=response), patch.object(collector.time, 'sleep') as sleep_mock:
+            with self.assertRaises(Exception) as error:
+                collector.rpc_call('eth_getLogs', [])
+        self.assertEqual(type(error.exception).__name__, 'RetryableCollectorError')
+        sleep_mock.assert_not_called()
+
+    def test_a2b_outer_retry_backoff_is_1_2_5_10_30_and_caps(self):
+        retry_type = getattr(collector, 'RetryableCollectorError', RuntimeError)
+        effects = [retry_type('temporary') for _ in range(6)] + [KeyboardInterrupt()]
+        scan, sleep_mock, _ = self._run_main_retry_case(effects)
+        self.assertEqual(scan.call_count, 7)
+        self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [1, 2, 5, 10, 30, 30])
+
+
+    def test_a2b_timeout_is_retryable_batch(self):
+        post = Mock(side_effect=collector.requests.Timeout('slow'))
+        with patch.object(collector.requests, 'post', post), patch.object(collector.time, 'sleep') as sleep_mock:
+            with self.assertRaises(Exception) as error:
+                collector.rpc_call('eth_blockNumber', [])
+        self.assertEqual(type(error.exception).__name__, 'RetryableCollectorError')
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [1, 2])
+
+    def test_a2b_sqlite_busy_is_retryable_batch(self):
+        busy = sqlite3.OperationalError('busy')
+        busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        scan, sleep_mock, _ = self._run_main_retry_case([busy, KeyboardInterrupt()])
+        self.assertEqual(scan.call_count, 2)
+        self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [1])
+
+    def test_a2b_storage_error_is_fatal_without_retry(self):
+        with self.assertRaises(SystemExit) as stopped:
+            self._run_main_retry_case([StorageError('history conflict')])
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(self._a2b_scan.call_count, 1)
+        self._a2b_sleep.assert_not_called()
+
+    def test_a2b_unknown_runtime_error_is_fatal_not_retryable(self):
+        with self.assertRaises(SystemExit) as stopped:
+            self._run_main_retry_case([RuntimeError('decoder/programming failure'), KeyboardInterrupt()])
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(self._a2b_scan.call_count, 1)
+        self._a2b_sleep.assert_not_called()
+
+    def test_a2b_backoff_resets_only_after_checkpoint_advances(self):
+        retry_type = getattr(collector, 'RetryableCollectorError', RuntimeError)
+        cp = {'block_number': 100}
+        calls = 0
+        def effects(*_):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise retry_type('temporary')
+            if calls == 2:
+                cp['block_number'] = 105
+                return 0
+            if calls == 3:
+                raise retry_type('temporary again')
+            raise KeyboardInterrupt()
+        scan, sleep_mock, _ = self._run_main_retry_case(effects, checkpoint=cp)
+        self.assertEqual(scan.call_count, 4)
+        self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [1, collector.CHECK_INTERVAL, 1])
+
+    def test_a2b_no_work_success_does_not_reset_backoff(self):
+        retry_type = getattr(collector, 'RetryableCollectorError', RuntimeError)
+        cp = {'block_number': 100}
+        effects = [retry_type('temporary'), 0, retry_type('temporary again'), KeyboardInterrupt()]
+        scan, sleep_mock, _ = self._run_main_retry_case(effects, checkpoint=cp)
+        self.assertEqual(scan.call_count, 4)
+        self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [1, collector.CHECK_INTERVAL, 2])
+
+    def test_a2b_post_commit_snapshot_failure_is_local_degrade(self):
+        cp = {'block_number': 100}
+        calls = 0
+        def effects(*_):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                cp['block_number'] = 105
+                raise OSError('snapshot export failed after commit')
+            raise KeyboardInterrupt()
+        scan, sleep_mock, _ = self._run_main_retry_case(effects, checkpoint=cp)
+        self.assertEqual(scan.call_count, 2)
+        self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [collector.CHECK_INTERVAL])
+
+    def test_a2b_invalid_start_block_is_fatal_config(self):
+        other_path = self.root / 'invalid-start.db'
+        with CollectorStore(other_path) as other, patch.object(collector, 'START_BLOCK', '999999'):
+            with self.assertRaises(Exception) as error:
+                collector.initialize_store(other, 1000)
+        self.assertEqual(type(error.exception).__name__, 'FatalConfigError')
+
+
+    def test_a2b2_inner_retry_recovers_without_outer_backoff(self):
+        def response(payload):
+            r = Mock()
+            r.raise_for_status.return_value = None
+            r.json.return_value = payload
+            return r
+
+        success_response = response({'jsonrpc': '2.0', 'id': 1, 'result': '0x123'})
+        real_rpc_call = collector.rpc_call
+
+        class PostRouter:
+            def __init__(self):
+                self.call_count = 0
+                self.effects = [collector.requests.Timeout('slow'), success_response]
+
+            def __call__(self, *args, **kwargs):
+                self.call_count += 1
+                effect = self.effects[self.call_count - 1]
+                if isinstance(effect, BaseException):
+                    raise effect
+                return effect
+
+        post = PostRouter()
+        store = Mock()
+        store.checkpoint.return_value = {'block_number': 100}
+        scan_calls = 0
+
+        def rpc_dispatch(method, params):
+            if method == 'eth_chainId':
+                return '0x89'
+            return real_rpc_call(method, params)
+
+        def scan_effect(*_):
+            nonlocal scan_calls
+            scan_calls += 1
+            if scan_calls == 1:
+                self.assertEqual(collector.rpc_call('eth_blockNumber', []), '0x123')
+                return 0
+            raise KeyboardInterrupt()
+
+        with (
+            patch.object(collector, 'CollectorLock'),
+            patch.object(collector, 'CollectorStore') as store_cls,
+            patch.object(collector, 'rpc_call', side_effect=rpc_dispatch),
+            patch.object(collector, 'initialize_store', return_value={'block_number': 100}),
+            patch.object(collector, 'publish_snapshot'),
+            patch.object(collector, 'load_market_map', return_value={}),
+            patch.object(collector, 'scan_once', side_effect=scan_effect) as scan,
+            patch.object(collector.requests, 'post', side_effect=post) as post_mock,
+            patch.object(collector.time, 'sleep') as sleep_mock,
+        ):
+            store_cls.return_value.__enter__.return_value = store
+            collector.main()
+
+        self.assertEqual(scan.call_count, 2)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post_mock.call_count, 2)
+        self.assertEqual(
+            [c.args[0] for c in sleep_mock.call_args_list],
+            [1, collector.CHECK_INTERVAL],
+        )
+
+    def test_a2b2_http500_inner_exhaustion_then_outer_backoff(self):
+        real_rpc_call = collector.rpc_call
+        http500 = collector.requests.HTTPError(response=Mock(status_code=500))
+        post = Mock(side_effect=[http500, http500, http500])
+        store = Mock()
+        store.checkpoint.return_value = {'block_number': 100}
+        scan_calls = 0
+
+        def rpc_dispatch(method, params):
+            if method == 'eth_chainId':
+                return '0x89'
+            return real_rpc_call(method, params)
+
+        def scan_effect(*_):
+            nonlocal scan_calls
+            scan_calls += 1
+            if scan_calls == 1:
+                collector.rpc_call('eth_blockNumber', [])
+                return 0
+            raise KeyboardInterrupt()
+
+        with (
+            patch.object(collector, 'CollectorLock'),
+            patch.object(collector, 'CollectorStore') as store_cls,
+            patch.object(collector, 'rpc_call', side_effect=rpc_dispatch),
+            patch.object(collector, 'initialize_store', return_value={'block_number': 100}),
+            patch.object(collector, 'publish_snapshot'),
+            patch.object(collector, 'load_market_map', return_value={}),
+            patch.object(collector, 'scan_once', side_effect=scan_effect) as scan,
+            patch.object(collector.requests, 'post', post),
+            patch.object(collector.time, 'sleep') as sleep_mock,
+        ):
+            store_cls.return_value.__enter__.return_value = store
+            collector.main()
+
+        self.assertEqual(scan.call_count, 2)
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [1, 2, 1])
+
+    def test_a2b2_jsonrpc_permanent_and_unknown_errors_fail_closed(self):
+        cases = [
+            (-32600, 'invalid request'),
+            (-32601, 'method not found'),
+            (-32602, 'invalid params'),
+            (-32099, 'unknown provider code'),
+        ]
+        for code, message in cases:
+            with self.subTest(code=code):
+                response = Mock()
+                response.raise_for_status.return_value = None
+                response.json.return_value = {
+                    'jsonrpc': '2.0',
+                    'id': 1,
+                    'error': {'code': code, 'message': message},
+                }
+                post = Mock(return_value=response)
+                with (
+                    patch.object(collector.requests, 'post', post),
+                    patch.object(collector.time, 'sleep') as sleep_mock,
+                ):
+                    with self.assertRaises(Exception) as error:
+                        collector.rpc_call('eth_getLogs', [])
+                self.assertEqual(post.call_count, 1)
+                sleep_mock.assert_not_called()
+                self.assertNotIsInstance(error.exception, collector.RetryableCollectorError)
+
+    def test_a2b2_sqlite_locked_retryable_and_ioerr_fatal(self):
+        locked = sqlite3.OperationalError('database is locked')
+        locked.sqlite_errorcode = sqlite3.SQLITE_LOCKED
+        scan, sleep_mock, _ = self._run_main_retry_case([locked, KeyboardInterrupt()])
+        self.assertEqual(scan.call_count, 2)
+        self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [1])
+
+        ioerr = sqlite3.OperationalError('disk I/O error')
+        ioerr.sqlite_errorcode = sqlite3.SQLITE_IOERR
+        with self.assertRaises(SystemExit) as stopped:
+            self._run_main_retry_case([ioerr])
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(self._a2b_scan.call_count, 1)
+        self._a2b_sleep.assert_not_called()
+
+    def test_a2b2_programming_error_after_real_checkpoint_progress_is_fatal(self):
+        real_scan_once = collector.scan_once
+        scan_calls = 0
+
+        def scan_effect(store, token_map):
+            nonlocal scan_calls
+            scan_calls += 1
+            if scan_calls == 1:
+                return real_scan_once(store, token_map)
+            raise ValueError('programming failure after prior committed progress')
+
+        with (
+            patch.object(collector, 'CollectorLock'),
+            patch.object(collector, 'CollectorStore') as store_cls,
+            patch.object(collector, 'rpc_call', return_value='0x89'),
+            patch.object(collector, 'initialize_store', return_value={'block_number': 100}),
+            patch.object(collector, 'load_market_map', return_value=self.token_map),
+            patch.object(collector, 'get_latest_block', return_value=123),
+            patch.object(collector, 'get_block_header', side_effect=header),
+            patch.object(collector, 'get_order_filled_logs', return_value=[event()]),
+            patch.object(collector, 'CONFIRMATION_BLOCKS', 20),
+            patch.object(collector, 'publish_snapshot'),
+            patch.object(collector, 'scan_once', side_effect=scan_effect) as scan,
+            patch.object(collector.time, 'sleep') as sleep_mock,
+        ):
+            store_cls.return_value.__enter__.return_value = self.store
+            with self.assertRaises(SystemExit) as stopped:
+                collector.main()
+
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(scan.call_count, 2)
+        self.assertEqual(self.store.checkpoint()['block_number'], 103)
+        self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [collector.CHECK_INTERVAL])
+
+if __name__=='__main__':
+    unittest.main(verbosity=2)
+
+
+# ============================================================
+# LIVE-1C PERFORMANCE INSTRUMENTATION SAFETY DELTA
+# ============================================================
+
+class Live1CInstrumentationTests(unittest.TestCase):
+    """LIVE-1C instrumentation-only contracts. No strategy assertions."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.db = self.root / "live1c.db"
+        self.json_path = self.root / "live_trades.jsonl"
+        self.store = CollectorStore(self.db)
+        self.addCleanup(self.store.close)
+        self.store.initialize(100, h(100))
+        self.token_map = {"123": market()}
+
+    def _begin(self, outer_retries=0):
+        return collector._live1c_begin(self.store, outer_retries=outer_retries)
+
+    def _finish(self, record, status="SUCCESS", backoff_ms=0, flag=None):
+        return collector._live1c_finish(
+            record, status, self.store, backoff_ms=backoff_ms, flag=flag
+        )
+
+    def test_live1c_01_final_header_recheck_no_commit_no_extra_header_rpc(self):
+        record = self._begin()
+        calls = []
+        seen_to = 0
+        observed_105_hashes = []
+        self.store.commit_batch = Mock(wraps=self.store.commit_batch)
+
+        def changing_header(number):
+            nonlocal seen_to
+            calls.append(number)
+            value = header(number)
+            if number == 105:
+                seen_to += 1
+                if seen_to == 2:
+                    value = dict(value)
+                    value["block_hash"] = h(999999)
+            if number == 105:
+                observed_105_hashes.append(value["block_hash"])
+            return value
+
+        with patch.object(collector, "get_latest_block", return_value=125) as latest, \
+             patch.object(collector, "get_block_header", side_effect=changing_header) as headers, \
+             patch.object(collector, "get_order_filled_logs", return_value=[]), \
+             patch.object(collector, "publish_snapshot") as publish:
+            with self.assertRaises(StorageError):
+                collector.scan_once(self.store, self.token_map)
+
+        result = self._finish(record, "FATAL_FAILURE")
+        self.assertEqual(self.store.checkpoint()["block_number"], 100)
+        publish.assert_not_called()
+        latest.assert_called_once_with()
+        self.assertEqual(headers.call_count, 6)
+        self.assertEqual(calls.count(101), 1)
+        self.assertEqual(calls.count(102), 1)
+        self.assertEqual(calls.count(103), 1)
+        self.assertEqual(calls.count(104), 1)
+        self.assertEqual(calls.count(105), 2)
+        self.assertEqual(seen_to, 2)
+        self.assertEqual(observed_105_hashes, [h(105), h(999999)])
+        self.store.commit_batch.assert_not_called()
+        self.assertEqual(result["status"], "FATAL_FAILURE")
+
+    def test_live1c_04_success_range_durations_counts_and_no_extra_rpc(self):
+        record = self._begin()
+        with patch.object(collector, "get_latest_block", return_value=125) as latest, \
+             patch.object(collector, "get_block_header", side_effect=header) as headers, \
+             patch.object(collector, "get_order_filled_logs", return_value=[event(101)]), \
+             patch.object(collector, "publish_snapshot", return_value=7) as publish:
+            collector.scan_once(self.store, self.token_map)
+
+        result = self._finish(record)
+        self.assertEqual(
+            (result["from_block"], result["to_block"], result["blocks"]),
+            (101, 105, 5),
+        )
+        self.assertEqual(result["safe_tip"], 105)
+        self.assertEqual(result["checkpoint_before"], 100)
+        self.assertEqual(result["checkpoint_after"], 105)
+        self.assertEqual(result["lag_before"], 5)
+        self.assertEqual(result["lag_after"], 0)
+        self.assertEqual(result["compatibility_rows"], 7)
+        self.assertEqual(result["raw_log_count"], 1)
+        self.assertEqual(result["trade_count"], 1)
+        self.assertEqual(result["unique_tx_count"], 1)
+        for field in (
+            "batch_ms", "get_logs_ms", "timestamp_ms", "decode_ms",
+            "enrichment_ms", "sqlite_ms", "compatibility_ms",
+            "gamma_lookup_ms", "gamma_refresh_ms", "rpc_ms",
+        ):
+            self.assertGreaterEqual(result[field], 0)
+        self.assertGreaterEqual(result["blocks_per_second"], 0)
+        latest.assert_called_once_with()
+        self.assertEqual(headers.call_count, 6)
+        publish.assert_called_once_with(self.store, collector.LIVE_TRADES_FILE)
+
+    def test_live1c_02_rpc_retry_counter_preserves_exact_attempts_and_sleep(self):
+        record = self._begin()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": "0x89"}
+        post = Mock(side_effect=[collector.requests.Timeout("slow"), response])
+
+        with patch.object(collector.requests, "post", post), \
+             patch.object(collector.time, "sleep") as sleep_mock:
+            self.assertEqual(collector.rpc_call("eth_blockNumber", []), "0x89")
+
+        result = self._finish(record)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [1])
+        self.assertEqual(result["rpc_calls"], 2)
+        self.assertEqual(result["rpc_retries"], 1)
+        self.assertIn("RPC_RETRY", result["flags"])
+        self.assertGreaterEqual(result["rpc_ms"], 0)
+
+    def test_live1c_05_gamma_token_lookup_cache_unchanged(self):
+        token_map = {}
+        record1 = self._begin()
+        with patch.object(collector, "get_latest_block", return_value=125), \
+             patch.object(collector, "get_block_header", side_effect=header), \
+             patch.object(collector, "get_order_filled_logs", return_value=[event(101)]), \
+             patch.object(collector, "lookup_market", return_value=market()) as lookup, \
+             patch.object(collector, "publish_snapshot", return_value=0):
+            collector.scan_once(self.store, token_map)
+        first = self._finish(record1)
+
+        record2 = self._begin()
+        with patch.object(collector, "get_latest_block", return_value=130), \
+             patch.object(collector, "get_block_header", side_effect=header), \
+             patch.object(collector, "get_order_filled_logs", return_value=[event(106)]), \
+             patch.object(collector, "lookup_market", return_value=market()) as lookup2, \
+             patch.object(collector, "publish_snapshot", return_value=0):
+            collector.scan_once(self.store, token_map)
+        second = self._finish(record2)
+
+        lookup.assert_called_once_with("123")
+        lookup2.assert_not_called()
+        self.assertEqual(first["gamma_lookup_count"], 1)
+        self.assertIn("TOKEN_LOOKUP", first["flags"])
+        self.assertEqual(second["gamma_lookup_count"], 0)
+
+    def test_live1c_08_commit_before_publish_and_rows_from_existing_return(self):
+        order = []
+        real_commit = self.store.commit_batch
+
+        def commit(blocks, trades):
+            order.append("commit")
+            return real_commit(blocks, trades)
+
+        def publish(store, destination):
+            order.append("publish")
+            return 23
+
+        record = self._begin()
+        with patch.object(self.store, "commit_batch", side_effect=commit) as commit_mock, \
+             patch.object(collector, "get_latest_block", return_value=125), \
+             patch.object(collector, "get_block_header", side_effect=header), \
+             patch.object(collector, "get_order_filled_logs", return_value=[]), \
+             patch.object(collector, "publish_snapshot", side_effect=publish) as publish_mock:
+            collector.scan_once(self.store, self.token_map)
+
+        result = self._finish(record)
+        self.assertEqual(order, ["commit", "publish"])
+        self.assertEqual(commit_mock.call_count, 1)
+        self.assertEqual(publish_mock.call_count, 1)
+        self.assertEqual(result["compatibility_rows"], 23)
+
+    def test_live1c_11_metric_logging_failure_cannot_change_committed_batch(self):
+        record = self._begin()
+        with patch.object(collector, "get_latest_block", return_value=125), \
+             patch.object(collector, "get_block_header", side_effect=header), \
+             patch.object(collector, "get_order_filled_logs", return_value=[]), \
+             patch.object(collector, "publish_snapshot", return_value=4) as publish:
+            collector.scan_once(self.store, self.token_map)
+
+        with patch.object(
+            collector, "_emit_live1c_record", side_effect=RuntimeError("diagnostic sink failed")
+        ):
+            result = self._finish(record)
+
+        self.assertEqual(self.store.checkpoint()["block_number"], 105)
+        self.assertEqual(publish.call_count, 1)
+        self.assertEqual(result["checkpoint_after"], 105)
+        self.assertEqual(result["compatibility_rows"], 4)
+
+    def test_live1c_03_06_10_outer_backoff_gamma_schedule_and_success_sleep_unchanged(self):
+        cp = {"block_number": 100}
+        store = Mock()
+        store.checkpoint.side_effect = lambda: dict(cp)
+        retry = collector.RetryableCollectorError("temporary")
+        emitted = []
+
+        # Startup time, before-refresh attempt, refresh boundary, refresh reset, next loop.
+        clock = iter([1000.0, 1299.0, 1300.0, 1300.0, 1301.0])
+
+        with patch.object(collector, "CollectorLock"), \
+             patch.object(collector, "CollectorStore") as store_cls, \
+             patch.object(collector, "rpc_call", return_value="0x89"), \
+             patch.object(collector, "get_latest_block", return_value=123), \
+             patch.object(collector, "initialize_store", return_value={"block_number": 100}), \
+             patch.object(collector, "publish_snapshot"), \
+             patch.object(collector, "load_market_map", side_effect=[{}, {}]) as refresh, \
+             patch.object(collector, "scan_once", side_effect=[retry, 0, KeyboardInterrupt]), \
+             patch.object(collector.time, "time", side_effect=lambda: next(clock)), \
+             patch.object(collector.time, "sleep") as sleep_mock, \
+             patch.object(collector, "_emit_live1c_record", side_effect=lambda r: emitted.append(dict(r))):
+            store_cls.return_value.__enter__.return_value = store
+            collector.main()
+
+        self.assertEqual(collector.CHECK_INTERVAL, 1.5)
+        self.assertEqual(refresh.call_count, 2)  # startup + exactly one scheduled refresh
+        sleeps = [c.args[0] for c in sleep_mock.call_args_list]
+        self.assertEqual(sleeps[:2], [1, collector.CHECK_INTERVAL])
+        self.assertEqual(emitted[0]["status"], "RETRYABLE_FAILURE")
+        self.assertEqual(emitted[0]["outer_retries"], 0)
+        self.assertEqual(emitted[0]["backoff_ms"], 1000)
+        self.assertEqual(emitted[1]["status"], "SUCCESS")
+        self.assertIn("GAMMA_REFRESH", emitted[1]["flags"])
+        self.assertGreaterEqual(emitted[1]["gamma_refresh_ms"], 0)
+
+
+# ============================================================
+# LIVE-1D GAMMA MISS + RPC ATTRIBUTION
+# ============================================================
+
+class Live1DAttributionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = CollectorStore(Path(self.temp.name) / "live1d.db")
+        self.addCleanup(self.store.close)
+        self.store.initialize(100, h(100))
+        collector._LIVE1D_MISS_HISTORY = {}
+        collector._LIVE1D_REFRESH_GENERATION = 0
+
+    def _batch(self, token_map, block_number, resolved):
+        r = collector._live1c_begin(self.store)
+        with patch.object(collector, "get_latest_block", return_value=block_number + 24), \
+             patch.object(collector, "get_block_header", side_effect=header), \
+             patch.object(collector, "get_order_filled_logs", return_value=[event(block_number)]), \
+             patch.object(collector, "lookup_market", return_value=resolved) as lookup, \
+             patch.object(collector, "publish_snapshot", return_value=0):
+            collector.scan_once(self.store, token_map)
+        return collector._live1c_finish(r, "SUCCESS", self.store), lookup
+
+    def test_live1d_gamma_first_repeat_refresh_classification_and_no_extra_lookup(self):
+        active = market()
+        active["active"], active["closed"] = True, False
+        first, lookup1 = self._batch({}, 101, active)
+        lookup1.assert_called_once_with("123")
+        a = first["gamma_misses"][0]
+        self.assertEqual(a["token_id"], "123")
+        self.assertFalse(a["repeated_miss"])
+        self.assertEqual(a["miss_number"], 1)
+        self.assertEqual(a["refresh_generation"], 0)
+        self.assertFalse(a["after_refresh"])
+        self.assertEqual(a["market_classification"], "ACTIVE_OPEN")
+        self.assertTrue(a["lookup_succeeded"])
+        self.assertIsInstance(a["timestamp"], float)
+
+        collector._live1d_note_refresh()
+
+        historical = market()
+        historical["active"], historical["closed"] = False, True
+        second, lookup2 = self._batch({}, 106, historical)
+        lookup2.assert_called_once_with("123")
+        b = second["gamma_misses"][0]
+        self.assertTrue(b["repeated_miss"])
+        self.assertEqual(b["miss_number"], 2)
+        self.assertEqual(b["refresh_generation"], 1)
+        self.assertTrue(b["after_refresh"])
+        self.assertTrue(b["fallback_lost_after_refresh"])
+        self.assertEqual(b["previous_market_classification"], "ACTIVE_OPEN")
+        self.assertEqual(b["market_classification"], "CLOSED_INACTIVE_HISTORICAL")
+
+        r = collector._live1c_begin(self.store)
+        with patch.object(collector, "get_latest_block", return_value=135), \
+             patch.object(collector, "get_block_header", side_effect=header), \
+             patch.object(collector, "get_order_filled_logs", return_value=[event(111)]), \
+             patch.object(collector, "lookup_market") as cached_lookup, \
+             patch.object(collector, "publish_snapshot", return_value=0):
+            collector.scan_once(self.store, {"123": historical})
+        cached = collector._live1c_finish(r, "SUCCESS", self.store)
+        cached_lookup.assert_not_called()
+        self.assertEqual(cached["gamma_misses"], [])
+
+    def test_live1d_rpc_retry_attribution_by_method_without_extra_rpc(self):
+        r = collector._live1c_begin(self.store)
+        ok = Mock()
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": "0x89"}
+        post = Mock(side_effect=[
+            collector.requests.Timeout("bn"), ok,
+            collector.requests.Timeout("l1"),
+            collector.requests.Timeout("l2"), ok,
+            ok,
+        ])
+        with patch.object(collector.requests, "post", post), \
+             patch.object(collector.time, "sleep") as sleep_mock:
+            collector.rpc_call("eth_blockNumber", [])
+            collector.rpc_call("eth_getLogs", [{}])
+            collector.rpc_call("eth_getBlockByNumber", ["0x1", False])
+        out = collector._live1c_finish(r, "SUCCESS", self.store)
+        self.assertEqual(post.call_count, 6)
+        self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [1, 1, 2])
+        self.assertEqual(out["rpc_calls"], 6)
+        self.assertEqual(out["rpc_retries"], 3)
+        self.assertEqual(out["rpc_methods"]["eth_blockNumber"]["retries"], 1)
+        self.assertEqual(out["rpc_methods"]["eth_getLogs"]["retries"], 2)
+        self.assertEqual(out["rpc_methods"]["eth_getBlockByNumber"]["retries"], 0)
+
+    def test_live1d_checkpoint_commit_publish_unchanged(self):
+        real_commit = self.store.commit_batch
+        r = collector._live1c_begin(self.store)
+        with patch.object(self.store, "commit_batch", wraps=real_commit) as commit, \
+             patch.object(collector, "get_latest_block", return_value=125), \
+             patch.object(collector, "get_block_header", side_effect=header), \
+             patch.object(collector, "get_order_filled_logs", return_value=[]), \
+             patch.object(collector, "publish_snapshot", return_value=0) as publish:
+            collector.scan_once(self.store, {"123": market()})
+        out = collector._live1c_finish(r, "SUCCESS", self.store)
+        self.assertEqual(self.store.checkpoint()["block_number"], 105)
+        self.assertEqual(out["checkpoint_after"], 105)
+        self.assertEqual(commit.call_count, 1)
+        self.assertEqual(publish.call_count, 1)
+
+    def test_live1d_attribution_failure_is_fail_open(self):
+        r = collector._live1c_begin(self.store)
+        with patch.object(collector, "get_latest_block", return_value=125), \
+             patch.object(collector, "get_block_header", side_effect=header), \
+             patch.object(collector, "get_order_filled_logs", return_value=[event(101)]), \
+             patch.object(collector, "lookup_market", return_value=market()) as lookup, \
+             patch.object(collector, "_live1d_note_gamma_miss", side_effect=RuntimeError("diag")), \
+             patch.object(collector, "publish_snapshot", return_value=0) as publish:
+            collector.scan_once(self.store, {})
+        out = collector._live1c_finish(r, "SUCCESS", self.store)
+        lookup.assert_called_once_with("123")
+        self.assertEqual(self.store.checkpoint()["block_number"], 105)
+        self.assertEqual(out["checkpoint_after"], 105)
+        self.assertEqual(publish.call_count, 1)
+
+===== TEST RESULTS =====
+
+LIVE-1D targeted:
+4 passed, 39 deselected
+
+Collector Regression:
+43 passed, 9 subtests passed
+
+Full Project Regression:
+156 passed, 13 subtests passed
