@@ -45,8 +45,8 @@ class RegressionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.patchers = [patch.object(bot,'ENV_CHAT','123'),patch.object(bot,'PAPER',self.root/'paper.json'),
-            patch.object(bot,'TRADES',self.root/'trades.jsonl'),patch.object(flow,'TRADES_FILE',self.root/'trades.jsonl'),
+        self.patchers = [patch.object(bot,'ENV_CHAT','123'),
+            patch.object(flow,'TRADES_FILE',self.root/'trades.jsonl'),
             patch.object(flow,'FLOW_STATE_FILE',self.root/'flow.json'),
             patch.object(flow,'VERIFICATION_STATE_FILE',self.root/'verify.json'),patch.object(flow,'market_states',{})]
         for item in self.patchers:
@@ -73,30 +73,55 @@ class RegressionTests(unittest.TestCase):
     def test_legacy_snapshot_blocked(self):
         x=fixture();x.pop('schema_version');self.assertFalse(diamond.analyze(x,[])['diamond'])
 
-    def test_sell_and_unauthorized_paper_blocked(self):
-        r=diamond.analyze(fixture(),[])
-        self.assertIsNotNone(bot.open_paper(r,25,'999')[1])
-        r['direction']='SELL';self.assertIsNotNone(bot.open_paper(r,25,'123')[1])
-        self.assertFalse(bot.PAPER.exists())
+    def _focus_book(self):
+        focus={
+            'schema_version':1,
+            'generated_at':datetime.now(timezone.utc).isoformat(),
+            'input_status':'OK',
+            'source_generation_id':'GEN-X',
+            'state':'READY',
+            'focus':{
+                'status':'READY',
+                'token_id':'yes-token',
+                'condition_id':'condition',
+                'last_evidence_id':'0x'+'ab'*32+':1',
+            },
+        }
+        book={
+            'schema_version':1,
+            'generated_at':datetime.now(timezone.utc).isoformat(),
+            'status':'OK',
+            'book_ok':True,
+            'token_id':'yes-token',
+            'condition_id':'condition',
+            'source_generation_id':'GEN-X',
+            'source_evidence_id':'0x'+'ab'*32+':1',
+        }
+        return focus,book
 
-    def test_buy_paper_and_limits(self):
-        r=diamond.analyze(fixture(),[])
-        self.assertIsNone(bot.open_paper(r,25,'123')[1])
-        self.assertIsNotNone(bot.open_paper(r,25,'123')[1])
-        self.assertEqual(len(bot.paper()),1)
+    def test_telegram_has_no_paper_state_ownership(self):
+        self.assertFalse(hasattr(bot,'PAPER'))
+        self.assertFalse(hasattr(bot,'TRADES'))
+        self.assertFalse(hasattr(bot,'open_paper'))
+        self.assertFalse(hasattr(bot,'update_paper'))
 
-    def test_stale_paper_entry_blocked(self):
-        r=diamond.analyze(fixture(),[]);r['source_updated_at']='2000-01-01T00:00:00Z'
-        self.assertIsNotNone(bot.open_paper(r,25,'123')[1])
+    def test_execution_requires_focus_ready_even_with_book_pass(self):
+        focus,book=self._focus_book();focus['state']='WAIT 2/3';focus['focus']['status']='WAIT'
+        ready,reason=bot.execution_binding('OK',focus,'OK',book)
+        self.assertFalse(ready);self.assertEqual(reason,'FOCUS_NOT_READY')
 
-    def test_time_exit_waits_for_fresh_price(self):
-        r=diamond.analyze(fixture(),[]);bot.open_paper(r,25,'123')
-        rows=bot.paper();rows[0]['opened_at']='2000-01-01T00:00:00+00:00';bot.save(bot.PAPER,rows)
-        self.assertEqual(bot.update_paper(),[])
-        self.assertEqual(bot.paper()[0]['exit_pending'],'WAITING_FOR_FRESH_PRICE')
-        bot.TRADES.write_text(json.dumps({'collector_version':4,'token_id':'yes-token','fill_price':.5,
-            'detected_at':datetime.now(timezone.utc).isoformat()})+'\n',encoding='utf-8')
-        self.assertEqual(len(bot.update_paper()),1)
+    def test_execution_requires_exact_generation_and_evidence_binding(self):
+        focus,book=self._focus_book();book['source_evidence_id']='0x'+'cd'*32+':2'
+        ready,reason=bot.execution_binding('OK',focus,'OK',book)
+        self.assertFalse(ready);self.assertEqual(reason,'EVIDENCE_ID_MISMATCH')
+        book['source_evidence_id']=focus['focus']['last_evidence_id'];book['source_generation_id']='OTHER'
+        ready,reason=bot.execution_binding('OK',focus,'OK',book)
+        self.assertFalse(ready);self.assertEqual(reason,'GENERATION_ID_MISMATCH')
+
+    def test_execution_ready_only_on_exact_focus_book_pass(self):
+        focus,book=self._focus_book()
+        ready,reason=bot.execution_binding('OK',focus,'OK',book)
+        self.assertTrue(ready);self.assertEqual(reason,'READY_BOOK_PASS')
 
     def test_confirmation_resets_on_reversal(self):
         for evidence in ['a','b','c']:
