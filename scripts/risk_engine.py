@@ -431,7 +431,7 @@ def self_test():
         "source_updated_at": now.isoformat(),
         "last_trade_at": now.isoformat(),
         "remaining_seconds": 86400,
-        "evidence_id": "0xabc:4",
+        "evidence_id": "0x" + "ab" * 32 + ":4",
         "evidence_cursor": [123, 4],
         "evidence_at": now.isoformat(),
         "market": {"active": True, "closed": False, "accepting_orders": True},
