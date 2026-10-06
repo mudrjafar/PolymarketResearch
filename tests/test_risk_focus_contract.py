@@ -87,7 +87,7 @@ def _flow_row(
     *,
     condition_id="condition-a",
     outcome="Yes",
-    evidence_id="tx-a:7",
+    evidence_id="0x1111111111111111111111111111111111111111111111111111111111111111:7",
     evidence_cursor=None,
     evidence_at="2026-10-05T12:00:00+00:00",
 ):
@@ -177,7 +177,7 @@ def test_rf4a_2_pass_result_contains_risk_fields(monkeypatch, tmp_path):
 def test_rf4a_3_pass_result_contains_exact_evidence_triple_from_flow_x(monkeypatch, tmp_path):
     paths = _configure_paths(monkeypatch, tmp_path)
     evidence = {
-        "evidence_id": "0xabc:9",
+        "evidence_id": "0x2222222222222222222222222222222222222222222222222222222222222222:9",
         "evidence_cursor": [777, 9],
         "evidence_at": "2026-10-05T12:00:09+00:00",
     }
@@ -195,7 +195,7 @@ def test_rf4a_4_root_flow_y_cannot_replace_generation_x_evidence(monkeypatch, tm
     paths = _configure_paths(monkeypatch, tmp_path)
     flow_x = {
         "token-a": _flow_row(
-            evidence_id="0xaaa:1",
+            evidence_id="0x1111111111111111111111111111111111111111111111111111111111111111:1",
             evidence_cursor=[100, 1],
             evidence_at="2026-10-05T12:00:00+00:00",
         )
@@ -206,7 +206,7 @@ def test_rf4a_4_root_flow_y_cannot_replace_generation_x_evidence(monkeypatch, tm
         paths["root_flow"],
         {
             "token-a": _flow_row(
-                evidence_id="0xbbb:99",
+                evidence_id="0x3333333333333333333333333333333333333333333333333333333333333333:99",
                 evidence_cursor=[999, 99],
                 evidence_at="2026-10-05T12:59:59+00:00",
             )
@@ -215,7 +215,7 @@ def test_rf4a_4_root_flow_y_cannot_replace_generation_x_evidence(monkeypatch, tm
 
     result = _run_and_output(paths)["results"][0]
 
-    assert result["evidence_id"] == "0xaaa:1"
+    assert result["evidence_id"] == "0x1111111111111111111111111111111111111111111111111111111111111111:1"
     assert result["evidence_cursor"] == [100, 1]
     assert result["evidence_at"] == "2026-10-05T12:00:00+00:00"
 
