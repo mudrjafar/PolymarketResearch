@@ -2,6 +2,8 @@ import asyncio
 import hashlib
 import json
 import os
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from machine_common import fresh, finite_number, save_json_atomic
@@ -19,6 +21,8 @@ DIAMOND_MANIFEST = DATA / "diamond_generation.json"
 DIAMOND_GENERATIONS = DATA / "diamond_generations"
 FOCUS = DATA / "focused_market.json"
 BOOK = DATA / "book_assessment.json"
+PAPER_REQUEST_DIR = DATA / "paper_requests"
+PAPER_STATE = DATA / "paper_state.json"
 STATE = DATA / "telegram_state.json"
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -128,6 +132,8 @@ def _default_state():
         "focus_alert_key": None,
         "focus_invalidated_key": None,
         "execution_ready_key": None,
+        "paper_open_alerts": [],
+        "paper_closed_alerts": [],
     }
 
 
@@ -278,6 +284,30 @@ def book_snapshot():
     return _snapshot(BOOK)
 
 
+def paper_state_snapshot():
+    if not PAPER_STATE.exists():
+        return "MISSING", None
+
+    try:
+        with PAPER_STATE.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except Exception:
+        return "CORRUPT", None
+
+    if not isinstance(payload, dict):
+        return "CORRUPT", None
+    if payload.get("schema_version") != 1:
+        return "CORRUPT", payload
+    if not payload.get("updated_at"):
+        return "CORRUPT", payload
+    if not fresh(payload.get("updated_at")):
+        return "STALE", payload
+    if not isinstance(payload.get("positions"), list):
+        return "CORRUPT", payload
+
+    return "OK", payload
+
+
 def execution_binding(focus_status, focus_payload, book_status, book_payload):
     if focus_status != "OK" or book_status != "OK":
         return False, "INPUT_NOT_OK"
@@ -405,8 +435,145 @@ def execution_message(focus_payload, book_payload):
 
     lines += [
         "",
-        "No trade was opened. Paper execution is a separate user-controlled step.",
+        "Choose a virtual amount below. Telegram only submits the request; "
+        "the Paper Worker revalidates READY + Book and executes the simulation.",
     ]
+    return "\n".join(lines)
+
+
+def paper_open_keyboard():
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("$25 PAPER", callback_data="po:25"),
+            InlineKeyboardButton("$50 PAPER", callback_data="po:50"),
+            InlineKeyboardButton("$100 PAPER", callback_data="po:100"),
+        ]]
+    )
+
+
+def paper_close_keyboard(paper_id):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Close PAPER", callback_data=f"pc:{paper_id}")]]
+    )
+
+
+def _write_paper_request(payload):
+    request_id = str(payload.get("request_id") or "").strip()
+    if not request_id:
+        raise ValueError("request id missing")
+    PAPER_REQUEST_DIR.mkdir(parents=True, exist_ok=True)
+    save_json_atomic(PAPER_REQUEST_DIR / f"{request_id}.json", payload)
+
+
+def submit_open_request(amount, chat_id):
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return None, "Invalid paper amount"
+
+    if amount not in (25.0, 50.0, 100.0):
+        return None, "Invalid paper amount"
+
+    focus_status, focus_payload = focus_snapshot()
+    book_status, book_payload = book_snapshot()
+    ready, reason = execution_binding(
+        focus_status,
+        focus_payload,
+        book_status,
+        book_payload,
+    )
+    if not ready:
+        return None, f"Execution not ready: {reason}"
+
+    focus = focus_payload["focus"]
+    request_id = "REQ-" + uuid.uuid4().hex[:16]
+    payload = {
+        "schema_version": 1,
+        "request_id": request_id,
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "action": "OPEN",
+        "amount_usd": amount,
+        "chat_id": str(chat_id),
+        "token_id": focus.get("token_id"),
+        "condition_id": focus.get("condition_id"),
+        "source_generation_id": focus_payload.get("source_generation_id"),
+        "source_evidence_id": focus.get("last_evidence_id"),
+        "focus_locked_at": focus.get("locked_at"),
+    }
+    _write_paper_request(payload)
+    return request_id, None
+
+
+def submit_close_request(paper_id, chat_id):
+    paper_id = str(paper_id or "").strip()
+    if not paper_id:
+        return None, "Paper position missing"
+
+    status, payload = paper_state_snapshot()
+    if status != "OK":
+        return None, f"Paper input: {status}"
+
+    position = next(
+        (
+            row
+            for row in payload.get("positions", [])
+            if isinstance(row, dict)
+            and row.get("paper_id") == paper_id
+            and row.get("status") == "OPEN"
+        ),
+        None,
+    )
+    if position is None:
+        return None, "Open paper position not found"
+
+    request_id = "REQ-" + uuid.uuid4().hex[:16]
+    request = {
+        "schema_version": 1,
+        "request_id": request_id,
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "action": "CLOSE",
+        "paper_id": paper_id,
+        "chat_id": str(chat_id),
+    }
+    _write_paper_request(request)
+    return request_id, None
+
+
+def paper_position_message(position):
+    mark = position.get("mark") if isinstance(position.get("mark"), dict) else {}
+    lines = [
+        f"🧪 PAPER {position.get('status', '?')}",
+        position.get("question") or "Unknown market",
+        f"Outcome: {position.get('outcome') or '?'}",
+        f"Investment: {money(position.get('investment_usd'))}",
+        (
+            f"Entry VWAP {num(position.get('entry', {}).get('vwap')):.4f} | "
+            f"effective {num(position.get('entry', {}).get('effective_entry_price')):.4f}"
+        ),
+        f"Tokens: {num(position.get('tokens')):.4f}",
+        f"Mark status: {position.get('mark_status') or 'UNKNOWN'}",
+    ]
+
+    if mark:
+        lines += [
+            (
+                f"Exit-now VWAP {num(mark.get('exit_vwap')):.4f} | "
+                f"effective {num(mark.get('effective_exit_price')):.4f}"
+            ),
+            (
+                f"P/L {money(mark.get('pnl_usd'))} "
+                f"({num(mark.get('return_pct')):.2f}%)"
+            ),
+        ]
+
+    if position.get("status") == "CLOSED":
+        lines += [
+            (
+                f"Realized P/L {money(position.get('realized_pnl_usd'))} "
+                f"({num(position.get('realized_return_pct')):.2f}%)"
+            )
+        ]
+
     return "\n".join(lines)
 
 
@@ -417,7 +584,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_chat(update.effective_chat.id)
     await update.message.reply_text(
         "💎 Diamond Intelligence online.\n\n"
-        "/diamonds /markets /focus /status"
+        "/diamonds /markets /focus /positions /status"
     )
 
 
@@ -438,6 +605,16 @@ async def status_cmd(update, context):
 
     analysis_status, analysis_rows = analyses_snapshot()
     diamond_status, diamond_rows = diamonds_snapshot()
+    paper_status, paper_payload = paper_state_snapshot()
+    open_papers = (
+        len([
+            row
+            for row in paper_payload.get("positions", [])
+            if isinstance(row, dict) and row.get("status") == "OPEN"
+        ])
+        if paper_status == "OK"
+        else "-"
+    )
 
     lines = [
         "SYSTEM STATUS",
@@ -447,6 +624,8 @@ async def status_cmd(update, context):
         f"Fresh Diamonds: {len(diamond_rows) if diamond_status == 'OK' else '-'}",
         f"Focus snapshot: {focus_status}",
         f"Book snapshot: {book_status}",
+        f"Paper snapshot: {paper_status}",
+        f"Open paper positions: {open_papers}",
         f"Execution ready: {'YES' if ready else 'NO'} ({reason})",
     ]
 
@@ -474,10 +653,40 @@ async def focus_cmd(update, context):
         book_status,
         book_payload,
     )
+    markup = None
     if ready:
         lines += ["", execution_message(focus_payload, book_payload)]
+        markup = paper_open_keyboard()
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), reply_markup=markup)
+
+
+async def positions_cmd(update, context):
+    if not authorized(update):
+        return
+
+    register_chat(update.effective_chat.id)
+    status, payload = paper_state_snapshot()
+    if status != "OK":
+        await update.message.reply_text(f"Paper input: {status}")
+        return
+
+    positions = [
+        row
+        for row in payload.get("positions", [])
+        if isinstance(row, dict)
+    ]
+    opens = [row for row in positions if row.get("status") == "OPEN"]
+
+    if not opens:
+        await update.message.reply_text("No open paper positions.")
+        return
+
+    for position in opens:
+        await update.message.reply_text(
+            paper_position_message(position),
+            reply_markup=paper_close_keyboard(position.get("paper_id")),
+        )
 
 
 async def diamonds_cmd(update, context):
@@ -560,10 +769,34 @@ async def button(update, context):
         )
         return
 
+    if data.startswith("po:"):
+        amount = data.split(":", 1)[1]
+        request_id, err = submit_open_request(amount, query.message.chat.id)
+        if err:
+            await query.message.reply_text("❌ " + err)
+            return
+        await query.message.reply_text(
+            f"🧪 PAPER OPEN REQUEST SUBMITTED\n{request_id}\n"
+            "The Paper Worker will revalidate READY + Book and use a fresh CLOB book."
+        )
+        return
+
+    if data.startswith("pc:"):
+        paper_id = data.split(":", 1)[1]
+        request_id, err = submit_close_request(paper_id, query.message.chat.id)
+        if err:
+            await query.message.reply_text("❌ " + err)
+            return
+        await query.message.reply_text(
+            f"🧪 PAPER CLOSE REQUEST SUBMITTED\n{request_id}\n"
+            "The Paper Worker will simulate the exit against current bids."
+        )
+        return
+
     # Old Telegram messages may still contain legacy paper callback buttons.
     if data.startswith("p:"):
         await query.message.reply_text(
-            "Paper trading is not active in this Telegram runtime."
+            "Legacy paper action rejected. Use a current READY + Book PAPER button."
         )
 
 
@@ -756,10 +989,50 @@ async def watcher(app):
                             await app.bot.send_message(
                                 chat_id=chat_id,
                                 text=execution_message(focus_payload, book_payload),
+                                reply_markup=paper_open_keyboard(),
                             )
                         except Exception as exc:
                             print("[TELEGRAM]", exc)
                     current_state["execution_ready_key"] = execution_key
+
+            paper_status, paper_payload = paper_state_snapshot()
+            if paper_status == "OK":
+                seen_open = set(current_state.get("paper_open_alerts") or [])
+                seen_closed = set(current_state.get("paper_closed_alerts") or [])
+
+                for position in paper_payload.get("positions", []):
+                    if not isinstance(position, dict):
+                        continue
+
+                    paper_id = str(position.get("paper_id") or "").strip()
+                    if not paper_id:
+                        continue
+
+                    if position.get("status") == "OPEN" and paper_id not in seen_open:
+                        for chat_id in chat_ids():
+                            try:
+                                await app.bot.send_message(
+                                    chat_id=chat_id,
+                                    text="🧪 PAPER OPENED\n\n" + paper_position_message(position),
+                                    reply_markup=paper_close_keyboard(paper_id),
+                                )
+                            except Exception as exc:
+                                print("[TELEGRAM]", exc)
+                        seen_open.add(paper_id)
+
+                    if position.get("status") == "CLOSED" and paper_id not in seen_closed:
+                        for chat_id in chat_ids():
+                            try:
+                                await app.bot.send_message(
+                                    chat_id=chat_id,
+                                    text="🏁 PAPER CLOSED\n\n" + paper_position_message(position),
+                                )
+                            except Exception as exc:
+                                print("[TELEGRAM]", exc)
+                        seen_closed.add(paper_id)
+
+                current_state["paper_open_alerts"] = sorted(seen_open)[-200:]
+                current_state["paper_closed_alerts"] = sorted(seen_closed)[-200:]
 
             current_state["active_diamonds"] = sorted(x for x in active if x)
             current_state["cashflow_levels"] = cash_levels
@@ -792,12 +1065,13 @@ def main():
         ("diamonds", diamonds_cmd),
         ("markets", markets_cmd),
         ("focus", focus_cmd),
+        ("positions", positions_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
 
     app.add_handler(CallbackQueryHandler(button))
 
-    print("[TELEGRAM] Focus/Book consumer starting...")
+    print("[TELEGRAM] Focus/Book/Paper interface starting...")
     app.run_polling(drop_pending_updates=True)
 
 

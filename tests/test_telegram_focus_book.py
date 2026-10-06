@@ -20,6 +20,8 @@ def configure_paths(monkeypatch, tmp_path):
         "generations": generations,
         "focus": data / "focused_market.json",
         "book": data / "book_assessment.json",
+        "paper_requests": data / "paper_requests",
+        "paper_state": data / "paper_state.json",
         "state": data / "telegram_state.json",
     }
 
@@ -28,6 +30,8 @@ def configure_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "DIAMOND_GENERATIONS", generations, raising=False)
     monkeypatch.setattr(bot, "FOCUS", paths["focus"], raising=False)
     monkeypatch.setattr(bot, "BOOK", paths["book"], raising=False)
+    monkeypatch.setattr(bot, "PAPER_REQUEST_DIR", paths["paper_requests"], raising=False)
+    monkeypatch.setattr(bot, "PAPER_STATE", paths["paper_state"], raising=False)
     monkeypatch.setattr(bot, "STATE", paths["state"], raising=False)
 
     return paths
@@ -250,7 +254,7 @@ def test_keyboard_exposes_analysis_only_no_paper_action():
     assert all(not value.startswith("p:") for value in callback_data)
 
 
-def test_execution_message_is_informational_not_trade_opening():
+def test_execution_message_is_informational_and_user_controlled():
     message = bot.execution_message(
         focus_payload(),
         book_payload(),
@@ -260,7 +264,67 @@ def test_execution_message_is_informational_not_trade_opening():
     assert "$25" in message
     assert "$50" in message
     assert "$100" in message
-    assert "No trade was opened" in message
+    assert "Choose a virtual amount" in message
+    assert "Telegram only submits the request" in message
+
+
+def test_paper_open_keyboard_exposes_only_explicit_user_amounts():
+    markup = bot.paper_open_keyboard()
+    callback_data = [
+        button.callback_data
+        for row_buttons in markup.inline_keyboard
+        for button in row_buttons
+    ]
+
+    assert callback_data == ["po:25", "po:50", "po:100"]
+
+
+def test_submit_open_request_writes_intent_but_not_paper_state(monkeypatch, tmp_path):
+    paths = configure_paths(monkeypatch, tmp_path)
+    focus = focus_payload()
+    book = book_payload()
+    save_json_atomic(paths["focus"], focus)
+    save_json_atomic(paths["book"], book)
+
+    request_id, err = bot.submit_open_request(25, "123")
+
+    assert err is None
+    request_path = paths["paper_requests"] / f"{request_id}.json"
+    assert request_path.exists()
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request["action"] == "OPEN"
+    assert request["amount_usd"] == 25.0
+    assert request["token_id"] == "token-a"
+    assert request["source_generation_id"] == "GEN-X"
+    assert request["source_evidence_id"] == focus["focus"]["last_evidence_id"]
+    assert not paths["paper_state"].exists()
+
+
+def test_submit_close_request_reads_state_and_writes_close_intent_only(monkeypatch, tmp_path):
+    paths = configure_paths(monkeypatch, tmp_path)
+    original_state = {
+        "schema_version": 1,
+        "updated_at": NOW.isoformat(),
+        "positions": [
+            {
+                "paper_id": "PAPER-abc",
+                "status": "OPEN",
+                "token_id": "token-a",
+            }
+        ],
+        "processed_request_ids": [],
+    }
+    save_json_atomic(paths["paper_state"], original_state)
+
+    request_id, err = bot.submit_close_request("PAPER-abc", "123")
+
+    assert err is None
+    request = json.loads(
+        (paths["paper_requests"] / f"{request_id}.json").read_text(encoding="utf-8")
+    )
+    assert request["action"] == "CLOSE"
+    assert request["paper_id"] == "PAPER-abc"
+    assert json.loads(paths["paper_state"].read_text(encoding="utf-8")) == original_state
 
 
 def test_telegram_has_no_paper_state_ownership_or_system_online_claim():
@@ -269,5 +333,5 @@ def test_telegram_has_no_paper_state_ownership_or_system_online_claim():
     assert "PAPER =" not in source
     assert "def open_paper" not in source
     assert "def update_paper" not in source
-    assert "positions_cmd" not in source
+    assert "save_json_atomic(PAPER_STATE" not in source
     assert "System online" not in source
