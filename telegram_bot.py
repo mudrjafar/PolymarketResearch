@@ -15,6 +15,8 @@ DATA = BASE / "data"
 
 ANALYSIS = DATA / "diamond_analysis_v3.json"
 DIAMONDS = DATA / "diamonds.json"
+DIAMOND_MANIFEST = DATA / "diamond_generation.json"
+DIAMOND_GENERATIONS = DATA / "diamond_generations"
 FOCUS = DATA / "focused_market.json"
 BOOK = DATA / "book_assessment.json"
 STATE = DATA / "telegram_state.json"
@@ -54,15 +56,61 @@ def sid(row):
     ).hexdigest()[:12]
 
 
+def _diamond_generation_snapshot(filename):
+    if not DIAMOND_MANIFEST.exists():
+        return "MISSING", None
+
+    try:
+        with DIAMOND_MANIFEST.open("r", encoding="utf-8") as stream:
+            manifest = json.load(stream)
+    except Exception:
+        return "CORRUPT", None
+
+    if not isinstance(manifest, dict):
+        return "CORRUPT", None
+
+    generation_id = str(manifest.get("generation_id") or "").strip()
+    published_at = manifest.get("published_at")
+    if not generation_id or not published_at:
+        return "CORRUPT", manifest
+
+    if not fresh(published_at):
+        return "STALE", manifest
+
+    path = DIAMOND_GENERATIONS / generation_id / filename
+    if not path.exists():
+        return "MISSING", manifest
+
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except Exception:
+        return "CORRUPT", manifest
+
+    if not isinstance(payload, list):
+        return "CORRUPT", manifest
+
+    return "OK", payload
+
+
+def analyses_snapshot():
+    return _diamond_generation_snapshot("diamond_analysis_v3.json")
+
+
+def diamonds_snapshot():
+    return _diamond_generation_snapshot("diamonds.json")
+
+
 def analyses():
-    value = load(ANALYSIS, [])
-    return value if isinstance(value, list) else []
+    status, value = analyses_snapshot()
+    return value if status == "OK" else []
 
 
 def diamonds():
-    value = load(DIAMONDS, [])
-    if not isinstance(value, list):
+    status, value = diamonds_snapshot()
+    if status != "OK":
         return []
+
     return [
         row
         for row in value
@@ -388,10 +436,15 @@ async def status_cmd(update, context):
         book_payload,
     )
 
+    analysis_status, analysis_rows = analyses_snapshot()
+    diamond_status, diamond_rows = diamonds_snapshot()
+
     lines = [
         "SYSTEM STATUS",
-        f"Markets analyzed: {len(analyses())}",
-        f"Fresh Diamonds: {len(diamonds())}",
+        f"Analysis snapshot: {analysis_status}",
+        f"Markets analyzed: {len(analysis_rows) if analysis_status == 'OK' else '-'}",
+        f"Diamond snapshot: {diamond_status}",
+        f"Fresh Diamonds: {len(diamond_rows) if diamond_status == 'OK' else '-'}",
         f"Focus snapshot: {focus_status}",
         f"Book snapshot: {book_status}",
         f"Execution ready: {'YES' if ready else 'NO'} ({reason})",
@@ -432,7 +485,20 @@ async def diamonds_cmd(update, context):
         return
 
     register_chat(update.effective_chat.id)
-    rows = diamonds()
+    snapshot_status, snapshot_rows = diamonds_snapshot()
+    if snapshot_status != "OK":
+        await update.message.reply_text(
+            f"Diamond input: {snapshot_status}. No result is not treated as an empty result."
+        )
+        return
+
+    rows = [
+        row
+        for row in snapshot_rows
+        if isinstance(row, dict)
+        and fresh(row.get("source_updated_at"))
+        and fresh(row.get("last_trade_at"))
+    ]
 
     if not rows:
         await update.message.reply_text("No verified Diamonds right now.")
@@ -450,11 +516,21 @@ async def markets_cmd(update, context):
         return
 
     register_chat(update.effective_chat.id)
+    snapshot_status, snapshot_rows = analyses_snapshot()
+    if snapshot_status != "OK":
+        await update.message.reply_text(
+            f"Market input: {snapshot_status}. No result is not treated as an empty result."
+        )
+        return
+
     rows = [
         row
-        for row in analyses()
-        if row.get("classification") != "LOW"
-        or row.get("cashflow_alert", {}).get("active")
+        for row in snapshot_rows
+        if isinstance(row, dict)
+        and (
+            row.get("classification") != "LOW"
+            or row.get("cashflow_alert", {}).get("active")
+        )
     ][:6]
 
     if not rows:
@@ -552,58 +628,75 @@ async def watcher(app):
 
     while True:
         try:
-            rows = diamonds()
-            current = {row.get("market_key") for row in rows if row.get("market_key")}
-
-            for row in rows:
-                market_key = row.get("market_key")
-                if market_key not in active:
-                    for chat_id in chat_ids():
-                        try:
-                            await app.bot.send_message(
-                                chat_id=chat_id,
-                                text=(
-                                    "💎 NEW VERIFIED DIAMOND\n\n"
-                                    + short_message(row)
-                                    + "\n\nFocus/Risk still decide whether it can become READY."
-                                ),
-                            )
-                        except Exception as exc:
-                            print("[TELEGRAM]", exc)
-
-            active = current
-
-            current_cash = {}
-            for row in analyses():
-                cash = row.get("cashflow_alert", {})
-                tier = cash.get("tier")
-                market_key = row.get("market_key")
-
-                if (
-                    fresh(row.get("source_updated_at"))
+            diamond_status, diamond_rows = diamonds_snapshot()
+            if diamond_status == "OK":
+                rows = [
+                    row
+                    for row in diamond_rows
+                    if isinstance(row, dict)
+                    and fresh(row.get("source_updated_at"))
                     and fresh(row.get("last_trade_at"))
-                    and cash.get("active")
-                    and rank.get(tier, 0) >= 2
-                    and cash.get("quality") != "WHALE_DOMINATED"
-                    and num(row.get("scores", {}).get("signal_quality")) >= 65
-                ):
-                    current_cash[market_key] = tier
+                ]
+                current = {
+                    row.get("market_key")
+                    for row in rows
+                    if row.get("market_key")
+                }
 
-                    if rank.get(tier, 0) > rank.get(cash_levels.get(market_key), 0):
+                for row in rows:
+                    market_key = row.get("market_key")
+                    if market_key not in active:
                         for chat_id in chat_ids():
                             try:
                                 await app.bot.send_message(
                                     chat_id=chat_id,
                                     text=(
-                                        f"💰 {tier} CASHFLOW WATCH\n\n"
+                                        "💎 NEW VERIFIED DIAMOND\n\n"
                                         + short_message(row)
-                                        + "\n\nNot automatically READY."
+                                        + "\n\nFocus/Risk still decide whether it can become READY."
                                     ),
                                 )
                             except Exception as exc:
                                 print("[TELEGRAM]", exc)
 
-            cash_levels = current_cash
+                active = current
+
+            analysis_status, analysis_rows = analyses_snapshot()
+            if analysis_status == "OK":
+                current_cash = {}
+                for row in analysis_rows:
+                    if not isinstance(row, dict):
+                        continue
+
+                    cash = row.get("cashflow_alert", {})
+                    tier = cash.get("tier")
+                    market_key = row.get("market_key")
+
+                    if (
+                        fresh(row.get("source_updated_at"))
+                        and fresh(row.get("last_trade_at"))
+                        and cash.get("active")
+                        and rank.get(tier, 0) >= 2
+                        and cash.get("quality") != "WHALE_DOMINATED"
+                        and num(row.get("scores", {}).get("signal_quality")) >= 65
+                    ):
+                        current_cash[market_key] = tier
+
+                        if rank.get(tier, 0) > rank.get(cash_levels.get(market_key), 0):
+                            for chat_id in chat_ids():
+                                try:
+                                    await app.bot.send_message(
+                                        chat_id=chat_id,
+                                        text=(
+                                            f"💰 {tier} CASHFLOW WATCH\n\n"
+                                            + short_message(row)
+                                            + "\n\nNot automatically READY."
+                                        ),
+                                    )
+                                except Exception as exc:
+                                    print("[TELEGRAM]", exc)
+
+                cash_levels = current_cash
 
             focus_status, focus_payload = focus_snapshot()
             book_status, book_payload = book_snapshot()
