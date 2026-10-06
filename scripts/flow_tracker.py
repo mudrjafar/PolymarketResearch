@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import sys
 import time
 from collections import defaultdict, deque
@@ -184,6 +185,7 @@ def format_remaining(seconds):
 
 CURRENT_COLLECTOR_VERSION = 4
 SUPPORTED_LEGACY_COLLECTOR_VERSIONS = {3}
+_CANONICAL_TX_HASH_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 
 
 def _collector_version_class(trade):
@@ -245,7 +247,7 @@ def evidence_identity(trade):
     tx = trade.get("transaction_hash")
     log_index = trade.get("log_index")
 
-    if not isinstance(tx, str) or not tx.strip():
+    if not isinstance(tx, str) or _CANONICAL_TX_HASH_RE.fullmatch(tx.strip()) is None:
         return None
     if not _real_nonnegative_int(log_index):
         return None
