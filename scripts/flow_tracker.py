@@ -1,4 +1,6 @@
 import json
+import math
+import re
 import sys
 import time
 from collections import defaultdict, deque
@@ -181,14 +183,63 @@ def format_remaining(seconds):
 # FILE LOADING
 # ============================================================
 
+CURRENT_COLLECTOR_VERSION = 4
+SUPPORTED_LEGACY_COLLECTOR_VERSIONS = {3}
+_CANONICAL_TX_HASH_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+
+
+def _collector_version_class(trade):
+    if not isinstance(trade, dict):
+        return "UNKNOWN"
+    if "collector_version" not in trade or trade.get("collector_version") is None:
+        return "LEGACY"
+    version = trade.get("collector_version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        return "UNKNOWN"
+    if version == CURRENT_COLLECTOR_VERSION:
+        return "V4"
+    if version in SUPPORTED_LEGACY_COLLECTOR_VERSIONS:
+        return "LEGACY"
+    return "UNKNOWN"
+
+
+def _is_v4_trade(trade):
+    return _collector_version_class(trade) == "V4"
+
+
+def _real_nonnegative_int(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    )
+
+
+def _strict_aware_time(value):
+    if value is None:
+        raise ValueError("timestamp missing")
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text_value = str(value).strip()
+        if not text_value:
+            raise ValueError("timestamp missing")
+        if text_value.endswith("Z"):
+            text_value = text_value[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text_value)
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return dt.astimezone(timezone.utc)
+
+
 def event_time(trade):
     """
-    Event time of a trade: the actual block timestamp. detected_at (local
-    ingestion time) is only a fallback for legacy rows without block time.
+    Current collector V4 rows use canonical block time only. Legacy rows may
+    still fall back to detected_at for backward-compatible offline handling.
     """
-    return parse_time(
-        trade.get("block_timestamp") or trade.get("detected_at")
-    )
+    if _is_v4_trade(trade):
+        return _strict_aware_time(trade.get("block_timestamp"))
+    return parse_time(trade.get("block_timestamp") or trade.get("detected_at"))
 
 
 def evidence_identity(trade):
@@ -196,10 +247,45 @@ def evidence_identity(trade):
     tx = trade.get("transaction_hash")
     log_index = trade.get("log_index")
 
-    if tx is None or log_index is None:
+    if not isinstance(tx, str) or _CANONICAL_TX_HASH_RE.fullmatch(tx.strip()) is None:
+        return None
+    if not _real_nonnegative_int(log_index):
         return None
 
-    return f"{str(tx).lower()}:{log_index}"
+    return f"{tx.strip().lower()}:{log_index}"
+
+
+def is_flow_eligible_trade(trade):
+    """
+    Strict gate for current collector V4 rows before they can affect live
+    flow mathematics. Only explicitly supported legacy schemas retain their
+    historical compatibility path. Unknown/future versions fail closed.
+    """
+    version_class = _collector_version_class(trade)
+    if version_class == "UNKNOWN":
+        return False
+    if version_class == "LEGACY":
+        return True
+
+    if not isinstance(trade.get("condition_id"), str) or not trade["condition_id"].strip():
+        return False
+    if not isinstance(trade.get("token_id"), str) or not trade["token_id"].strip():
+        return False
+    if not isinstance(trade.get("outcome"), str) or not trade["outcome"].strip():
+        return False
+    if evidence_identity(trade) is None:
+        return False
+    if not _real_nonnegative_int(trade.get("block")):
+        return False
+    try:
+        event_time(trade)
+    except (TypeError, ValueError):
+        return False
+    if get_trade_side(trade) not in {"BUY", "SELL"}:
+        return False
+    if get_trade_size(trade) is None:
+        return False
+    return True
 
 
 def trade_order_key(trade):
@@ -250,6 +336,8 @@ def load_trades():
                 continue
             if not trade.get("token_id") or not trade.get("condition_id"):
                 continue
+            if not is_flow_eligible_trade(trade):
+                continue
             if not cutoff <= event_time(trade) <= now:
                 continue
             trade_order_key(trade)
@@ -292,38 +380,49 @@ def parse_time(value):
 # TRADE SIZE / SIDE
 # ============================================================
 
+def _finite_nonnegative_number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
 def get_trade_size(trade):
     """
-    Returns the USD value of the individual trade.
+    Return USD value for one trade.
 
-    Primary source:
-        trade_usd
-
-    Fallbacks are kept for older data formats.
+    UNKNOWN is None, never an invented $0. Current V4 collector rows must
+    provide trade_usd directly. Legacy rows may use historical USD fields or
+    reconstruct USD only from share count multiplied by a valid share price.
     """
 
-    # Do not mix share counts with USD. Current collector rows always provide
-    # trade_usd. For older rows, usd_size is accepted; as a final fallback,
-    # token_amount may be converted only when a valid per-share price exists.
+    if _is_v4_trade(trade):
+        return _finite_nonnegative_number(trade.get("trade_usd"))
+
     for value in (trade.get("trade_usd"), trade.get("usd_size")):
-        try:
-            if value is None:
-                continue
-            size = float(value)
-            if size >= 0:
-                return size
-        except (TypeError, ValueError):
-            continue
+        size = _finite_nonnegative_number(value)
+        if size is not None:
+            return size
 
+    shares = _finite_nonnegative_number(trade.get("token_amount"))
     try:
-        shares = float(trade.get("token_amount"))
         price = float(trade.get("fill_price") or trade.get("price"))
-        if shares >= 0 and 0 < price < 1:
-            return shares * price
     except (TypeError, ValueError):
-        pass
+        price = None
+    if (
+        shares is not None
+        and price is not None
+        and math.isfinite(price)
+        and 0 < price < 1
+    ):
+        return shares * price
 
-    return 0.0
+    return None
 
 
 def get_trade_side(trade):
@@ -396,11 +495,13 @@ def analyze_flow(trades, now, window):
     valid_trades = 0
 
     for trade in recent:
+        if not is_flow_eligible_trade(trade):
+            continue
 
         size = get_trade_size(trade)
         side = get_trade_side(trade)
 
-        if side not in {"BUY", "SELL"}:
+        if size is None or side not in {"BUY", "SELL"}:
             continue
 
         valid_trades += 1
@@ -838,6 +939,31 @@ def confirmation_evidence_id(latest_trade, evidence_id, new_evidence, flow_direc
     return None
 
 
+def confirmation_evidence_triple(latest_trade, confirming_evidence):
+    """
+    Flow is the producer authority for the evidence triple. All three fields
+    are derived together from the exact same confirming trade event.
+    """
+    if not confirming_evidence:
+        return None
+    identity = evidence_identity(latest_trade)
+    if identity != confirming_evidence:
+        return None
+    block = latest_trade.get("block")
+    log_index = latest_trade.get("log_index")
+    if not _real_nonnegative_int(block) or not _real_nonnegative_int(log_index):
+        return None
+    try:
+        evidence_at = event_time(latest_trade).isoformat()
+    except (TypeError, ValueError):
+        return None
+    return {
+        "evidence_id": identity,
+        "evidence_cursor": [block, log_index],
+        "evidence_at": evidence_at,
+    }
+
+
 
 def far_market_wake_trigger(
     profile,
@@ -858,7 +984,10 @@ def far_market_wake_trigger(
     latest_trade_usd = get_trade_size(latest_trade)
 
     return (
-        latest_trade_usd >= threshold["latest_trade_usd"]
+        (
+            latest_trade_usd is not None
+            and latest_trade_usd >= threshold["latest_trade_usd"]
+        )
         or flow_15m["total_volume"] >= threshold["volume_15m"]
         or flow_15m["trade_count"] >= threshold["trades_15m"]
     )
@@ -1424,20 +1553,27 @@ def main():
                 flow_5m["direction"],
             )
 
+            evidence_triple = confirmation_evidence_triple(
+                latest_trade,
+                confirming_evidence,
+            )
+
             state_data = update_market_state(
                 token_id,
                 candidate,
                 verified,
-                confirming_evidence,
+                (
+                    evidence_triple["evidence_id"]
+                    if evidence_triple else None
+                ),
                 flow_5m["direction"],
                 evidence_cursor=(
-                    [latest_trade.get("block"), latest_trade.get("log_index")]
-                    if confirming_evidence else None
+                    evidence_triple["evidence_cursor"]
+                    if evidence_triple else None
                 ),
                 evidence_at=(
-                    latest_trade.get("block_timestamp")
-                    or latest_trade.get("detected_at")
-                    if confirming_evidence else None
+                    evidence_triple["evidence_at"]
+                    if evidence_triple else None
                 ),
             )
 

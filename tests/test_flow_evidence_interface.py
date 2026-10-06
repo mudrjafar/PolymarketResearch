@@ -160,6 +160,8 @@ class Pipeline:
             except InterruptedError:
                 pass
 
+        if not self.flow_file.exists():
+            return {}
         return json.loads(self.flow_file.read_text(encoding="utf-8"))
 
 
@@ -271,7 +273,7 @@ def test_unverified_flow_never_stores_evidence(pipeline):
     assert_no_evidence(entry)
 
 
-def test_rows_without_chain_identity_never_produce_evidence(pipeline):
+def test_rows_without_chain_identity_never_enter_v4_flow(pipeline):
     rows = []
     for n in range(10):
         row = pipeline.trade(n)
@@ -280,11 +282,12 @@ def test_rows_without_chain_identity_never_produce_evidence(pipeline):
         rows.append(row)
     pipeline.add(*rows)
 
-    entry = pipeline.run_cycle()[TOKEN_YES]
+    pipeline.run_cycle()
 
-    assert entry["verification_check_passed"] is True
-    assert entry["confirmations"] == 0
-    assert_no_evidence(entry)
+    # Incomplete V4 rows are rejected before market aggregation, so they
+    # cannot create flow, confirmations, or an evidence triple at all.
+    assert TOKEN_YES not in flow.flow_states
+    assert TOKEN_YES not in flow.market_states
 
 
 def test_evidence_never_crosses_between_yes_and_no_tokens(pipeline):
@@ -306,6 +309,23 @@ def test_evidence_never_crosses_between_yes_and_no_tokens(pipeline):
 # ============================================================
 # 3. EVIDENCE ADVANCES ONLY WITH NEW CONFIRMING TRADES
 # ============================================================
+
+def test_confirmation_b_replaces_entire_evidence_triple_from_same_event(pipeline):
+    rows = [pipeline.trade(n) for n in range(10)]
+    pipeline.add(*rows)
+    first = pipeline.run_cycle()[TOKEN_YES]
+    assert_evidence_from(first, rows[-1])
+
+    confirmation_b = pipeline.trade(10)
+    pipeline.add(confirmation_b)
+    second = pipeline.run_cycle()[TOKEN_YES]
+
+    assert_evidence_from(second, confirmation_b)
+    assert second["evidence_at"] == confirmation_b["block_timestamp"]
+    assert second["evidence_id"] != first["evidence_id"]
+    assert second["evidence_cursor"] != first["evidence_cursor"]
+    assert second["evidence_at"] != first["evidence_at"]
+
 
 def test_evidence_advances_only_with_new_confirming_trades(pipeline):
     rows = [pipeline.trade(n) for n in range(10)]

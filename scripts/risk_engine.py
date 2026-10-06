@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -68,6 +69,68 @@ def flow_for(row, flow_state):
         return None
     candidate = flow_state.get(token_id)
     return candidate if isinstance(candidate, dict) else None
+
+
+_EVIDENCE_ID_RE = re.compile(r"^0x[0-9a-fA-F]{64}:([0-9]+)$")
+
+
+def _valid_evidence_id(value):
+    if not isinstance(value, str):
+        return False
+    match = _EVIDENCE_ID_RE.fullmatch(value.strip())
+    if match is None:
+        return False
+    return int(match.group(1)) >= 0
+
+
+def _valid_evidence_cursor(value):
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(
+            isinstance(item, int)
+            and not isinstance(item, bool)
+            and item >= 0
+            for item in value
+        )
+    )
+
+
+def _valid_evidence_at(value):
+    if not isinstance(value, str) or not value.strip():
+        return False
+    value = value.strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def evidence_contract_error(flow):
+    fields = ("evidence_id", "evidence_cursor", "evidence_at")
+    if any(flow.get(field) is None or flow.get(field) == "" for field in fields):
+        return "EVIDENCE_MISSING"
+
+    evidence_id = flow.get("evidence_id")
+    cursor = flow.get("evidence_cursor")
+    evidence_at = flow.get("evidence_at")
+
+    if not _valid_evidence_id(evidence_id):
+        return "EVIDENCE_INVALID"
+    if not _valid_evidence_cursor(cursor):
+        return "EVIDENCE_INVALID"
+    if not _valid_evidence_at(evidence_at):
+        return "EVIDENCE_INVALID"
+
+    # The canonical evidence id suffix and cursor log_index must identify the
+    # same event. No evidence is synthesized to repair a mismatch.
+    if int(evidence_id.rsplit(":", 1)[1]) != cursor[1]:
+        return "EVIDENCE_INVALID"
+
+    return None
 
 
 def assess(row, flow_state, now=None):
@@ -187,6 +250,12 @@ def assess(row, flow_state, now=None):
 
         if flow.get("schema_version") != SCHEMA_VERSION:
             block("Flow schema mismatch", "SCHEMA_MISMATCH")
+
+        evidence_error = evidence_contract_error(flow)
+        if evidence_error == "EVIDENCE_MISSING":
+            block("Canonical flow evidence triple missing", "EVIDENCE_MISSING")
+        elif evidence_error == "EVIDENCE_INVALID":
+            block("Canonical flow evidence triple invalid", "EVIDENCE_INVALID")
 
         if not fresh(flow.get("source_updated_at"), now=now):
             block("Flow source stale", "STALE_FLOW")
@@ -362,6 +431,9 @@ def self_test():
         "source_updated_at": now.isoformat(),
         "last_trade_at": now.isoformat(),
         "remaining_seconds": 86400,
+        "evidence_id": "0x" + "ab" * 32 + ":4",
+        "evidence_cursor": [123, 4],
+        "evidence_at": now.isoformat(),
         "market": {"active": True, "closed": False, "accepting_orders": True},
     }
 
