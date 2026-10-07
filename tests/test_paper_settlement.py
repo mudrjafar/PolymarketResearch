@@ -257,6 +257,11 @@ def test_frozen_identity_mismatch_fails_closed(monkeypatch):
         "resolve_position_identity",
         lambda *a, **k: wrong,
     )
+    monkeypatch.setattr(
+        paper_settlement,
+        "_ctf_uint",
+        lambda *a, **k: 1,
+    )
 
     result = paper_settlement.check_settlement(position(), rpc_url="http://rpc")
     assert result["status"] == paper_settlement.IDENTITY_MISMATCH
