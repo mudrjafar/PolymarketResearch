@@ -120,13 +120,7 @@ class CollectorStore:
             self.conn.commit()
             return
 
-        if not legacy_trades_required.issubset(trades_columns):
-            raise StorageError(
-                "Unsupported collector trades schema; refusing automatic migration"
-            )
-
-        unexpected_missing = trades_required - trades_columns
-        if unexpected_missing != {"block_hash"}:
+        if trades_columns != legacy_trades_required:
             raise StorageError(
                 "Unsupported collector trades schema; refusing automatic migration"
             )
@@ -166,23 +160,41 @@ class CollectorStore:
                     "trade timestamps conflict with canonical block history"
                 )
 
-            self.conn.execute("ALTER TABLE trades ADD COLUMN block_hash TEXT")
             self.conn.execute(
                 """
-                UPDATE trades
-                   SET block_hash=(
-                       SELECT b.block_hash
-                         FROM blocks AS b
-                        WHERE b.chain_id=trades.chain_id
-                          AND b.block_number=trades.block_number
-                   )
+                CREATE TABLE trades_v2 (
+                    chain_id INTEGER NOT NULL,
+                    transaction_hash TEXT NOT NULL,
+                    log_index INTEGER NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    block_hash TEXT NOT NULL,
+                    block_timestamp INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (chain_id, transaction_hash, log_index),
+                    FOREIGN KEY (chain_id, block_number)
+                        REFERENCES blocks(chain_id, block_number)
+                )
                 """
             )
 
             rows = self.conn.execute(
-                "SELECT rowid, block_number, block_hash, block_timestamp, payload_json "
-                "FROM trades"
+                """
+                SELECT
+                    t.chain_id,
+                    t.transaction_hash,
+                    t.log_index,
+                    t.block_number,
+                    b.block_hash,
+                    t.block_timestamp,
+                    t.payload_json
+                FROM trades AS t
+                JOIN blocks AS b
+                  ON b.chain_id=t.chain_id
+                 AND b.block_number=t.block_number
+                ORDER BY t.chain_id, t.block_number, t.log_index, t.transaction_hash
+                """
             ).fetchall()
+
             for row in rows:
                 expected_hash = self._hash(row["block_hash"], "block_hash")
                 expected_timestamp = self._integer(
@@ -222,22 +234,49 @@ class CollectorStore:
                 payload["block_hash"] = expected_hash
                 payload["block_timestamp"] = expected_timestamp
                 self.conn.execute(
-                    "UPDATE trades SET block_hash=?, payload_json=? WHERE rowid=?",
+                    """
+                    INSERT INTO trades_v2(
+                        chain_id,
+                        transaction_hash,
+                        log_index,
+                        block_number,
+                        block_hash,
+                        block_timestamp,
+                        payload_json
+                    ) VALUES(?,?,?,?,?,?,?)
+                    """,
                     (
+                        row["chain_id"],
+                        row["transaction_hash"],
+                        row["log_index"],
+                        row["block_number"],
                         expected_hash,
+                        expected_timestamp,
                         self._payload_text(payload),
-                        row["rowid"],
                     ),
                 )
 
-            null_hashes = self.conn.execute(
-                "SELECT COUNT(*) FROM trades "
-                "WHERE block_hash IS NULL OR TRIM(block_hash)=''"
+            source_count = self.conn.execute(
+                "SELECT COUNT(*) FROM trades"
             ).fetchone()[0]
-            if int(null_hashes):
+            migrated_count = self.conn.execute(
+                "SELECT COUNT(*) FROM trades_v2"
+            ).fetchone()[0]
+            if int(source_count) != int(migrated_count):
                 raise StorageError(
-                    "Legacy collector database migration left unresolved block hashes"
+                    "Legacy collector database migration row count mismatch"
                 )
+
+            self.conn.execute("DROP TABLE trades")
+            self.conn.execute("ALTER TABLE trades_v2 RENAME TO trades")
+            self.conn.execute(
+                "CREATE INDEX idx_trades_block "
+                "ON trades(chain_id, block_number, log_index)"
+            )
+            self.conn.execute(
+                "CREATE INDEX idx_trades_time "
+                "ON trades(chain_id, block_timestamp, block_number, log_index)"
+            )
 
             self.conn.execute(f"PRAGMA user_version={STORAGE_SCHEMA_VERSION}")
             self.conn.commit()
