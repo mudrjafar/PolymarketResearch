@@ -1,0 +1,262 @@
+import base64
+
+import pytest
+
+from scripts import paper_settlement
+
+
+CONDITION = "0x" + "11" * 32
+TOKEN = "12345"
+
+
+def test_identity_matches_exactly_one_supported_family(monkeypatch):
+    monkeypatch.setattr(paper_settlement, "_ctf_uint", lambda *a, **k: 2)
+
+    def fake_collection(condition, index_set, **kwargs):
+        return b"A" * 32 if index_set == 1 else b"B" * 32
+
+    def fake_position(collateral, collection_id, **kwargs):
+        if (
+            collateral == paper_settlement.STANDARD_USDCE
+            and collection_id == b"A" * 32
+        ):
+            return int(TOKEN)
+        return 999
+
+    monkeypatch.setattr(paper_settlement, "_collection_id", fake_collection)
+    monkeypatch.setattr(paper_settlement, "_position_id", fake_position)
+
+    identity = paper_settlement.resolve_position_identity(
+        CONDITION,
+        TOKEN,
+        rpc_url="http://rpc",
+    )
+
+    assert identity == {
+        "settlement_family": paper_settlement.FAMILY_STANDARD,
+        "ctf_contract": paper_settlement.CTF_CONTRACT,
+        "position_collateral": paper_settlement.STANDARD_USDCE,
+        "outcome_index": 0,
+    }
+
+
+def test_identity_zero_or_ambiguous_match_fails_closed(monkeypatch):
+    monkeypatch.setattr(paper_settlement, "_ctf_uint", lambda *a, **k: 2)
+    monkeypatch.setattr(
+        paper_settlement,
+        "_collection_id",
+        lambda condition, index_set, **kwargs: bytes([index_set]) * 32,
+    )
+    monkeypatch.setattr(paper_settlement, "_position_id", lambda *a, **k: 999)
+
+    with pytest.raises(
+        paper_settlement.SettlementIdentityError,
+        match="TOKEN_IDENTITY_NO_MATCH",
+    ):
+        paper_settlement.resolve_position_identity(
+            CONDITION,
+            TOKEN,
+            rpc_url="http://rpc",
+        )
+
+    monkeypatch.setattr(
+        paper_settlement,
+        "_position_id",
+        lambda *a, **k: int(TOKEN),
+    )
+    with pytest.raises(
+        paper_settlement.SettlementIdentityError,
+        match="TOKEN_IDENTITY_NOT_UNIQUE",
+    ):
+        paper_settlement.resolve_position_identity(
+            CONDITION,
+            TOKEN,
+            rpc_url="http://rpc",
+        )
+
+
+def test_finalized_rpc_path_is_primary(monkeypatch):
+    block_hash = "0x" + "aa" * 32
+    calls = []
+
+    def fake_rpc(url, method, params, timeout=8):
+        calls.append((method, params))
+        return {"number": "0x64", "hash": block_hash}
+
+    monkeypatch.setattr(paper_settlement, "_rpc_call", fake_rpc)
+    monkeypatch.setattr(
+        paper_settlement,
+        "_latest_milestone",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("Heimdall must not be called")
+        ),
+    )
+
+    result = paper_settlement.get_finalized_block(
+        rpc_url="http://rpc",
+        heimdall_url="http://heimdall",
+    )
+
+    assert result.number == 100
+    assert result.block_hash == block_hash
+    assert result.source == "RPC_FINALIZED"
+    assert calls == [("eth_getBlockByNumber", ["finalized", False])]
+
+
+def test_heimdall_fallback_requires_rpc_hash_match(monkeypatch):
+    milestone_hash = "0x" + "bb" * 32
+
+    def fake_rpc(url, method, params, timeout=8):
+        if params[0] == "finalized":
+            raise paper_settlement.SettlementSourceError("UNSUPPORTED")
+        return {"number": "0xc8", "hash": milestone_hash}
+
+    monkeypatch.setattr(paper_settlement, "_rpc_call", fake_rpc)
+    monkeypatch.setattr(
+        paper_settlement,
+        "_latest_milestone",
+        lambda *a, **k: (200, milestone_hash),
+    )
+
+    result = paper_settlement.get_finalized_block(
+        rpc_url="http://rpc",
+        heimdall_url="http://heimdall",
+    )
+    assert result.number == 200
+    assert result.source == "HEIMDALL_MILESTONE"
+
+    def mismatch_rpc(url, method, params, timeout=8):
+        if params[0] == "finalized":
+            raise paper_settlement.SettlementSourceError("UNSUPPORTED")
+        return {"number": "0xc8", "hash": "0x" + "cc" * 32}
+
+    monkeypatch.setattr(paper_settlement, "_rpc_call", mismatch_rpc)
+    with pytest.raises(
+        paper_settlement.SettlementSourceError,
+        match="FINALITY_HASH_MISMATCH",
+    ):
+        paper_settlement.get_finalized_block(
+            rpc_url="http://rpc",
+            heimdall_url="http://heimdall",
+        )
+
+
+def test_heimdall_hash_accepts_protobuf_base64():
+    raw = bytes.fromhex("dd" * 32)
+    encoded = base64.b64encode(raw).decode()
+    assert paper_settlement._normalize_milestone_hash(encoded) == "0x" + "dd" * 32
+
+
+def position():
+    return {
+        "condition_id": CONDITION,
+        "token_id": TOKEN,
+        "settlement_family": paper_settlement.FAMILY_STANDARD,
+        "ctf_contract": paper_settlement.CTF_CONTRACT,
+        "position_collateral": paper_settlement.STANDARD_USDCE,
+        "outcome_index": 0,
+    }
+
+
+def _identity():
+    return {
+        "settlement_family": paper_settlement.FAMILY_STANDARD,
+        "ctf_contract": paper_settlement.CTF_CONTRACT,
+        "position_collateral": paper_settlement.STANDARD_USDCE,
+        "outcome_index": 0,
+    }
+
+
+def test_unresolved_and_resolved_not_final(monkeypatch):
+    monkeypatch.setattr(
+        paper_settlement,
+        "get_finalized_block",
+        lambda **kwargs: paper_settlement.FinalizedBlock(
+            100,
+            "0x" + "aa" * 32,
+            "RPC_FINALIZED",
+        ),
+    )
+    monkeypatch.setattr(
+        paper_settlement,
+        "resolve_position_identity",
+        lambda *a, **k: _identity(),
+    )
+
+    values = iter([0, 0])
+    monkeypatch.setattr(
+        paper_settlement,
+        "_ctf_uint",
+        lambda *a, **k: next(values),
+    )
+    result = paper_settlement.check_settlement(position(), rpc_url="http://rpc")
+    assert result["status"] == paper_settlement.UNRESOLVED
+
+    values = iter([0, 1])
+    monkeypatch.setattr(
+        paper_settlement,
+        "_ctf_uint",
+        lambda *a, **k: next(values),
+    )
+    result = paper_settlement.check_settlement(position(), rpc_url="http://rpc")
+    assert result["status"] == paper_settlement.RESOLVED_NOT_FINAL
+
+
+def test_final_payout_and_malformed_structure(monkeypatch):
+    monkeypatch.setattr(
+        paper_settlement,
+        "get_finalized_block",
+        lambda **kwargs: paper_settlement.FinalizedBlock(
+            100,
+            "0x" + "aa" * 32,
+            "RPC_FINALIZED",
+        ),
+    )
+    monkeypatch.setattr(
+        paper_settlement,
+        "resolve_position_identity",
+        lambda *a, **k: _identity(),
+    )
+
+    values = iter([2, 1, 1])
+    monkeypatch.setattr(
+        paper_settlement,
+        "_ctf_uint",
+        lambda *a, **k: next(values),
+    )
+    result = paper_settlement.check_settlement(position(), rpc_url="http://rpc")
+    assert result["status"] == paper_settlement.FINAL_SETTLED
+    assert result["payout_numerator"] == 1
+    assert result["payout_denominator"] == 2
+
+    values = iter([2, 2, 1])
+    monkeypatch.setattr(
+        paper_settlement,
+        "_ctf_uint",
+        lambda *a, **k: next(values),
+    )
+    result = paper_settlement.check_settlement(position(), rpc_url="http://rpc")
+    assert result["status"] == paper_settlement.SETTLEMENT_CHECK_ERROR
+    assert result["reason_code"] == "PAYOUT_STRUCTURE_INVALID"
+
+
+def test_frozen_identity_mismatch_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        paper_settlement,
+        "get_finalized_block",
+        lambda **kwargs: paper_settlement.FinalizedBlock(
+            100,
+            "0x" + "aa" * 32,
+            "RPC_FINALIZED",
+        ),
+    )
+    wrong = _identity()
+    wrong["outcome_index"] = 1
+    monkeypatch.setattr(
+        paper_settlement,
+        "resolve_position_identity",
+        lambda *a, **k: wrong,
+    )
+
+    result = paper_settlement.check_settlement(position(), rpc_url="http://rpc")
+    assert result["status"] == paper_settlement.IDENTITY_MISMATCH
