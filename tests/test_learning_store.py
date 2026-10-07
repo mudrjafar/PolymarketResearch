@@ -147,6 +147,10 @@ def test_schema_mismatch_fails_before_creating_current_tables(tmp_path):
     finally:
         conn.close()
 
+    # Important on Windows: a rejected constructor must not leak a file handle.
+    db.unlink()
+    assert not db.exists()
+
 
 def test_unversioned_existing_database_fails_without_mutation(tmp_path):
     import sqlite3
