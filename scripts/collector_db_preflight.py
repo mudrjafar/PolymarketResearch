@@ -76,12 +76,18 @@ def _normalize_hash(value):
 
 
 def _int_equal(value, expected):
-    if isinstance(value, bool):
+    if isinstance(value, bool) or isinstance(expected, bool):
         return False
     try:
-        return int(value) == int(expected)
+        left = int(value)
+        right = int(expected)
     except (TypeError, ValueError):
         return False
+    if isinstance(value, float) and not value.is_integer():
+        return False
+    if isinstance(expected, float) and not expected.is_integer():
+        return False
+    return left == right
 
 
 def _text_equal(value, expected):
@@ -478,7 +484,7 @@ def audit_database(path):
         trade_anchors = {}
         payloads = {}
 
-        if schema_kind != "UNKNOWN" and not any(x.startswith("MISSING_TABLE:") for x in blockers):
+        if schema_kind != "UNKNOWN" and not blockers:
             _validate_chain_ids(conn, blockers)
             counts = {
                 "checkpoint": _count(conn, "SELECT COUNT(*) FROM checkpoint"),
