@@ -194,7 +194,6 @@ class CollectorStore:
                 JOIN blocks AS b
                   ON b.chain_id=t.chain_id
                  AND b.block_number=t.block_number
-                ORDER BY t.chain_id, t.block_number, t.log_index, t.transaction_hash
                 """
             )
 
