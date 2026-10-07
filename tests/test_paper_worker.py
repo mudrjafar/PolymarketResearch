@@ -157,7 +157,7 @@ def unresolved_settlement(position):
 def run_worker(**kwargs):
     kwargs.setdefault("identity_loader", fake_identity)
     kwargs.setdefault("settlement_checker", unresolved_settlement)
-    return run_worker(**kwargs)
+    return paper_worker.run_once(**kwargs)
 
 
 def test_open_requires_exact_ready_book_binding_and_marks_from_bids(monkeypatch, tmp_path):
