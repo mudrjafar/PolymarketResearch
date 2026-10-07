@@ -143,6 +143,7 @@ def test_schema_mismatch_fails_before_creating_current_tables(tmp_path):
             )
         }
         assert tables == {"learning_meta"}
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal"
     finally:
         conn.close()
 
