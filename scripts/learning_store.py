@@ -233,10 +233,13 @@ class LearningStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.path), timeout=30.0)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=FULL")
+        # Connection-local safety can be enabled before validation. Persistent
+        # journal-mode mutation is deliberately deferred until the on-disk
+        # schema/version has been accepted.
         self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.execute("PRAGMA synchronous=FULL")
         self._initialize()
+        self.conn.execute("PRAGMA journal_mode=WAL")
 
     def __enter__(self):
         return self
