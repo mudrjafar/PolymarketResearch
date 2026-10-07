@@ -113,6 +113,24 @@ def _rpc_call(rpc_url, method, params, timeout=DEFAULT_TIMEOUT_SECONDS):
     return payload["result"]
 
 
+
+def _assert_polygon_chain(rpc_url, timeout=DEFAULT_TIMEOUT_SECONDS):
+    result = _rpc_call(
+        rpc_url,
+        "eth_chainId",
+        [],
+        timeout=timeout,
+    )
+    try:
+        chain_id = int(str(result), 16)
+    except (TypeError, ValueError):
+        raise SettlementSourceError("RPC_CHAIN_ID_INVALID") from None
+    if chain_id != POLYGON_CHAIN_ID:
+        raise SettlementSourceError(
+            f"RPC_CHAIN_ID_MISMATCH:{chain_id}"
+        )
+    return chain_id
+
 def _normalize_block(block):
     if not isinstance(block, dict):
         raise SettlementSourceError("FINALIZED_BLOCK_INVALID")
@@ -195,6 +213,8 @@ def get_finalized_block(
     heimdall_url = str(
         heimdall_url or os.getenv("POLYMARKET_HEIMDALL_URL", "")
     ).strip()
+
+    _assert_polygon_chain(rpc_url, timeout=timeout)
 
     try:
         block = _rpc_call(
@@ -326,8 +346,11 @@ def resolve_position_identity(
     rpc_url=None,
     block_tag="latest",
     timeout=DEFAULT_TIMEOUT_SECONDS,
+    validate_chain=True,
 ):
     rpc_url = str(rpc_url or os.getenv("POLYMARKET_RPC_URL", "")).strip()
+    if validate_chain:
+        _assert_polygon_chain(rpc_url, timeout=timeout)
     condition = _condition_bytes(condition_id)
     token = _token_int(token_id)
 
@@ -481,6 +504,7 @@ def check_settlement(
             rpc_url=rpc_url,
             block_tag=block_tag,
             timeout=timeout,
+            validate_chain=False,
         )
         if observed != frozen:
             return {
