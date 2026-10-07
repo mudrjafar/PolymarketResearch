@@ -3,6 +3,7 @@ import sqlite3
 from pathlib import Path
 
 CHAIN_ID = 137
+STORAGE_SCHEMA_VERSION = 2
 
 
 class StorageError(RuntimeError):
@@ -20,6 +21,7 @@ class CollectorStore:
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self._create_schema()
+        self._migrate_schema()
 
     def __enter__(self):
         return self
@@ -72,6 +74,220 @@ class CollectorStore:
             """
         )
         self.conn.commit()
+
+    def _table_columns(self, table):
+        return {
+            str(row["name"])
+            for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+
+    def _migrate_schema(self):
+        """Upgrade known historical local schemas without discarding evidence."""
+        checkpoint_required = {"chain_id", "block_number", "block_hash"}
+        blocks_required = {
+            "chain_id",
+            "block_number",
+            "block_hash",
+            "parent_hash",
+            "block_timestamp",
+        }
+        trades_required = {
+            "chain_id",
+            "transaction_hash",
+            "log_index",
+            "block_number",
+            "block_hash",
+            "block_timestamp",
+            "payload_json",
+        }
+        legacy_trades_required = trades_required - {"block_hash"}
+
+        checkpoint_columns = self._table_columns("checkpoint")
+        blocks_columns = self._table_columns("blocks")
+        trades_columns = self._table_columns("trades")
+
+        if not checkpoint_required.issubset(checkpoint_columns):
+            raise StorageError(
+                "Unsupported collector checkpoint schema; refusing automatic migration"
+            )
+        if not blocks_required.issubset(blocks_columns):
+            raise StorageError(
+                "Unsupported collector block-history schema; refusing automatic migration"
+            )
+
+        if trades_required.issubset(trades_columns):
+            self.conn.execute(f"PRAGMA user_version={STORAGE_SCHEMA_VERSION}")
+            self.conn.commit()
+            return
+
+        if trades_columns != legacy_trades_required:
+            raise StorageError(
+                "Unsupported collector trades schema; refusing automatic migration"
+            )
+
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+
+            missing_headers = self.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM trades AS t
+                LEFT JOIN blocks AS b
+                  ON b.chain_id=t.chain_id
+                 AND b.block_number=t.block_number
+                WHERE b.block_hash IS NULL
+                """
+            ).fetchone()[0]
+            if int(missing_headers):
+                raise StorageError(
+                    "Legacy collector database cannot be migrated safely: "
+                    "trade rows are missing canonical block history"
+                )
+
+            timestamp_conflicts = self.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM trades AS t
+                JOIN blocks AS b
+                  ON b.chain_id=t.chain_id
+                 AND b.block_number=t.block_number
+                WHERE t.block_timestamp != b.block_timestamp
+                """
+            ).fetchone()[0]
+            if int(timestamp_conflicts):
+                raise StorageError(
+                    "Legacy collector database cannot be migrated safely: "
+                    "trade timestamps conflict with canonical block history"
+                )
+
+            self.conn.execute(
+                """
+                CREATE TABLE trades_v2 (
+                    chain_id INTEGER NOT NULL,
+                    transaction_hash TEXT NOT NULL,
+                    log_index INTEGER NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    block_hash TEXT NOT NULL,
+                    block_timestamp INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (chain_id, transaction_hash, log_index),
+                    FOREIGN KEY (chain_id, block_number)
+                        REFERENCES blocks(chain_id, block_number)
+                )
+                """
+            )
+
+            rows = self.conn.execute(
+                """
+                SELECT
+                    t.chain_id,
+                    t.transaction_hash,
+                    t.log_index,
+                    t.block_number,
+                    b.block_hash,
+                    t.block_timestamp,
+                    t.payload_json
+                FROM trades AS t
+                JOIN blocks AS b
+                  ON b.chain_id=t.chain_id
+                 AND b.block_number=t.block_number
+                ORDER BY t.chain_id, t.block_number, t.log_index, t.transaction_hash
+                """
+            ).fetchall()
+
+            for row in rows:
+                expected_hash = self._hash(row["block_hash"], "block_hash")
+                expected_timestamp = self._integer(
+                    row["block_timestamp"], "block_timestamp"
+                )
+                try:
+                    payload = json.loads(row["payload_json"])
+                except (TypeError, ValueError) as exc:
+                    raise StorageError(
+                        "Legacy collector database cannot be migrated safely: "
+                        "trade payload JSON is invalid"
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise StorageError(
+                        "Legacy collector database cannot be migrated safely: "
+                        "trade payload is not an object"
+                    )
+
+                payload_hash = payload.get("block_hash")
+                if payload_hash is not None:
+                    if self._hash(payload_hash, "payload block_hash") != expected_hash:
+                        raise StorageError(
+                            "Legacy collector database cannot be migrated safely: "
+                            "trade payload block hash conflicts with canonical history"
+                        )
+
+                payload_timestamp = payload.get("block_timestamp")
+                if payload_timestamp is not None:
+                    if self._integer(
+                        payload_timestamp, "payload block_timestamp"
+                    ) != expected_timestamp:
+                        raise StorageError(
+                            "Legacy collector database cannot be migrated safely: "
+                            "trade payload timestamp conflicts with canonical history"
+                        )
+
+                payload["block_hash"] = expected_hash
+                payload["block_timestamp"] = expected_timestamp
+                self.conn.execute(
+                    """
+                    INSERT INTO trades_v2(
+                        chain_id,
+                        transaction_hash,
+                        log_index,
+                        block_number,
+                        block_hash,
+                        block_timestamp,
+                        payload_json
+                    ) VALUES(?,?,?,?,?,?,?)
+                    """,
+                    (
+                        row["chain_id"],
+                        row["transaction_hash"],
+                        row["log_index"],
+                        row["block_number"],
+                        expected_hash,
+                        expected_timestamp,
+                        self._payload_text(payload),
+                    ),
+                )
+
+            source_count = self.conn.execute(
+                "SELECT COUNT(*) FROM trades"
+            ).fetchone()[0]
+            migrated_count = self.conn.execute(
+                "SELECT COUNT(*) FROM trades_v2"
+            ).fetchone()[0]
+            if int(source_count) != int(migrated_count):
+                raise StorageError(
+                    "Legacy collector database migration row count mismatch"
+                )
+
+            self.conn.execute("DROP TABLE trades")
+            self.conn.execute("ALTER TABLE trades_v2 RENAME TO trades")
+            self.conn.execute(
+                "CREATE INDEX idx_trades_block "
+                "ON trades(chain_id, block_number, log_index)"
+            )
+            self.conn.execute(
+                "CREATE INDEX idx_trades_time "
+                "ON trades(chain_id, block_timestamp, block_number, log_index)"
+            )
+
+            self.conn.execute(f"PRAGMA user_version={STORAGE_SCHEMA_VERSION}")
+            self.conn.commit()
+            print(
+                "[COLLECTOR STORAGE] Migrated legacy trades schema: "
+                "backfilled canonical block_hash"
+            )
+        except Exception:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
 
     @staticmethod
     def _hash(value, label):
