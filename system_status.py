@@ -17,6 +17,7 @@ FOCUS_STATE_FILE = DATA_DIR / "focus_state.json"
 FOCUS_FILE = DATA_DIR / "focused_market.json"
 BOOK_FILE = DATA_DIR / "book_assessment.json"
 PAPER_FILE = DATA_DIR / "paper_state.json"
+RUNTIME_STATUS_FILE = DATA_DIR / "runtime_status.json"
 
 REFRESH_SECONDS = 5
 TAIL_LINES = 50000
@@ -120,6 +121,7 @@ def main():
         diamonds = load_json(DIAMONDS_FILE, [])
         candidates = load_json(CANDIDATES_FILE, [])
         focus = load_json(FOCUS_FILE, {})
+        runtime = load_json(RUNTIME_STATUS_FILE, {})
         total_tail, recent15 = count_recent_trades()
 
         clear()
@@ -140,6 +142,17 @@ def main():
         print(f"Watchlist items           : {len(candidates) if isinstance(candidates, list) else 0:,}")
         print(f"Diamonds                  : {len(diamonds) if isinstance(diamonds, list) else 0:,}")
         print(f"Focused market            : {focused_label(focus)}")
+        print(f"Runtime supervisor        : {runtime.get('overall_status', 'UNKNOWN') if isinstance(runtime, dict) else 'UNKNOWN'}")
+        if isinstance(runtime, dict):
+            services = runtime.get("services")
+            if isinstance(services, dict):
+                degraded = [
+                    f"{name}:{row.get('status')}"
+                    for name, row in services.items()
+                    if isinstance(row, dict) and row.get("status") not in {"RUNNING", "DISABLED"}
+                ]
+                if degraded:
+                    print(f"Runtime exceptions        : {', '.join(degraded)}")
         print()
         print("FILE HEALTH")
         print(f"live_trades.jsonl         : {file_age(TRADES_FILE)}")
@@ -150,6 +163,7 @@ def main():
         print(f"focused_market.json       : {file_age(FOCUS_FILE)}")
         print(f"book_assessment.json      : {file_age(BOOK_FILE)}")
         print(f"paper_state.json          : {file_age(PAPER_FILE)}")
+        print(f"runtime_status.json       : {file_age(RUNTIME_STATUS_FILE)}")
         print()
         print(f"Refresh: {REFRESH_SECONDS}s | CTRL+C to stop this window")
         print("=" * 72)
