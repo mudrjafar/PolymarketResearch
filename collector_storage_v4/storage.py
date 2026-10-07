@@ -177,6 +177,9 @@ class CollectorStore:
                 """
             )
 
+            source_count = int(
+                self.conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            )
             rows = self.conn.execute(
                 """
                 SELECT
@@ -191,10 +194,10 @@ class CollectorStore:
                 JOIN blocks AS b
                   ON b.chain_id=t.chain_id
                  AND b.block_number=t.block_number
-                ORDER BY t.chain_id, t.block_number, t.log_index, t.transaction_hash
                 """
-            ).fetchall()
+            )
 
+            migrated_rows = 0
             for row in rows:
                 expected_hash = self._hash(row["block_hash"], "block_hash")
                 expected_timestamp = self._integer(
@@ -255,14 +258,12 @@ class CollectorStore:
                         self._payload_text(payload),
                     ),
                 )
+                migrated_rows += 1
 
-            source_count = self.conn.execute(
-                "SELECT COUNT(*) FROM trades"
-            ).fetchone()[0]
-            migrated_count = self.conn.execute(
-                "SELECT COUNT(*) FROM trades_v2"
-            ).fetchone()[0]
-            if int(source_count) != int(migrated_count):
+            migrated_count = int(
+                self.conn.execute("SELECT COUNT(*) FROM trades_v2").fetchone()[0]
+            )
+            if source_count != migrated_rows or source_count != migrated_count:
                 raise StorageError(
                     "Legacy collector database migration row count mismatch"
                 )
