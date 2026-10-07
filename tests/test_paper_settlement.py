@@ -10,6 +10,7 @@ TOKEN = "12345"
 
 
 def test_identity_matches_exactly_one_supported_family(monkeypatch):
+    monkeypatch.setattr(paper_settlement, "_assert_polygon_chain", lambda *a, **k: 137)
     monkeypatch.setattr(paper_settlement, "_ctf_uint", lambda *a, **k: 2)
 
     def fake_collection(condition, index_set, **kwargs):
@@ -41,6 +42,7 @@ def test_identity_matches_exactly_one_supported_family(monkeypatch):
 
 
 def test_identity_zero_or_ambiguous_match_fails_closed(monkeypatch):
+    monkeypatch.setattr(paper_settlement, "_assert_polygon_chain", lambda *a, **k: 137)
     monkeypatch.setattr(paper_settlement, "_ctf_uint", lambda *a, **k: 2)
     monkeypatch.setattr(
         paper_settlement,
@@ -81,6 +83,8 @@ def test_finalized_rpc_path_is_primary(monkeypatch):
 
     def fake_rpc(url, method, params, timeout=8):
         calls.append((method, params))
+        if method == "eth_chainId":
+            return "0x89"
         return {"number": "0x64", "hash": block_hash}
 
     monkeypatch.setattr(paper_settlement, "_rpc_call", fake_rpc)
@@ -100,13 +104,18 @@ def test_finalized_rpc_path_is_primary(monkeypatch):
     assert result.number == 100
     assert result.block_hash == block_hash
     assert result.source == "RPC_FINALIZED"
-    assert calls == [("eth_getBlockByNumber", ["finalized", False])]
+    assert calls == [
+        ("eth_chainId", []),
+        ("eth_getBlockByNumber", ["finalized", False]),
+    ]
 
 
 def test_heimdall_fallback_requires_rpc_hash_match(monkeypatch):
     milestone_hash = "0x" + "bb" * 32
 
     def fake_rpc(url, method, params, timeout=8):
+        if method == "eth_chainId":
+            return "0x89"
         if params[0] == "finalized":
             raise paper_settlement.SettlementSourceError("UNSUPPORTED")
         return {"number": "0xc8", "hash": milestone_hash}
@@ -126,6 +135,8 @@ def test_heimdall_fallback_requires_rpc_hash_match(monkeypatch):
     assert result.source == "HEIMDALL_MILESTONE"
 
     def mismatch_rpc(url, method, params, timeout=8):
+        if method == "eth_chainId":
+            return "0x89"
         if params[0] == "finalized":
             raise paper_settlement.SettlementSourceError("UNSUPPORTED")
         return {"number": "0xc8", "hash": "0x" + "cc" * 32}
@@ -265,3 +276,20 @@ def test_frozen_identity_mismatch_fails_closed(monkeypatch):
 
     result = paper_settlement.check_settlement(position(), rpc_url="http://rpc")
     assert result["status"] == paper_settlement.IDENTITY_MISMATCH
+
+
+def test_wrong_rpc_chain_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        paper_settlement,
+        "_rpc_call",
+        lambda url, method, params, timeout=8: "0x1",
+    )
+
+    with pytest.raises(
+        paper_settlement.SettlementSourceError,
+        match="RPC_CHAIN_ID_MISMATCH:1",
+    ):
+        paper_settlement.get_finalized_block(
+            rpc_url="http://rpc",
+            heimdall_url="http://heimdall",
+        )
