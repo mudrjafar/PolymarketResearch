@@ -441,19 +441,6 @@ def check_settlement(
         )
         block_tag = hex(finalized.number)
 
-        observed = resolve_position_identity(
-            position.get("condition_id"),
-            position.get("token_id"),
-            rpc_url=rpc_url,
-            block_tag=block_tag,
-            timeout=timeout,
-        )
-        if observed != frozen:
-            return {
-                "status": IDENTITY_MISMATCH,
-                "reason_code": "FROZEN_IDENTITY_MISMATCH",
-            }
-
         condition = _condition_bytes(position.get("condition_id"))
         denominator = _ctf_uint(
             "payoutDenominator(bytes32)",
@@ -487,6 +474,19 @@ def check_settlement(
             except SettlementSourceError:
                 result["reason_code"] = "LATEST_DIAGNOSTIC_UNAVAILABLE"
             return result
+
+        observed = resolve_position_identity(
+            position.get("condition_id"),
+            position.get("token_id"),
+            rpc_url=rpc_url,
+            block_tag=block_tag,
+            timeout=timeout,
+        )
+        if observed != frozen:
+            return {
+                "status": IDENTITY_MISMATCH,
+                "reason_code": "FROZEN_IDENTITY_MISMATCH",
+            }
 
         numerator0 = _ctf_uint(
             "payoutNumerators(bytes32,uint256)",
