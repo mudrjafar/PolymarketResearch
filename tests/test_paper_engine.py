@@ -110,3 +110,27 @@ def test_missing_fee_data_is_fee_free_like_official_client_default():
     )
 
     assert info == {"fee_rate": 0.0, "fee_exponent": 0.0}
+
+
+def test_settlement_math_supports_binary_and_fractional_payouts():
+    yes = paper_engine.calculate_settlement(40, 25, 1, 1)
+    assert yes["payout_per_token"] == 1.0
+    assert yes["settlement_value_usd"] == 40.0
+    assert yes["realized_pnl_usd"] == 15.0
+
+    lose = paper_engine.calculate_settlement(40, 25, 0, 1)
+    assert lose["settlement_value_usd"] == 0.0
+    assert lose["realized_pnl_usd"] == -25.0
+
+    half = paper_engine.calculate_settlement(40, 25, 1, 2)
+    assert half["payout_per_token"] == 0.5
+    assert half["settlement_value_usd"] == 20.0
+    assert half["realized_pnl_usd"] == -5.0
+
+
+def test_settlement_math_rejects_invalid_payouts():
+    with pytest.raises(ValueError, match="PAYOUT_STRUCTURE_INVALID"):
+        paper_engine.calculate_settlement(40, 25, 2, 1)
+
+    with pytest.raises(ValueError, match="PAYOUT_STRUCTURE_INVALID"):
+        paper_engine.calculate_settlement(40, 25, 0, 0)
