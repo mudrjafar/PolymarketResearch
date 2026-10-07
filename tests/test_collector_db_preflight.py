@@ -306,3 +306,57 @@ def test_cli_success_exit_code_for_safe_legacy_db(tmp_path, capsys):
     assert rc == 0
     assert "RESULT: MIGRATION_SAFE" in output
     assert "READ ONLY" in output
+
+
+def test_structurally_unsupported_checkpoint_schema_reports_blocked_not_error(tmp_path):
+    db = tmp_path / "collector.sqlite3"
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE checkpoint (
+                chain_id INTEGER PRIMARY KEY,
+                block_number INTEGER NOT NULL
+            );
+            CREATE TABLE blocks (
+                chain_id INTEGER NOT NULL,
+                block_number INTEGER NOT NULL,
+                block_hash TEXT NOT NULL,
+                parent_hash TEXT NOT NULL,
+                block_timestamp INTEGER NOT NULL,
+                PRIMARY KEY (chain_id, block_number)
+            );
+            CREATE TABLE trades (
+                chain_id INTEGER NOT NULL,
+                transaction_hash TEXT NOT NULL,
+                log_index INTEGER NOT NULL,
+                block_number INTEGER NOT NULL,
+                block_timestamp INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (chain_id, transaction_hash, log_index)
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    report = audit_database(db)
+
+    assert report["result"] == "MIGRATION_BLOCKED"
+    assert "UNSUPPORTED_CHECKPOINT_SCHEMA" in report["blockers"]
+
+
+def test_fractional_payload_log_index_is_not_accepted_as_same_identity(tmp_path):
+    db = tmp_path / "collector.sqlite3"
+    payload = {
+        "block": 101,
+        "transaction_hash": h(1001),
+        "log_index": 7.5,
+    }
+    create_db(db, payload=payload)
+
+    report = audit_database(db)
+
+    assert report["result"] == "MIGRATION_BLOCKED"
+    assert "PAYLOAD_IDENTITY_MISMATCH:1" in report["blockers"]
