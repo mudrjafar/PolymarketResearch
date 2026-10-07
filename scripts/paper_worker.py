@@ -938,10 +938,26 @@ def self_test():
                     "fd": {"r": 0.05, "e": 1},
                 }
 
+            def fake_identity(condition_id, token_id):
+                return {
+                    "settlement_family": paper_settlement.FAMILY_STANDARD,
+                    "ctf_contract": paper_settlement.CTF_CONTRACT,
+                    "position_collateral": paper_settlement.STANDARD_USDCE,
+                    "outcome_index": 0,
+                }
+
+            def fake_settlement(position):
+                return {
+                    "status": paper_settlement.UNRESOLVED,
+                    "reason_code": None,
+                }
+
             state, events = run_once(
                 now=now,
                 book_loader=fake_book,
                 market_info_loader=fake_market,
+                identity_loader=fake_identity,
+                settlement_checker=fake_settlement,
             )
             assert events[0]["type"] == "OPENED"
             assert len(state["positions"]) == 1
@@ -967,6 +983,8 @@ def self_test():
                 now=now,
                 book_loader=fake_book,
                 market_info_loader=fake_market,
+                identity_loader=fake_identity,
+                settlement_checker=fake_settlement,
             )
             assert events[0]["type"] == "CLOSED"
             assert state["positions"][0]["status"] == "CLOSED"
