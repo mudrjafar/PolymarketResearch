@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import pytest
 
 from machine_common import save_json_atomic
-from scripts import paper_worker
+from scripts import paper_settlement, paper_worker
 
 
 NOW = datetime.now(timezone.utc)
@@ -134,13 +134,39 @@ def loaders():
     )
 
 
+def fake_identity(condition_id, token_id):
+    return {
+        "settlement_family": paper_settlement.FAMILY_STANDARD,
+        "ctf_contract": paper_settlement.CTF_CONTRACT,
+        "position_collateral": paper_settlement.STANDARD_USDCE,
+        "outcome_index": 0,
+    }
+
+
+def unresolved_settlement(position):
+    return {
+        "status": paper_settlement.UNRESOLVED,
+        "reason_code": None,
+        "settlement_read_block": 100,
+        "settlement_read_block_hash": "0x" + "aa" * 32,
+        "settlement_authority": paper_settlement.CTF_CONTRACT,
+        "settlement_finality_source": "RPC_FINALIZED",
+    }
+
+
+def run_worker(**kwargs):
+    kwargs.setdefault("identity_loader", fake_identity)
+    kwargs.setdefault("settlement_checker", unresolved_settlement)
+    return run_worker(**kwargs)
+
+
 def test_open_requires_exact_ready_book_binding_and_marks_from_bids(monkeypatch, tmp_path):
     paths = configure(monkeypatch, tmp_path)
     write_gate(paths)
     write_open_request(paths)
     book_loader, market_loader = loaders()
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=book_loader,
         market_info_loader=market_loader,
@@ -165,7 +191,7 @@ def test_focus_wait_rejects_open_without_fetching_execution_book(monkeypatch, tm
     def forbidden(_):
         raise AssertionError("CLOB must not be called")
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=forbidden,
         market_info_loader=forbidden,
@@ -182,7 +208,7 @@ def test_generation_mismatch_rejects_request(monkeypatch, tmp_path):
     write_open_request(paths, generation="GEN-OLD")
     book_loader, market_loader = loaders()
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=book_loader,
         market_info_loader=market_loader,
@@ -198,7 +224,7 @@ def test_same_request_is_idempotent(monkeypatch, tmp_path):
     write_open_request(paths)
     book_loader, market_loader = loaders()
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=book_loader,
         market_info_loader=market_loader,
@@ -206,7 +232,7 @@ def test_same_request_is_idempotent(monkeypatch, tmp_path):
     assert len(state["positions"]) == 1
     assert len(events) == 1
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=book_loader,
         market_info_loader=market_loader,
@@ -221,7 +247,7 @@ def test_close_is_user_controlled_and_does_not_require_focus_ready(monkeypatch, 
     write_open_request(paths)
     book_loader, market_loader = loaders()
 
-    state, _ = paper_worker.run_once(
+    state, _ = run_worker(
         now=NOW,
         book_loader=book_loader,
         market_info_loader=market_loader,
@@ -231,7 +257,7 @@ def test_close_is_user_controlled_and_does_not_require_focus_ready(monkeypatch, 
     write_gate(paths, state="WAIT")
     write_close_request(paths, paper_id)
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=book_loader,
         market_info_loader=market_loader,
@@ -250,7 +276,7 @@ def test_insufficient_exit_depth_rejects_close_and_keeps_position_open(monkeypat
     write_gate(paths)
     write_open_request(paths)
 
-    state, _ = paper_worker.run_once(
+    state, _ = run_worker(
         now=NOW,
         book_loader=lambda _: raw_book(),
         market_info_loader=lambda _: market_info(),
@@ -258,7 +284,7 @@ def test_insufficient_exit_depth_rejects_close_and_keeps_position_open(monkeypat
     paper_id = state["positions"][0]["paper_id"]
     write_close_request(paths, paper_id)
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=lambda _: raw_book(bid_size="1"),
         market_info_loader=lambda _: market_info(),
@@ -275,7 +301,7 @@ def test_corrupt_durable_state_fails_closed(monkeypatch, tmp_path):
     paths["state"].write_text("{bad-json", encoding="utf-8")
 
     with pytest.raises(paper_worker.PaperStateError):
-        paper_worker.run_once(
+        run_worker(
             now=NOW,
             book_loader=lambda _: raw_book(),
             market_info_loader=lambda _: market_info(),
