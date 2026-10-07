@@ -90,11 +90,24 @@ def test_legacy_trades_schema_migrates_block_hash_and_payload(tmp_path):
     create_legacy_db(db)
 
     with CollectorStore(db) as store:
-        columns = {
-            row["name"]
+        schema = {
+            row["name"]: row
             for row in store.conn.execute("PRAGMA table_info(trades)").fetchall()
         }
-        assert "block_hash" in columns
+        assert "block_hash" in schema
+        assert schema["block_hash"]["notnull"] == 1
+        assert schema["block_timestamp"]["notnull"] == 1
+        assert schema["payload_json"]["notnull"] == 1
+
+        foreign_keys = store.conn.execute(
+            "PRAGMA foreign_key_list(trades)"
+        ).fetchall()
+        assert any(
+            row["table"] == "blocks"
+            and row["from"] == "block_number"
+            and row["to"] == "block_number"
+            for row in foreign_keys
+        )
 
         row = store.conn.execute(
             "SELECT block_hash, block_timestamp, payload_json FROM trades"
@@ -187,3 +200,36 @@ def test_current_schema_is_noop_and_sets_schema_version(tmp_path):
             store.conn.execute("PRAGMA user_version").fetchone()[0]
             == STORAGE_SCHEMA_VERSION
         )
+
+
+
+def test_unknown_legacy_trade_columns_fail_closed_instead_of_being_discarded(tmp_path):
+    db = tmp_path / "collector.sqlite3"
+    create_legacy_db(db)
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN legacy_extra TEXT")
+        conn.execute("UPDATE trades SET legacy_extra='preserve-me'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        StorageError,
+        match="Unsupported collector trades schema",
+    ):
+        CollectorStore(db)
+
+    conn = sqlite3.connect(db)
+    try:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(trades)").fetchall()
+        }
+        assert "legacy_extra" in columns
+        assert conn.execute(
+            "SELECT legacy_extra FROM trades"
+        ).fetchone()[0] == "preserve-me"
+    finally:
+        conn.close()
