@@ -1,0 +1,33 @@
+name: Temporary P0 Integration Validation
+
+on:
+  push:
+    branches:
+      - integration/p0-runtime-storage-ld1-validation
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Targeted integration tests
+        run: python -m pytest -q tests/test_learning_contract.py tests/test_learning_store.py tests/test_collector_legacy_schema_migration.py tests/test_runtime_supervisor.py
+
+      - name: Collector storage regressions
+        run: python -m pytest -q collector_storage_v4/test_storage.py tests/test_collector_sqlite.py
+
+      - name: Full project regression
+        run: python -m pytest -q
+
+      - name: Machine self-test
+        run: python run_machine.py --self-test
