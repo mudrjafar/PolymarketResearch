@@ -115,3 +115,62 @@ def test_foreign_key_prevents_orphan_signal(tmp_path):
     with LearningStore(tmp_path / "learning.sqlite3") as store:
         with pytest.raises(LearningStoreError, match="FOREIGN KEY"):
             store.insert_signal_observation("SIG-1", "SV-missing", signal_row())
+
+
+def test_schema_mismatch_fails_before_creating_current_tables(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "learning.sqlite3"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("CREATE TABLE learning_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO learning_meta(key,value) VALUES('schema_version','999')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(LearningStoreError, match="schema mismatch"):
+        LearningStore(db)
+
+    conn = sqlite3.connect(db)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert tables == {"learning_meta"}
+    finally:
+        conn.close()
+
+
+def test_unversioned_existing_database_fails_without_mutation(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "learning.sqlite3"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("CREATE TABLE legacy_data (id INTEGER PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO legacy_data(value) VALUES('keep-me')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(LearningStoreError, match="unversioned"):
+        LearningStore(db)
+
+    conn = sqlite3.connect(db)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert tables == {"legacy_data"}
+        assert conn.execute("SELECT value FROM legacy_data").fetchone()[0] == "keep-me"
+    finally:
+        conn.close()
