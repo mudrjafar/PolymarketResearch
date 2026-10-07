@@ -250,20 +250,52 @@ class LearningStore:
             self.conn.close()
             self.conn = None
 
+    def _existing_user_tables(self):
+        rows = self.conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        return {str(row["name"]) for row in rows}
+
+    def _validate_existing_schema_marker(self, tables):
+        if not tables:
+            return False
+        if "learning_meta" not in tables:
+            raise LearningStoreError(
+                "existing learning database is unversioned; refusing automatic mutation"
+            )
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM learning_meta WHERE key='schema_version'"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise LearningStoreError(
+                f"learning database schema marker unreadable: {exc}"
+            ) from exc
+        if row is None:
+            raise LearningStoreError("learning database schema version missing")
+        try:
+            version = int(row["value"])
+        except (TypeError, ValueError) as exc:
+            raise LearningStoreError("learning database schema version invalid") from exc
+        if version != LEARNING_SCHEMA_VERSION:
+            raise LearningStoreError("learning database schema mismatch")
+        return True
+
     def _initialize(self):
         try:
+            tables = self._existing_user_tables()
+            has_schema_marker = self._validate_existing_schema_marker(tables)
+
             with self.conn:
                 self.conn.executescript(SCHEMA_SQL)
-                current = self.conn.execute(
-                    "SELECT value FROM learning_meta WHERE key='schema_version'"
-                ).fetchone()
-                if current is None:
+                if not has_schema_marker:
                     self.conn.execute(
                         "INSERT INTO learning_meta(key,value) VALUES('schema_version',?)",
                         (str(LEARNING_SCHEMA_VERSION),),
                     )
-                elif int(current["value"]) != LEARNING_SCHEMA_VERSION:
-                    raise LearningStoreError("learning database schema mismatch")
+        except LearningStoreError:
+            raise
         except sqlite3.Error as exc:
             raise LearningStoreError(f"learning database init failed: {exc}") from exc
 
