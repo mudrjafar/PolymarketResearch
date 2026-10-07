@@ -318,3 +318,189 @@ def test_runtime_orders_book_before_paper_before_telegram():
     telegram_index = source.index('("telegram",')
 
     assert book_index < paper_index < telegram_index
+
+
+def final_settlement(position):
+    return {
+        "status": paper_settlement.FINAL_SETTLED,
+        "reason_code": None,
+        "settlement_read_block": 200,
+        "settlement_read_block_hash": "0x" + "bb" * 32,
+        "settlement_authority": paper_settlement.CTF_CONTRACT,
+        "settlement_finality_source": "RPC_FINALIZED",
+        "payout_numerator": 1,
+        "payout_denominator": 1,
+    }
+
+
+def resolved_not_final(position):
+    return {
+        "status": paper_settlement.RESOLVED_NOT_FINAL,
+        "reason_code": None,
+        "settlement_read_block": 199,
+        "settlement_read_block_hash": "0x" + "cc" * 32,
+        "settlement_authority": paper_settlement.CTF_CONTRACT,
+        "settlement_finality_source": "RPC_FINALIZED",
+    }
+
+
+def settlement_error(position):
+    return {
+        "status": paper_settlement.SETTLEMENT_CHECK_ERROR,
+        "reason_code": "RPC_UNAVAILABLE",
+    }
+
+
+def test_final_settlement_is_terminal_and_idempotent(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    paper_id = state["positions"][0]["paper_id"]
+
+    def forbidden_book(_):
+        raise AssertionError("SETTLED position must not be marked from CLOB")
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=forbidden_book,
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=final_settlement,
+    )
+
+    settled = [event for event in events if event["type"] == "SETTLED"]
+    assert len(settled) == 1
+    position = state["positions"][0]
+    assert position["paper_id"] == paper_id
+    assert position["status"] == "SETTLED"
+    assert position["settlement_status"] == paper_settlement.FINAL_SETTLED
+    assert position["payout_per_token"] == 1.0
+    assert position["settlement_value_usd"] == pytest.approx(position["tokens"])
+    assert position["realized_pnl_usd"] == pytest.approx(
+        position["settlement_value_usd"] - 25.0
+    )
+    assert position["mark_status"] == "SETTLED"
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=forbidden_book,
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=final_settlement,
+    )
+    assert events == []
+    assert state["positions"][0]["status"] == "SETTLED"
+
+
+def test_resolved_not_final_still_allows_user_close(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    paper_id = state["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=resolved_not_final,
+    )
+
+    closed = [event for event in events if event["type"] == "CLOSED"]
+    assert len(closed) == 1
+    assert state["positions"][0]["status"] == "CLOSED"
+
+
+def test_settlement_source_error_does_not_block_user_close(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    paper_id = state["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=settlement_error,
+    )
+
+    assert any(event["type"] == "CLOSED" for event in events)
+    assert state["positions"][0]["status"] == "CLOSED"
+
+
+def test_legacy_open_position_identity_is_backfilled_deterministically(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    position = state["positions"][0]
+    for field in paper_worker.SETTLEMENT_IDENTITY_FIELDS:
+        position.pop(field, None)
+    save_json_atomic(paths["state"], state)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    position = state["positions"][0]
+    assert position["settlement_family"] == paper_settlement.FAMILY_STANDARD
+    assert position["ctf_contract"] == paper_settlement.CTF_CONTRACT
+    assert position["position_collateral"] == paper_settlement.STANDARD_USDCE
+    assert position["outcome_index"] == 0
+
+
+def test_close_after_settlement_is_rejected(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    paper_id = state["positions"][0]["paper_id"]
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=final_settlement,
+    )
+    assert state["positions"][0]["status"] == "SETTLED"
+
+    write_close_request(paths, paper_id)
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=final_settlement,
+    )
+
+    rejected = [event for event in events if event["type"] == "REJECTED"]
+    assert rejected
+    assert rejected[0]["reason_code"] == "POSITION_ALREADY_SETTLED"
