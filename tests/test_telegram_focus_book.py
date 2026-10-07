@@ -335,3 +335,28 @@ def test_telegram_has_no_paper_state_ownership_or_system_online_claim():
     assert "def update_paper" not in source
     assert "save_json_atomic(PAPER_STATE" not in source
     assert "System online" not in source
+
+
+def test_settled_paper_message_surfaces_authoritative_result():
+    message = bot.paper_position_message(
+        {
+            "status": "SETTLED",
+            "question": "Market A",
+            "outcome": "Yes",
+            "investment_usd": 25.0,
+            "tokens": 40.0,
+            "entry": {"vwap": 0.6, "effective_entry_price": 0.625},
+            "mark_status": "SETTLED",
+            "payout_per_token": 1.0,
+            "settlement_value_usd": 40.0,
+            "realized_pnl_usd": 15.0,
+            "realized_return_pct": 60.0,
+            "settlement_finality_source": "RPC_FINALIZED",
+        }
+    )
+
+    assert "PAPER SETTLED" in message
+    assert "Payout/token: 1.0000" in message
+    assert "Settlement value: $40.00" in message
+    assert "Realized P/L $15.00 (60.00%)" in message
+    assert "RPC_FINALIZED" in message
