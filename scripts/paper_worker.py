@@ -232,6 +232,7 @@ def _matches_open_request(request, focus_payload):
 
 
 SETTLEMENT_IDENTITY_FIELDS = (
+    "settlement_protocol",
     "settlement_family",
     "ctf_contract",
     "position_collateral",
