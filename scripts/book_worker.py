@@ -21,6 +21,8 @@ sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import fresh, save_json_atomic
 from scripts import book_engine
+from scripts.learning_queue import enqueue_book_observation
+from scripts.learning_versioning import current_strategy_versions
 
 DATA_DIR = BASE_DIR / "data"
 FOCUS_FILE = DATA_DIR / "focused_market.json"
@@ -32,6 +34,7 @@ BOOK_URL = f"{CLOB_BASE_URL}/book"
 SCHEMA_VERSION = 1
 DEFAULT_INTERVAL_SECONDS = 5
 DEFAULT_TIMEOUT_SECONDS = 5
+_LEARNING_INIT_ERROR = None
 
 
 class BookFetchError(RuntimeError):
@@ -130,6 +133,39 @@ def _base_output(status, now, focus_payload=None):
     return result
 
 
+def _queue_learning(output):
+    """Best-effort Book attribution. Never changes Book authority/output."""
+    global _LEARNING_INIT_ERROR
+    if not isinstance(output, dict):
+        return
+    if output.get("status") not in {"OK", "API_ERROR"}:
+        return
+    if not all(
+        str(output.get(field) or "").strip()
+        for field in (
+            "generated_at",
+            "source_generation_id",
+            "source_evidence_id",
+            "condition_id",
+            "token_id",
+        )
+    ):
+        return
+    try:
+        versions = current_strategy_versions()
+        enqueue_book_observation(
+            output,
+            data_dir=DATA_DIR,
+            strategy_versions=versions,
+        )
+        _LEARNING_INIT_ERROR = None
+    except Exception as exc:
+        signature = f"{type(exc).__name__}: {exc}"
+        if signature != _LEARNING_INIT_ERROR:
+            print(f"[LEARNING] BOOK_QUEUE_ERROR: {signature}")
+            _LEARNING_INIT_ERROR = signature
+
+
 def run_once(now=None, book_loader=fetch_book):
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
@@ -153,6 +189,7 @@ def run_once(now=None, book_loader=fetch_book):
         code = str(exc).strip() or type(exc).__name__
         output["reason_codes"] = ["BOOK_API_ERROR", code]
         save_json_atomic(BOOK_FILE, output)
+        _queue_learning(output)
         return output
 
     analysis = book_engine.analyze_book(raw_book, focus)
@@ -162,6 +199,7 @@ def run_once(now=None, book_loader=fetch_book):
     output["status"] = "OK"
 
     save_json_atomic(BOOK_FILE, output)
+    _queue_learning(output)
     return output
 
 
