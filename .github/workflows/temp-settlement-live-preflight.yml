@@ -1,0 +1,22 @@
+name: TEMP Settlement Live Preflight Validation
+
+on:
+  push:
+    branches:
+      - feat/paper-settlement-live-preflight
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: python -m pip install -r requirements.txt
+      - name: Targeted
+        run: python -m pytest -q tests/test_paper_settlement_preflight.py tests/test_paper_settlement.py tests/test_paper_worker.py tests/test_paper_engine.py
+      - name: Full
+        run: python -m pytest -q
+      - name: Self test
+        run: python run_machine.py --self-test
