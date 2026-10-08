@@ -254,14 +254,16 @@ def calculate_settlement(token_amount, investment_usd, payout_numerator, payout_
 
     if tokens is None or investment is None or tokens <= 0 or investment <= 0:
         raise ValueError("SETTLEMENT_INPUT_INVALID")
-    if isinstance(payout_numerator, bool) or isinstance(payout_denominator, bool):
+    if (
+        not isinstance(payout_numerator, int)
+        or isinstance(payout_numerator, bool)
+        or not isinstance(payout_denominator, int)
+        or isinstance(payout_denominator, bool)
+    ):
         raise ValueError("PAYOUT_STRUCTURE_INVALID")
 
-    try:
-        numerator = int(payout_numerator)
-        denominator = int(payout_denominator)
-    except (TypeError, ValueError):
-        raise ValueError("PAYOUT_STRUCTURE_INVALID") from None
+    numerator = payout_numerator
+    denominator = payout_denominator
 
     if numerator < 0 or denominator <= 0 or numerator > denominator:
         raise ValueError("PAYOUT_STRUCTURE_INVALID")
