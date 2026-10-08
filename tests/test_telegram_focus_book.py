@@ -335,3 +335,48 @@ def test_telegram_has_no_paper_state_ownership_or_system_online_claim():
     assert "def update_paper" not in source
     assert "save_json_atomic(PAPER_STATE" not in source
     assert "System online" not in source
+
+
+
+def test_settled_paper_message_uses_ctf_value_not_clob_exit_mark():
+    position = {
+        "paper_id": "PAPER-settled",
+        "status": "SETTLED",
+        "question": "Market A",
+        "outcome": "Yes",
+        "investment_usd": 25.0,
+        "tokens": 50.0,
+        "entry": {"vwap": 0.5, "effective_entry_price": 0.5},
+        "mark_status": "SETTLED",
+        "mark": {
+            "exit_vwap": 0.49,
+            "effective_exit_price": 0.48,
+            "pnl_usd": -1.0,
+            "return_pct": -4.0,
+        },
+        "settlement": {
+            "payout_per_token": 0.5,
+            "settlement_value_usd": 25.0,
+            "finalized_block_number": 123,
+        },
+        "realized_pnl_usd": 0.0,
+        "realized_return_pct": 0.0,
+    }
+
+    message = bot.paper_position_message(position)
+
+    assert "PAPER SETTLED" in message
+    assert "CTF payout 0.5000/token" in message
+    assert "value $25.00" in message
+    assert "Finalized block: 123" in message
+    assert "Realized P/L $0.00" in message
+    assert "Exit-now VWAP" not in message
+
+
+def test_telegram_tracks_settled_alerts_as_consumer_only():
+    default = bot._default_state()
+    source = inspect.getsource(bot)
+
+    assert default["paper_settled_alerts"] == []
+    assert "✅ PAPER SETTLED" in source
+    assert "save_json_atomic(PAPER_STATE" not in source
