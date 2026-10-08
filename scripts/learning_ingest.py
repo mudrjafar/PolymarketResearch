@@ -827,21 +827,95 @@ def ingest_paper_open_queue_file(queue_file, *, store: LearningStore):
 
 
 def finalize_ready_selection_from_paper_state(*, data_dir, store: LearningStore):
-    """Finalize ended READYs only after Paper authority has advanced past them.
+    """Reconcile user selection intent and ended READY outcomes.
 
-    A matching Paper position keeps the READY unresolved until its durable
-    Paper OPEN queue is ingested. This prevents a scheduler race from creating
-    false NOT_SELECTED labels.
+    Explicit OPEN requests count as USER_SELECTED even if later execution is
+    rejected. Successful Paper OPEN binding is handled separately and may add
+    selected_paper_id. NOT_SELECTED is finalized only after Paper authority has
+    advanced beyond the READY window and no matching successful position exists.
     """
-    state_path = Path(data_dir) / "paper_state.json"
+    data_dir = Path(data_dir)
+    request_dir = data_dir / "paper_requests"
+
+    open_requests = []
+    if request_dir.exists():
+        for path in sorted(request_dir.glob("*.json")):
+            try:
+                payload = _read_json(path)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("schema_version") != 1:
+                continue
+            if _text(payload.get("request_id")) != path.stem:
+                continue
+            if _text(payload.get("action")).upper() != "OPEN":
+                continue
+            requested_dt = _parse_time(payload.get("requested_at"))
+            if requested_dt is None:
+                continue
+            try:
+                amount = float(payload.get("amount_usd"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(amount) or amount <= 0:
+                continue
+            open_requests.append((payload, requested_dt))
+
+    pending_all = store.conn.execute(
+        "SELECT ready_id,source_generation_id,source_evidence_id,"
+        "condition_id,token_id,ready_at,ended_at "
+        "FROM ready_opportunities "
+        "WHERE selection_status='PENDING' AND selected_paper_id IS NULL "
+        "ORDER BY ready_at"
+    ).fetchall()
+
+    selected = 0
+    for ready in pending_all:
+        ready_dt = _parse_time(ready["ready_at"])
+        ended_dt = _parse_time(ready["ended_at"]) if ready["ended_at"] else None
+        if ready_dt is None:
+            continue
+
+        matched_request = False
+        for request, requested_dt in open_requests:
+            if requested_dt < ready_dt:
+                continue
+            if ended_dt is not None and requested_dt > ended_dt:
+                continue
+            if (
+                _text(request.get("source_generation_id"))
+                != _text(ready["source_generation_id"])
+                or _text(request.get("source_evidence_id"))
+                != _text(ready["source_evidence_id"])
+                or _text(request.get("condition_id"))
+                != _text(ready["condition_id"])
+                or _text(request.get("token_id"))
+                != _text(ready["token_id"])
+            ):
+                continue
+            matched_request = True
+            break
+
+        if matched_request and store.mark_ready_selected(ready["ready_id"]):
+            selected += 1
+
+    state_path = data_dir / "paper_state.json"
     if not state_path.exists():
-        return {"status": "NO_PAPER_STATE", "finalized": 0, "deferred": 0}
+        return {
+            "status": "NO_PAPER_STATE",
+            "selected": selected,
+            "finalized": 0,
+            "deferred": 0,
+        }
 
     try:
         state = _read_json(state_path)
     except Exception as exc:
         return {
             "status": "PAPER_STATE_UNREADABLE",
+            "selected": selected,
             "finalized": 0,
             "deferred": 0,
             "error": type(exc).__name__,
@@ -852,13 +926,23 @@ def finalize_ready_selection_from_paper_state(*, data_dir, store: LearningStore)
         or state.get("schema_version") != 1
         or not isinstance(state.get("positions"), list)
     ):
-        return {"status": "PAPER_STATE_INVALID", "finalized": 0, "deferred": 0}
+        return {
+            "status": "PAPER_STATE_INVALID",
+            "selected": selected,
+            "finalized": 0,
+            "deferred": 0,
+        }
 
     state_updated = _parse_time(state.get("updated_at"))
     if state_updated is None:
-        return {"status": "PAPER_STATE_INVALID", "finalized": 0, "deferred": 0}
+        return {
+            "status": "PAPER_STATE_INVALID",
+            "selected": selected,
+            "finalized": 0,
+            "deferred": 0,
+        }
 
-    pending = store.conn.execute(
+    pending_ended = store.conn.execute(
         "SELECT ready_id,source_generation_id,source_evidence_id,"
         "condition_id,token_id,ready_at,ended_at "
         "FROM ready_opportunities "
@@ -871,7 +955,7 @@ def finalize_ready_selection_from_paper_state(*, data_dir, store: LearningStore)
     deferred = 0
     positions = [row for row in state.get("positions", []) if isinstance(row, dict)]
 
-    for ready in pending:
+    for ready in pending_ended:
         ended_dt = _parse_time(ready["ended_at"])
         ready_dt = _parse_time(ready["ready_at"])
         if ended_dt is None or ready_dt is None or state_updated <= ended_dt:
@@ -900,7 +984,7 @@ def finalize_ready_selection_from_paper_state(*, data_dir, store: LearningStore)
                 matching_positions.append(position)
 
         if matching_positions:
-            # A successful Paper OPEN exists. Its queue may simply be lagging.
+            # A successful Paper OPEN exists. Its learning queue may be lagging.
             deferred += 1
             continue
 
@@ -909,6 +993,7 @@ def finalize_ready_selection_from_paper_state(*, data_dir, store: LearningStore)
 
     return {
         "status": "OK",
+        "selected": selected,
         "finalized": finalized,
         "deferred": deferred,
     }
