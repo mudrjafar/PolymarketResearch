@@ -167,7 +167,6 @@ def position():
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
         "outcome_index": 0,
-        "outcome": "Yes",
     }
 
 
@@ -298,18 +297,18 @@ def test_wrong_rpc_chain_fails_closed(monkeypatch):
 
 
 def test_outcome_label_must_match_derived_index():
-    assert paper_settlement.validate_outcome_identity("Yes", 0) is True
-    assert paper_settlement.validate_outcome_identity("No", 1) is True
+    assert paper_settlement.validate_outcome_identity("Yes", 0) == 0
+    assert paper_settlement.validate_outcome_identity("No", 1) == 1
 
     with pytest.raises(
         paper_settlement.SettlementIdentityError,
-        match="OUTCOME_IDENTITY_MISMATCH",
+        match="OUTCOME_LABEL_INDEX_MISMATCH",
     ):
         paper_settlement.validate_outcome_identity("Yes", 1)
 
     with pytest.raises(
         paper_settlement.SettlementIdentityError,
-        match="OUTCOME_IDENTITY_MISMATCH",
+        match="OUTCOME_LABEL_INDEX_MISMATCH",
     ):
         paper_settlement.validate_outcome_identity("No", 0)
 
