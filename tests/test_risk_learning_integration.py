@@ -1,4 +1,4 @@
-from scripts import risk_worker
+from scripts import diamond_filter_v3, risk_worker
 
 
 def test_learning_failure_does_not_change_risk_worker_authority(monkeypatch, capsys):
@@ -20,3 +20,13 @@ def test_learning_failure_does_not_change_risk_worker_authority(monkeypatch, cap
     assert calls == [("risk", False)]
     output = capsys.readouterr().out
     assert "[LEARNING] ERROR: RuntimeError: learning unavailable" in output
+
+
+def test_learning_provenance_failure_cannot_stop_diamond(monkeypatch, capsys):
+    def broken_versions(_root):
+        raise RuntimeError("git unavailable")
+
+    monkeypatch.setattr(diamond_filter_v3, "strategy_versions", broken_versions)
+
+    assert diamond_filter_v3.learning_versions_snapshot() is None
+    assert "Learning provenance unavailable" in capsys.readouterr().out
