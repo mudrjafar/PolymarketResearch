@@ -61,6 +61,10 @@ def risk_decision_id(signal: str) -> str:
     return _id("RISK-", signal)
 
 
+def ready_opportunity_id(focus_event_id: str) -> str:
+    return _id("READY-", focus_event_id)
+
+
 def _flow_for(candidate: Mapping[str, Any], flow_state: Mapping[str, Any]):
     token_id = _text(candidate.get("token_id"))
     value = flow_state.get(token_id) if token_id else None
@@ -544,11 +548,47 @@ def ingest_focus_queue_file(queue_file, *, store: LearningStore):
         version_id,
         lineage,
     )
+
+    ready_id = None
+    ready_inserted = False
+
+    if event_type == "READY":
+        ready_id = ready_opportunity_id(focus_event_id)
+        ready_row = dict(lineage)
+        ready_row.update(
+            {
+                "population": "SYSTEM_READY",
+                "focus_event_id": focus_event_id,
+                "ready_at": event_at,
+                "selection_status": "PENDING",
+                "selected_paper_id": None,
+                "ended_at": None,
+            }
+        )
+        ready_inserted = store.insert_ready_opportunity(
+            ready_id,
+            version_id,
+            focus_event_id,
+            ready_row,
+        )
+
+    elif event_type in {"WAIT", "INVALIDATED"}:
+        store.end_open_ready_opportunities(
+            condition_id,
+            token_id,
+            event_at,
+        )
+
     return {
-        "status": "INGESTED" if inserted else "ALREADY_INGESTED",
+        "status": (
+            "INGESTED"
+            if inserted or ready_inserted
+            else "ALREADY_INGESTED"
+        ),
         "focus_event_id": focus_event_id,
         "event_type": event_type,
         "token_id": token_id,
+        "ready_id": ready_id,
     }
 
 
