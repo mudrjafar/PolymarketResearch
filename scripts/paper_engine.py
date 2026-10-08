@@ -246,6 +246,35 @@ def simulate_sell(book, token_amount, *, fee_rate=0.0, fee_exponent=0.0):
     }
 
 
+
+def settlement_quote(tokens, numerator, denominator, investment_usd):
+    """Value a finalized CTF payout without orderbook liquidity or exit fees."""
+    tokens = _number(tokens)
+    numerator = _number(numerator)
+    denominator = _number(denominator)
+    investment = _number(investment_usd)
+
+    if None in (tokens, numerator, denominator, investment):
+        raise ValueError("SETTLEMENT_INPUT_INVALID")
+    if tokens < 0 or numerator < 0 or denominator <= 0 or investment < 0:
+        raise ValueError("SETTLEMENT_INPUT_INVALID")
+    if numerator > denominator:
+        raise ValueError("SETTLEMENT_PAYOUT_INVALID")
+
+    payout_per_token = numerator / denominator
+    value = tokens * payout_per_token
+    pnl = value - investment
+    return_pct = pnl / investment * 100.0 if investment > 0 else 0.0
+
+    return {
+        "payout_numerator": int(numerator),
+        "payout_denominator": int(denominator),
+        "payout_per_token": round(payout_per_token, 12),
+        "settlement_value_usd": round(value, 8),
+        "realized_pnl_usd": round(pnl, 8),
+        "realized_return_pct": round(return_pct, 4),
+    }
+
 def self_test():
     book = {
         "bids": [
@@ -270,6 +299,11 @@ def self_test():
     fee_buy = simulate_buy(book, 25, fee_rate=0.05, fee_exponent=1)
     assert fee_buy["fee_usd"] > 0
     assert fee_buy["net_tokens"] < fee_buy["gross_tokens"]
+
+    settled = settlement_quote(100, 1, 2, 40)
+    assert settled["settlement_value_usd"] == 50
+    assert settled["realized_pnl_usd"] == 10
+    assert settled["realized_return_pct"] == 25
 
     print("PAPER ENGINE SELF-TEST OK")
 
