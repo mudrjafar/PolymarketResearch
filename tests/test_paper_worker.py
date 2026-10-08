@@ -560,3 +560,53 @@ def test_legacy_backfill_rejects_outcome_identity_mismatch(monkeypatch, tmp_path
     assert position["settlement_status"] == paper_settlement.IDENTITY_MISMATCH
     assert position["settlement_reason_code"] == "OUTCOME_IDENTITY_MISMATCH"
 
+
+
+def test_open_rejects_focus_outcome_mismatched_to_derived_token(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    focus = write_gate(paths)
+    focus["outcome"] = "No"
+    payload = json.loads(paths["focus"].read_text(encoding="utf-8"))
+    payload["focus"] = focus
+    save_json_atomic(paths["focus"], payload)
+    write_open_request(paths)
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    assert state["positions"] == []
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == (
+        "SETTLEMENT_IDENTITY_OUTCOME_LABEL_INDEX_MISMATCH"
+    )
+
+
+def test_legacy_identity_backfill_rejects_outcome_mismatch(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    position = state["positions"][0]
+    for field in paper_worker.SETTLEMENT_IDENTITY_FIELDS:
+        position.pop(field, None)
+    position["outcome"] = "No"
+    save_json_atomic(paths["state"], state)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    position = state["positions"][0]
+    assert position["status"] == "OPEN"
+    assert position["settlement_status"] == paper_settlement.IDENTITY_MISMATCH
+    assert position["settlement_reason_code"] == "OUTCOME_LABEL_INDEX_MISMATCH"
