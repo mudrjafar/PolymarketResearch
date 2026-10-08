@@ -12,6 +12,7 @@ SERVICES=[
     ("flow", [PY,"-u",str(BASE/"scripts"/"flow_tracker.py")]),
     ("diamond", [PY,"-u",str(BASE/"scripts"/"diamond_filter_v3.py"),"--watch","--interval","10"]),
     ("risk", [PY,"-u",str(BASE/"scripts"/"risk_worker.py"),"--interval","5"]),
+    ("learning", [PY,"-u",str(BASE/"scripts"/"learning_worker.py"),"--interval","5"]),
     ("focus", [PY,"-u",str(BASE/"scripts"/"focus_runner.py"),"--interval","5"]),
     ("book", [PY,"-u",str(BASE/"scripts"/"book_worker.py"),"--interval","5"]),
     ("paper", [PY,"-u",str(BASE/"scripts"/"paper_worker.py"),"--interval","5"]),
@@ -24,7 +25,29 @@ def validate():
     missing=[]
     for var in ["POLYMARKET_RPC_URL","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"]:
         if not os.getenv(var,"").strip(): missing.append(var)
-    files=[BASE/"scripts"/"live_active_trades.py",BASE/"scripts"/"flow_tracker.py",BASE/"scripts"/"diamond_filter_v3.py",BASE/"scripts"/"risk_engine.py",BASE/"scripts"/"risk_worker.py",BASE/"scripts"/"focus_engine.py",BASE/"scripts"/"focus_runner.py",BASE/"scripts"/"book_engine.py",BASE/"scripts"/"book_worker.py",BASE/"scripts"/"paper_engine.py",BASE/"scripts"/"paper_worker.py",BASE/"telegram_bot.py",BASE/"dashboard.py",BASE/"collector_storage_v4"/"storage.py",BASE/"collector_storage_v4"/"bridge.py"]
+    files=[
+        BASE/"scripts"/"live_active_trades.py",
+        BASE/"scripts"/"flow_tracker.py",
+        BASE/"scripts"/"diamond_filter_v3.py",
+        BASE/"scripts"/"risk_engine.py",
+        BASE/"scripts"/"risk_worker.py",
+        BASE/"scripts"/"learning_contract.py",
+        BASE/"scripts"/"learning_store.py",
+        BASE/"scripts"/"learning_versioning.py",
+        BASE/"scripts"/"learning_queue.py",
+        BASE/"scripts"/"learning_ingest.py",
+        BASE/"scripts"/"learning_worker.py",
+        BASE/"scripts"/"focus_engine.py",
+        BASE/"scripts"/"focus_runner.py",
+        BASE/"scripts"/"book_engine.py",
+        BASE/"scripts"/"book_worker.py",
+        BASE/"scripts"/"paper_engine.py",
+        BASE/"scripts"/"paper_worker.py",
+        BASE/"telegram_bot.py",
+        BASE/"dashboard.py",
+        BASE/"collector_storage_v4"/"storage.py",
+        BASE/"collector_storage_v4"/"bridge.py",
+    ]
     for f in files:
         if not f.exists(): missing.append(str(f.relative_to(BASE)))
     if missing:
@@ -38,6 +61,15 @@ def self_test():
                       BASE/"collector_storage_v4"/"test_storage.py", BASE/"tests"/"test_collector_sqlite.py"]:
         t=subprocess.run([PY,"-B",str(test_path)],cwd=BASE)
         if t.returncode: return t.returncode
+
+    learning_tests=[
+        BASE/"tests"/"test_learning_contract.py",
+        BASE/"tests"/"test_learning_store.py",
+        BASE/"tests"/"test_learning_ingest.py",
+    ]
+    t=subprocess.run([PY,"-m","pytest","-q",*[str(p) for p in learning_tests]],cwd=BASE)
+    if t.returncode: return t.returncode
+
     for cmd in [
         [PY,"-B",str(BASE/"scripts"/"risk_engine.py"),"--self-test"],
         [PY,"-B",str(BASE/"scripts"/"focus_engine.py")],
@@ -59,6 +91,7 @@ def main():
     children=[]
     print("="*70); print("DIAMOND INTELLIGENCE V3 - ONE START MACHINE"); print("="*70)
     print("Pipeline: LIVE V2 SCAN -> FLOW -> DIAMOND V3 -> RISK -> FOCUS -> BOOK -> PAPER + TELEGRAM + DASHBOARD")
+    print("Learning sidecar: DIAMOND/RISK artifacts -> learning.sqlite3")
     print("Dashboard: http://localhost:8501")
     try:
         for name,cmd in SERVICES:
