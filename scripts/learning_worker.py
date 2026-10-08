@@ -182,13 +182,17 @@ def run_once(*, data_dir=DATA_DIR, db_path=DB_FILE):
             data_dir=data_dir,
             store=store,
         )
-        if selection_result.get("status") == "OK" and (
-            selection_result.get("finalized") or selection_result.get("deferred")
+        if (
+            selection_result.get("selected")
+            or selection_result.get("finalized")
+            or selection_result.get("deferred")
         ):
             outcomes.append(
                 {
                     "status": "SELECTION_RECONCILED",
+                    "reconciliation_status": selection_result.get("status"),
                     **selection_result,
+                    "status": "SELECTION_RECONCILED",
                 }
             )
 
@@ -213,7 +217,8 @@ def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
                     )
                 elif status == "SELECTION_RECONCILED":
                     print(
-                        f"[LEARNING] SELECTION finalized={row.get('finalized', 0)} "
+                        f"[LEARNING] SELECTION selected={row.get('selected', 0)} "
+                        f"finalized={row.get('finalized', 0)} "
                         f"deferred={row.get('deferred', 0)}"
                     )
                 elif status == "INGESTED" and row.get("book_decision_id"):
