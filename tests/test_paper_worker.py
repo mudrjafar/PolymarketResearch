@@ -30,6 +30,24 @@ def configure(monkeypatch, tmp_path):
     monkeypatch.setattr(paper_worker, "REQUEST_DIR", paths["requests"], raising=False)
     monkeypatch.setattr(paper_worker, "STATE_FILE", paths["state"], raising=False)
     monkeypatch.setattr(paper_worker, "EVENTS_FILE", paths["events"], raising=False)
+
+    def unresolved_settlement(condition_id, token_id):
+        return {
+            "status": "UNRESOLVED",
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "finalized_block_number": 100,
+            "finalized_block_hash": "0x" + "11" * 32,
+            "finality_source": "RPC_FINALIZED",
+            "ctf_contract": paper_worker.settlement_reader.CTF_ADDRESS,
+            "payout_denominator": 0,
+        }
+
+    monkeypatch.setattr(
+        paper_worker.settlement_reader,
+        "read_settlement",
+        unresolved_settlement,
+    )
     return paths
 
 
@@ -292,3 +310,173 @@ def test_runtime_orders_book_before_paper_before_telegram():
     telegram_index = source.index('("telegram",')
 
     assert book_index < paper_index < telegram_index
+
+
+def settled_result(condition_id="condition-a", token_id="token-a", *, yes=True, tie=False):
+    if tie:
+        denominator = 2
+        numerators = [1, 1]
+    else:
+        denominator = 1
+        numerators = [1, 0] if yes else [0, 1]
+    outcome_index = 0 if yes else 1
+    return {
+        "status": "SETTLED",
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "finalized_block_number": 101,
+        "finalized_block_hash": "0x" + "22" * 32,
+        "finality_source": "RPC_FINALIZED",
+        "ctf_contract": paper_worker.settlement_reader.CTF_ADDRESS,
+        "market_family": "STANDARD",
+        "collateral": "0x" + "33" * 20,
+        "outcome_index": outcome_index,
+        "outcome": "YES" if outcome_index == 0 else "NO",
+        "index_set": 1 if outcome_index == 0 else 2,
+        "payout_denominator": denominator,
+        "payout_numerators": numerators,
+        "payout_numerator": numerators[outcome_index],
+        "payout_per_token": numerators[outcome_index] / denominator,
+    }
+
+
+def test_finalized_settlement_wins_over_missing_clob(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = paper_worker.run_once(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    tokens = state["positions"][0]["tokens"]
+
+    monkeypatch.setattr(
+        paper_worker.settlement_reader,
+        "read_settlement",
+        lambda condition_id, token_id: settled_result(condition_id, token_id),
+    )
+
+    def forbidden_book(_):
+        raise AssertionError("CLOB must not be called after finalized settlement")
+
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=forbidden_book,
+        market_info_loader=lambda _: market_info(),
+    )
+
+    position = state["positions"][0]
+    assert position["status"] == "SETTLED"
+    assert position["settlement_status"] == "SETTLED"
+    assert position["settlement"]["settlement_value_usd"] == pytest.approx(tokens)
+    assert position["realized_pnl_usd"] == pytest.approx(tokens - 25.0)
+    assert [event["type"] for event in events] == ["SETTLED"]
+
+
+def test_fractional_ctf_payout_settles_without_exit_fee(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = paper_worker.run_once(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    tokens = state["positions"][0]["tokens"]
+
+    monkeypatch.setattr(
+        paper_worker.settlement_reader,
+        "read_settlement",
+        lambda condition_id, token_id: settled_result(
+            condition_id,
+            token_id,
+            tie=True,
+        ),
+    )
+
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=lambda _: (_ for _ in ()).throw(
+            AssertionError("CLOB must not be called")
+        ),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    position = state["positions"][0]
+    assert position["status"] == "SETTLED"
+    assert position["settlement"]["payout_per_token"] == 0.5
+    assert position["settlement"]["settlement_value_usd"] == pytest.approx(tokens * 0.5)
+    assert "exit" not in position
+    assert events[0]["type"] == "SETTLED"
+
+
+def test_settlement_source_error_blocks_manual_close_but_keeps_mark(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = paper_worker.run_once(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    paper_id = state["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+
+    def broken_settlement(_condition_id, _token_id):
+        raise RuntimeError("RPC_DOWN")
+
+    monkeypatch.setattr(
+        paper_worker.settlement_reader,
+        "read_settlement",
+        broken_settlement,
+    )
+
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    position = state["positions"][0]
+    assert position["status"] == "OPEN"
+    assert position["settlement_status"] == "SETTLEMENT_CHECK_ERROR"
+    assert position["settlement_error"] == "RPC_DOWN"
+    assert position["mark_status"] == "OK"
+    rejected = [event for event in events if event["type"] == "REJECTED"]
+    assert rejected[0]["reason_code"] == "SETTLEMENT_STATE_UNKNOWN"
+
+
+def test_invalid_settlement_binding_fails_closed(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = paper_worker.run_once(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    bad = settled_result()
+    bad["token_id"] = "different-token"
+    monkeypatch.setattr(
+        paper_worker.settlement_reader,
+        "read_settlement",
+        lambda _condition_id, _token_id: bad,
+    )
+
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    position = state["positions"][0]
+    assert position["status"] == "OPEN"
+    assert position["settlement_status"] == "SETTLEMENT_CHECK_ERROR"
+    assert position["settlement_error"] == "SETTLEMENT_TOKEN_ID_MISMATCH"
+    assert events == []
