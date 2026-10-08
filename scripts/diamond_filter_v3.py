@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from machine_common import fresh, age_seconds, tail_jsonl, finite_number, save_json_atomic as atomic_save
+from scripts.learning_versions import strategy_versions
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
@@ -326,6 +327,7 @@ def run_once(verbose=True):
         "markets_analyzed":len(results),
         "candidates":len(watch),
         "diamonds":len(diamonds),
+        "strategy_versions":strategy_versions(BASE_DIR),
     }
     save_json_atomic(GENERATION_MANIFEST_FILE,manifest)
     if verbose:
