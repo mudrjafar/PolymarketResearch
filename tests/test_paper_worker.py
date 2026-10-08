@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import pytest
 
 from machine_common import save_json_atomic
-from scripts import paper_worker
+from scripts import paper_settlement, paper_worker
 
 
 NOW = datetime.now(timezone.utc)
@@ -33,12 +33,19 @@ def configure(monkeypatch, tmp_path):
     return paths
 
 
-def write_gate(paths, *, state="READY", generation="GEN-X", evidence=None):
+def write_gate(
+    paths,
+    *,
+    state="READY",
+    generation="GEN-X",
+    evidence=None,
+    outcome="Yes",
+):
     evidence = evidence or ("0x" + "ab" * 32 + ":7")
     focus = {
         "token_id": "token-a",
         "condition_id": "condition-a",
-        "outcome": "Yes",
+        "outcome": outcome,
         "question": "Market A",
         "direction": "BUY",
         "price": 0.50,
@@ -134,13 +141,39 @@ def loaders():
     )
 
 
+def fake_identity(condition_id, token_id):
+    return {
+        "settlement_family": paper_settlement.FAMILY_STANDARD,
+        "ctf_contract": paper_settlement.CTF_CONTRACT,
+        "position_collateral": paper_settlement.STANDARD_USDCE,
+        "outcome_index": 0,
+    }
+
+
+def unresolved_settlement(position):
+    return {
+        "status": paper_settlement.UNRESOLVED,
+        "reason_code": None,
+        "settlement_read_block": 100,
+        "settlement_read_block_hash": "0x" + "aa" * 32,
+        "settlement_authority": paper_settlement.CTF_CONTRACT,
+        "settlement_finality_source": "RPC_FINALIZED",
+    }
+
+
+def run_worker(**kwargs):
+    kwargs.setdefault("identity_loader", fake_identity)
+    kwargs.setdefault("settlement_checker", unresolved_settlement)
+    return paper_worker.run_once(**kwargs)
+
+
 def test_open_requires_exact_ready_book_binding_and_marks_from_bids(monkeypatch, tmp_path):
     paths = configure(monkeypatch, tmp_path)
     write_gate(paths)
     write_open_request(paths)
     book_loader, market_loader = loaders()
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=book_loader,
         market_info_loader=market_loader,
@@ -165,7 +198,7 @@ def test_focus_wait_rejects_open_without_fetching_execution_book(monkeypatch, tm
     def forbidden(_):
         raise AssertionError("CLOB must not be called")
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=forbidden,
         market_info_loader=forbidden,
@@ -182,7 +215,7 @@ def test_generation_mismatch_rejects_request(monkeypatch, tmp_path):
     write_open_request(paths, generation="GEN-OLD")
     book_loader, market_loader = loaders()
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=book_loader,
         market_info_loader=market_loader,
@@ -198,7 +231,7 @@ def test_same_request_is_idempotent(monkeypatch, tmp_path):
     write_open_request(paths)
     book_loader, market_loader = loaders()
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=book_loader,
         market_info_loader=market_loader,
@@ -206,7 +239,7 @@ def test_same_request_is_idempotent(monkeypatch, tmp_path):
     assert len(state["positions"]) == 1
     assert len(events) == 1
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=book_loader,
         market_info_loader=market_loader,
@@ -221,7 +254,7 @@ def test_close_is_user_controlled_and_does_not_require_focus_ready(monkeypatch, 
     write_open_request(paths)
     book_loader, market_loader = loaders()
 
-    state, _ = paper_worker.run_once(
+    state, _ = run_worker(
         now=NOW,
         book_loader=book_loader,
         market_info_loader=market_loader,
@@ -231,7 +264,7 @@ def test_close_is_user_controlled_and_does_not_require_focus_ready(monkeypatch, 
     write_gate(paths, state="WAIT")
     write_close_request(paths, paper_id)
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=book_loader,
         market_info_loader=market_loader,
@@ -250,7 +283,7 @@ def test_insufficient_exit_depth_rejects_close_and_keeps_position_open(monkeypat
     write_gate(paths)
     write_open_request(paths)
 
-    state, _ = paper_worker.run_once(
+    state, _ = run_worker(
         now=NOW,
         book_loader=lambda _: raw_book(),
         market_info_loader=lambda _: market_info(),
@@ -258,7 +291,7 @@ def test_insufficient_exit_depth_rejects_close_and_keeps_position_open(monkeypat
     paper_id = state["positions"][0]["paper_id"]
     write_close_request(paths, paper_id)
 
-    state, events = paper_worker.run_once(
+    state, events = run_worker(
         now=NOW,
         book_loader=lambda _: raw_book(bid_size="1"),
         market_info_loader=lambda _: market_info(),
@@ -275,7 +308,7 @@ def test_corrupt_durable_state_fails_closed(monkeypatch, tmp_path):
     paths["state"].write_text("{bad-json", encoding="utf-8")
 
     with pytest.raises(paper_worker.PaperStateError):
-        paper_worker.run_once(
+        run_worker(
             now=NOW,
             book_loader=lambda _: raw_book(),
             market_info_loader=lambda _: market_info(),
@@ -292,3 +325,239 @@ def test_runtime_orders_book_before_paper_before_telegram():
     telegram_index = source.index('("telegram",')
 
     assert book_index < paper_index < telegram_index
+
+
+def final_settlement(position):
+    return {
+        "status": paper_settlement.FINAL_SETTLED,
+        "reason_code": None,
+        "settlement_read_block": 200,
+        "settlement_read_block_hash": "0x" + "bb" * 32,
+        "settlement_authority": paper_settlement.CTF_CONTRACT,
+        "settlement_finality_source": "RPC_FINALIZED",
+        "payout_numerator": 1,
+        "payout_denominator": 1,
+    }
+
+
+def resolved_not_final(position):
+    return {
+        "status": paper_settlement.RESOLVED_NOT_FINAL,
+        "reason_code": None,
+        "settlement_read_block": 199,
+        "settlement_read_block_hash": "0x" + "cc" * 32,
+        "settlement_authority": paper_settlement.CTF_CONTRACT,
+        "settlement_finality_source": "RPC_FINALIZED",
+    }
+
+
+def settlement_error(position):
+    return {
+        "status": paper_settlement.SETTLEMENT_CHECK_ERROR,
+        "reason_code": "RPC_UNAVAILABLE",
+    }
+
+
+def test_final_settlement_is_terminal_and_idempotent(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    paper_id = state["positions"][0]["paper_id"]
+
+    def forbidden_book(_):
+        raise AssertionError("SETTLED position must not be marked from CLOB")
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=forbidden_book,
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=final_settlement,
+    )
+
+    settled = [event for event in events if event["type"] == "SETTLED"]
+    assert len(settled) == 1
+    position = state["positions"][0]
+    assert position["paper_id"] == paper_id
+    assert position["status"] == "SETTLED"
+    assert position["settlement_status"] == paper_settlement.FINAL_SETTLED
+    assert position["payout_per_token"] == 1.0
+    assert position["settlement_value_usd"] == pytest.approx(position["tokens"])
+    assert position["realized_pnl_usd"] == pytest.approx(
+        position["settlement_value_usd"] - 25.0
+    )
+    assert position["mark_status"] == "SETTLED"
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=forbidden_book,
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=final_settlement,
+    )
+    assert events == []
+    assert state["positions"][0]["status"] == "SETTLED"
+
+
+def test_resolved_not_final_still_allows_user_close(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    paper_id = state["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=resolved_not_final,
+    )
+
+    closed = [event for event in events if event["type"] == "CLOSED"]
+    assert len(closed) == 1
+    assert state["positions"][0]["status"] == "CLOSED"
+
+
+def test_settlement_source_error_does_not_block_user_close(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    paper_id = state["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=settlement_error,
+    )
+
+    assert any(event["type"] == "CLOSED" for event in events)
+    assert state["positions"][0]["status"] == "CLOSED"
+
+
+def test_legacy_open_position_identity_is_backfilled_deterministically(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    position = state["positions"][0]
+    for field in paper_worker.SETTLEMENT_IDENTITY_FIELDS:
+        position.pop(field, None)
+    save_json_atomic(paths["state"], state)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    position = state["positions"][0]
+    assert position["settlement_family"] == paper_settlement.FAMILY_STANDARD
+    assert position["ctf_contract"] == paper_settlement.CTF_CONTRACT
+    assert position["position_collateral"] == paper_settlement.STANDARD_USDCE
+    assert position["outcome_index"] == 0
+
+
+def test_close_after_settlement_is_rejected(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    paper_id = state["positions"][0]["paper_id"]
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=final_settlement,
+    )
+    assert state["positions"][0]["status"] == "SETTLED"
+
+    write_close_request(paths, paper_id)
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=final_settlement,
+    )
+
+    rejected = [event for event in events if event["type"] == "REJECTED"]
+    assert rejected
+    assert rejected[0]["reason_code"] == "POSITION_ALREADY_SETTLED"
+
+
+def test_open_rejects_outcome_label_that_disagrees_with_token_identity(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths, outcome="No")
+    write_open_request(paths)
+    book_loader, market_loader = loaders()
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=book_loader,
+        market_info_loader=market_loader,
+    )
+
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == (
+        "SETTLEMENT_IDENTITY_OUTCOME_LABEL_INDEX_MISMATCH"
+    )
+
+
+def test_legacy_backfill_rejects_outcome_identity_mismatch(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    position = state["positions"][0]
+    for field in paper_worker.SETTLEMENT_IDENTITY_FIELDS:
+        position.pop(field, None)
+    position["outcome"] = "No"
+    save_json_atomic(paths["state"], state)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    position = state["positions"][0]
+    assert position["status"] == "OPEN"
+    assert position["settlement_status"] == paper_settlement.IDENTITY_MISMATCH
+    assert position["settlement_reason_code"] == "OUTCOME_LABEL_INDEX_MISMATCH"
+
+

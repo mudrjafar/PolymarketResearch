@@ -246,6 +246,46 @@ def simulate_sell(book, token_amount, *, fee_rate=0.0, fee_exponent=0.0):
     }
 
 
+
+def calculate_settlement(token_amount, investment_usd, payout_numerator, payout_denominator):
+    """Return final Paper economics from an authoritative CTF payout ratio."""
+    tokens = _number(token_amount)
+    investment = _number(investment_usd)
+
+    if tokens is None or investment is None or tokens <= 0 or investment <= 0:
+        raise ValueError("SETTLEMENT_INPUT_INVALID")
+    if isinstance(payout_numerator, bool) or isinstance(payout_denominator, bool):
+        raise ValueError("PAYOUT_STRUCTURE_INVALID")
+
+    try:
+        numerator = int(payout_numerator)
+        denominator = int(payout_denominator)
+    except (TypeError, ValueError):
+        raise ValueError("PAYOUT_STRUCTURE_INVALID") from None
+
+    if numerator < 0 or denominator <= 0 or numerator > denominator:
+        raise ValueError("PAYOUT_STRUCTURE_INVALID")
+
+    payout_per_token = numerator / denominator
+    settlement_value = float(tokens) * payout_per_token
+    pnl = settlement_value - float(investment)
+    return_pct = pnl / float(investment) * 100.0
+
+    if not all(
+        math.isfinite(value)
+        for value in (payout_per_token, settlement_value, pnl, return_pct)
+    ):
+        raise ValueError("SETTLEMENT_RESULT_INVALID")
+
+    return {
+        "payout_numerator": numerator,
+        "payout_denominator": denominator,
+        "payout_per_token": round(payout_per_token, 12),
+        "settlement_value_usd": round(settlement_value, 8),
+        "realized_pnl_usd": round(pnl, 8),
+        "realized_return_pct": round(return_pct, 4),
+    }
+
 def self_test():
     book = {
         "bids": [
