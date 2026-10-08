@@ -6,6 +6,7 @@ only after the learning worker has committed the matching generation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -86,5 +87,73 @@ def enqueue_risk_snapshot(payload, *, data_dir, strategy_versions):
     return {
         "status": "QUEUED",
         "generation_id": generation_id,
+        "path": str(target),
+    }
+
+
+def focus_event_id(event):
+    if not isinstance(event, Mapping):
+        raise LearningQueueError("Focus learning event must be an object")
+    required = (
+        "event_type",
+        "event_at",
+        "source_generation_id",
+        "condition_id",
+        "token_id",
+    )
+    for field in required:
+        if not _text(event.get(field)):
+            raise LearningQueueError(f"Focus learning event {field} missing")
+    raw = "\x00".join(
+        [
+            _text(event.get("source_generation_id")),
+            _text(event.get("event_type")).upper(),
+            _text(event.get("event_at")),
+            _text(event.get("condition_id")),
+            _text(event.get("token_id")),
+            _text(event.get("source_evidence_id")),
+        ]
+    ).encode("utf-8")
+    return "FOCUS-" + hashlib.sha256(raw).hexdigest()[:24]
+
+
+def enqueue_focus_event(event, *, data_dir, strategy_versions):
+    """Persist one already-authoritative Focus transition for Learning.
+
+    This queue is observational only. Failure must never alter Focus state.
+    """
+    if not isinstance(event, Mapping):
+        raise LearningQueueError("Focus learning event must be an object")
+    if not isinstance(strategy_versions, Mapping):
+        raise LearningQueueError("strategy_versions must be an object")
+
+    event_id = focus_event_id(event)
+    snapshot = {
+        "schema_version": 1,
+        "focus_event_id": event_id,
+        "strategy_versions": dict(strategy_versions),
+        "event": dict(event),
+    }
+
+    queue_dir = Path(data_dir) / "learning_queue"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    target = queue_dir / f"focus_{event_id}.json"
+
+    if target.exists():
+        existing = _read_json(target)
+        if existing != snapshot:
+            raise LearningQueueError(
+                f"Focus learning queue conflict for event {event_id}"
+            )
+        return {
+            "status": "ALREADY_QUEUED",
+            "focus_event_id": event_id,
+            "path": str(target),
+        }
+
+    save_json_atomic(target, snapshot)
+    return {
+        "status": "QUEUED",
+        "focus_event_id": event_id,
         "path": str(target),
     }
