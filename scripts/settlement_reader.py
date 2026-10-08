@@ -144,6 +144,13 @@ def read_finalized_settlement(
     if outcome_index not in (0, 1):
         raise SettlementReadError("OUTCOME_INDEX_INVALID")
 
+    chain_id = _parse_hex_uint(
+        rpc_call(rpc_url, "eth_chainId", [], timeout),
+        "CHAIN_ID_INVALID",
+    )
+    if chain_id != POLYGON_CHAIN_ID:
+        raise SettlementReadError("CHAIN_ID_MISMATCH")
+
     contract = str(ctf_contract or "").strip()
     if contract.lower() != POLYMARKET_CTF_ADDRESS.lower():
         raise SettlementReadError("CTF_CONTRACT_UNSUPPORTED")
@@ -161,6 +168,15 @@ def read_finalized_settlement(
     block_hash = str(block.get("hash") or "").strip().lower()
     if len(block_hash) != 66 or not block_hash.startswith("0x"):
         raise SettlementReadError("FINALIZED_BLOCK_INVALID")
+
+    code = rpc_call(
+        rpc_url,
+        "eth_getCode",
+        [contract, hex(block_number)],
+        timeout,
+    )
+    if not isinstance(code, str) or code in ("0x", "0x0", ""):
+        raise SettlementReadError("CTF_CONTRACT_CODE_MISSING")
 
     denominator = _eth_call_uint(
         rpc_url,
