@@ -836,10 +836,42 @@ def self_test():
                     "fd": {"r": 0.05, "e": 1},
                 }
 
+            def fake_binding(token_id, condition_id):
+                assert token_id == "token-a"
+                assert condition_id == "condition-a"
+                return {
+                    "source": "POLYGON_FINALIZED_CTF",
+                    "chain_id": 137,
+                    "ctf_contract": "0xctf",
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "market_family": "STANDARD_CTF_V2",
+                    "exchange_contract": "0xexchange",
+                    "ctf_collateral": "0xcollateral",
+                    "outcome_index": 0,
+                    "index_set": 1,
+                    "verified_block_number": 100,
+                    "verified_block_hash": "0x" + "11" * 32,
+                }
+
+            def fake_unresolved(position):
+                return {
+                    **position["settlement_binding"],
+                    "status": "UNRESOLVED",
+                    "finalized_block_number": 101,
+                    "finalized_block_hash": "0x" + "22" * 32,
+                    "payout_denominator": 0,
+                    "payout_numerators": None,
+                    "payout_numerator": None,
+                    "payout_per_token": None,
+                }
+
             state, events = run_once(
                 now=now,
                 book_loader=fake_book,
                 market_info_loader=fake_market,
+                settlement_binding_loader=fake_binding,
+                settlement_checker=fake_unresolved,
             )
             assert events[0]["type"] == "OPENED"
             assert len(state["positions"]) == 1
@@ -865,6 +897,8 @@ def self_test():
                 now=now,
                 book_loader=fake_book,
                 market_info_loader=fake_market,
+                settlement_binding_loader=fake_binding,
+                settlement_checker=fake_unresolved,
             )
             assert events[0]["type"] == "CLOSED"
             assert state["positions"][0]["status"] == "CLOSED"
