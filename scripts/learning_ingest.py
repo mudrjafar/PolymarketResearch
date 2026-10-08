@@ -865,7 +865,7 @@ def finalize_ready_selection_from_paper_state(*, data_dir, store: LearningStore)
 
     pending_all = store.conn.execute(
         "SELECT ready_id,source_generation_id,source_evidence_id,"
-        "condition_id,token_id,ready_at,ended_at "
+        "condition_id,token_id,ready_at,ended_at,payload_json "
         "FROM ready_opportunities "
         "WHERE selection_status='PENDING' AND selected_paper_id IS NULL "
         "ORDER BY ready_at"
@@ -877,6 +877,16 @@ def finalize_ready_selection_from_paper_state(*, data_dir, store: LearningStore)
         ended_dt = _parse_time(ready["ended_at"]) if ready["ended_at"] else None
         if ready_dt is None:
             continue
+
+        try:
+            ready_payload = json.loads(ready["payload_json"])
+        except (TypeError, ValueError):
+            ready_payload = {}
+        locked_at = (
+            ready_payload.get("locked_at")
+            if isinstance(ready_payload, dict)
+            else None
+        )
 
         matched_request = False
         for request, requested_dt in open_requests:
@@ -893,6 +903,10 @@ def finalize_ready_selection_from_paper_state(*, data_dir, store: LearningStore)
                 != _text(ready["condition_id"])
                 or _text(request.get("token_id"))
                 != _text(ready["token_id"])
+                or (
+                    _text(locked_at)
+                    and _text(request.get("focus_locked_at")) != _text(locked_at)
+                )
             ):
                 continue
             matched_request = True
