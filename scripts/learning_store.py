@@ -461,6 +461,45 @@ class LearningStore:
             "focus_events", "focus_event_id", str(focus_event_id), values
         )
 
+    def insert_book_decision(
+        self,
+        book_decision_id: str,
+        ready_id: str,
+        row: Mapping[str, Any],
+    ):
+        if not isinstance(row, Mapping):
+            raise LearningStoreError("Book decision must be an object")
+        status = str(row.get("status") or "").strip()
+        if not status:
+            raise LearningStoreError("Book status is required")
+        book_ok = row.get("book_ok")
+        if not isinstance(book_ok, bool):
+            raise LearningStoreError("Book book_ok must be boolean")
+        reason_codes = row.get("reason_codes")
+        if not isinstance(reason_codes, list) or not all(
+            isinstance(code, str) for code in reason_codes
+        ):
+            raise LearningStoreError("Book reason_codes must be a string list")
+        checked_at = str(row.get("checked_at") or "").strip()
+        if not checked_at:
+            raise LearningStoreError("Book checked_at is required")
+
+        values = {
+            "book_decision_id": str(book_decision_id),
+            "ready_id": str(ready_id),
+            "checked_at": checked_at,
+            "status": status,
+            "book_ok": int(book_ok),
+            "reason_codes_json": _json(reason_codes),
+            "payload_json": _json(dict(row)),
+        }
+        return self._insert_immutable(
+            "book_decisions",
+            "book_decision_id",
+            str(book_decision_id),
+            values,
+        )
+
     def insert_ready_opportunity(
         self,
         ready_id: str,

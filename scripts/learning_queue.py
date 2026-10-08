@@ -157,3 +157,71 @@ def enqueue_focus_event(event, *, data_dir, strategy_versions):
         "focus_event_id": event_id,
         "path": str(target),
     }
+
+
+def book_observation_id(observation):
+    if not isinstance(observation, Mapping):
+        raise LearningQueueError("Book observation must be an object")
+    required = (
+        "generated_at",
+        "source_generation_id",
+        "source_evidence_id",
+        "condition_id",
+        "token_id",
+        "status",
+    )
+    for field in required:
+        if not _text(observation.get(field)):
+            raise LearningQueueError(f"Book observation {field} missing")
+
+    raw = "\x00".join(
+        [
+            _text(observation.get("source_generation_id")),
+            _text(observation.get("source_evidence_id")),
+            _text(observation.get("condition_id")),
+            _text(observation.get("token_id")),
+            _text(observation.get("generated_at")),
+            _text(observation.get("status")),
+            _text(observation.get("book_hash")),
+        ]
+    ).encode("utf-8")
+    return "BOOKOBS-" + hashlib.sha256(raw).hexdigest()[:24]
+
+
+def enqueue_book_observation(observation, *, data_dir, strategy_versions):
+    """Queue one already-produced Book assessment for Learning only."""
+    if not isinstance(observation, Mapping):
+        raise LearningQueueError("Book observation must be an object")
+    if not isinstance(strategy_versions, Mapping):
+        raise LearningQueueError("strategy_versions must be an object")
+
+    observation_id = book_observation_id(observation)
+    snapshot = {
+        "schema_version": 1,
+        "book_observation_id": observation_id,
+        "strategy_versions": dict(strategy_versions),
+        "observation": dict(observation),
+    }
+
+    queue_dir = Path(data_dir) / "learning_queue"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    target = queue_dir / f"book_{observation_id}.json"
+
+    if target.exists():
+        existing = _read_json(target)
+        if existing != snapshot:
+            raise LearningQueueError(
+                f"Book learning queue conflict for observation {observation_id}"
+            )
+        return {
+            "status": "ALREADY_QUEUED",
+            "book_observation_id": observation_id,
+            "path": str(target),
+        }
+
+    save_json_atomic(target, snapshot)
+    return {
+        "status": "QUEUED",
+        "book_observation_id": observation_id,
+        "path": str(target),
+    }

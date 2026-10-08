@@ -592,6 +592,107 @@ def ingest_focus_queue_file(queue_file, *, store: LearningStore):
     }
 
 
+def book_decision_id(book_observation_id: str) -> str:
+    return _id("BOOK-", book_observation_id)
+
+
+def ingest_book_queue_file(queue_file, *, store: LearningStore):
+    """Bind one Book observation to exactly one SYSTEM_READY opportunity."""
+    snapshot = _read_json(Path(queue_file))
+    if not isinstance(snapshot, dict):
+        raise LearningIngestError("Book queue snapshot must be an object")
+
+    observation_id = _text(snapshot.get("book_observation_id"))
+    versions = snapshot.get("strategy_versions")
+    observation = snapshot.get("observation")
+    if not observation_id:
+        raise LearningIngestError("book_observation_id missing")
+    if not isinstance(versions, dict):
+        raise LearningIngestError("Book strategy_versions missing")
+    if not isinstance(observation, dict):
+        raise LearningIngestError("Book observation missing")
+
+    generated_at = _text(observation.get("generated_at"))
+    generation_id = _text(observation.get("source_generation_id"))
+    evidence_id = _text(observation.get("source_evidence_id"))
+    condition_id = _text(observation.get("condition_id"))
+    token_id = _text(observation.get("token_id"))
+    status = _text(observation.get("status"))
+    if not all(
+        (
+            generated_at,
+            generation_id,
+            evidence_id,
+            condition_id,
+            token_id,
+            status,
+        )
+    ):
+        raise LearningIngestError("Book observation identity incomplete")
+
+    version_id = store.register_strategy_version(versions)
+
+    rows = store.conn.execute(
+        "SELECT ready_id,version_id,ready_at,ended_at FROM ready_opportunities "
+        "WHERE source_generation_id=? AND source_evidence_id=? "
+        "AND condition_id=? AND token_id=?",
+        (generation_id, evidence_id, condition_id, token_id),
+    ).fetchall()
+    if len(rows) != 1:
+        raise LearningIngestError(
+            "Book observation must match exactly one SYSTEM_READY opportunity"
+        )
+
+    ready = rows[0]
+    if str(ready["version_id"]) != str(version_id):
+        raise LearningIngestError("Book/READY strategy provenance mismatch")
+
+    observed_dt = _parse_time(generated_at)
+    ready_dt = _parse_time(ready["ready_at"])
+    ended_dt = _parse_time(ready["ended_at"]) if ready["ended_at"] else None
+    if observed_dt is None or ready_dt is None:
+        raise LearningIngestError("Book/READY timestamp invalid")
+    if observed_dt < ready_dt:
+        raise LearningIngestError("Book observation predates READY")
+    if ended_dt is not None and observed_dt > ended_dt:
+        raise LearningIngestError("Book observation occurs after READY ended")
+
+    book_ok = observation.get("book_ok")
+    if not isinstance(book_ok, bool):
+        raise LearningIngestError("Book book_ok invalid")
+    reason_codes = observation.get("reason_codes")
+    if not isinstance(reason_codes, list) or not all(
+        isinstance(code, str) for code in reason_codes
+    ):
+        raise LearningIngestError("Book reason_codes invalid")
+
+    row = dict(observation)
+    row.update(
+        {
+            "book_observation_id": observation_id,
+            "ready_id": ready["ready_id"],
+            "checked_at": generated_at,
+            "measurement_status": (
+                "MEASURED" if status == "OK" else "UNAVAILABLE"
+            ),
+        }
+    )
+    decision_id = book_decision_id(observation_id)
+    inserted = store.insert_book_decision(
+        decision_id,
+        ready["ready_id"],
+        row,
+    )
+    return {
+        "status": "INGESTED" if inserted else "ALREADY_INGESTED",
+        "book_decision_id": decision_id,
+        "book_observation_id": observation_id,
+        "ready_id": ready["ready_id"],
+        "book_status": status,
+        "book_ok": book_ok,
+    }
+
+
 def ingest_pending(
     *,
     data_dir,
