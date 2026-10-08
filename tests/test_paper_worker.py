@@ -564,3 +564,118 @@ def test_legacy_backfill_rejects_outcome_identity_mismatch(monkeypatch, tmp_path
     assert position["settlement_reason_code"] == "OUTCOME_LABEL_INDEX_MISMATCH"
 
 
+
+
+
+def _learning_versions():
+    return {
+        "pipeline_version": "pipeline-v3",
+        "diamond_version": "diamond-v3.1",
+        "risk_version": "risk-v2",
+        "focus_version": "focus-v3",
+        "book_version": "book-v1",
+        "paper_version": "paper-v1",
+        "learning_schema_version": 1,
+        "git_commit_sha": "a" * 40,
+        "config_fingerprint": "SRC-paper-worker-test",
+    }
+
+
+def test_successful_open_freezes_provenance_and_queues_sanitized_snapshot(
+    monkeypatch, tmp_path
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    captured = []
+
+    monkeypatch.setattr(
+        paper_worker,
+        "_LEARNING_IMPORT_ERROR",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        paper_worker,
+        "runtime_strategy_versions",
+        lambda: _learning_versions(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        paper_worker,
+        "enqueue_paper_open_snapshot",
+        lambda snapshot, **kwargs: captured.append((snapshot, kwargs))
+        or {"status": "QUEUED"},
+        raising=False,
+    )
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    assert any(event["type"] == "OPENED" for event in events)
+    assert len(captured) == 1
+    snapshot, kwargs = captured[0]
+    position = state["positions"][0]
+
+    assert position["learning_strategy_versions"] == _learning_versions()
+    assert position["learning_open_queued_at"] == NOW.isoformat()
+    assert snapshot["paper_id"] == position["paper_id"]
+    assert snapshot["open_request_id"] == "REQ-open"
+    assert snapshot["source_generation_id"] == "GEN-X"
+    assert snapshot["source_evidence_id"].endswith(":7")
+    assert snapshot["entry"]["effective_entry_price"] is not None
+    assert "chat_id" not in snapshot
+    assert kwargs["strategy_versions"] == _learning_versions()
+    assert kwargs["data_dir"] == paths["data"]
+
+    stored = json.loads(paths["state"].read_text(encoding="utf-8"))
+    assert stored["positions"][0]["learning_open_queued_at"] == NOW.isoformat()
+
+
+def test_learning_queue_failure_never_rejects_successful_paper_open(
+    monkeypatch, tmp_path, capsys
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    monkeypatch.setattr(
+        paper_worker,
+        "_LEARNING_IMPORT_ERROR",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        paper_worker,
+        "runtime_strategy_versions",
+        lambda: _learning_versions(),
+        raising=False,
+    )
+
+    def broken_queue(*args, **kwargs):
+        raise RuntimeError("learning unavailable")
+
+    monkeypatch.setattr(
+        paper_worker,
+        "enqueue_paper_open_snapshot",
+        broken_queue,
+        raising=False,
+    )
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    opened = [event for event in events if event["type"] == "OPENED"]
+    assert len(opened) == 1
+    assert state["positions"][0]["status"] == "OPEN"
+    assert state["positions"][0]["learning_open_queued_at"] is None
+    assert "PAPER_QUEUE_ERROR" in capsys.readouterr().out
+
+    stored = json.loads(paths["state"].read_text(encoding="utf-8"))
+    assert stored["positions"][0]["status"] == "OPEN"
