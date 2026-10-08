@@ -439,3 +439,9 @@ def test_negrisk_fractional_payout_fails_closed_but_standard_remains_valid(monke
     assert result["payout_denominator"] == 1
 
 
+
+
+def test_ctf_function_selector_has_runtime_keccak_backend():
+    selector = paper_settlement._selector("payoutDenominator(bytes32)")
+    assert isinstance(selector, bytes)
+    assert len(selector) == 4
