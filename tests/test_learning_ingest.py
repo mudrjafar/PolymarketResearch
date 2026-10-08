@@ -254,7 +254,7 @@ def test_missing_or_duplicate_risk_identity_fails_closed(tmp_path):
             )
 
 
-def test_ingest_latest_reads_generation_archive_not_root_snapshot(tmp_path):
+def test_ingest_latest_reads_candidate_generation_archive(tmp_path):
     data = tmp_path / "data"
     generations = data / "diamond_generations"
     generation = generations / "GEN-X"
@@ -265,7 +265,7 @@ def test_ingest_latest_reads_generation_archive_not_root_snapshot(tmp_path):
     db_path = data / "learning.sqlite3"
 
     manifest_path.write_text(json.dumps(manifest("GEN-X")), encoding="utf-8")
-    (generation / "diamond_analysis_v3.json").write_text(
+    (generation / "diamond_candidates.json").write_text(
         json.dumps([diamond_row(token="token-a")]), encoding="utf-8"
     )
     risk_path.write_text(
@@ -290,3 +290,53 @@ def test_ingest_latest_reads_generation_archive_not_root_snapshot(tmp_path):
             "source_generation_id": "GEN-X",
             "token_id": "token-a",
         }
+
+
+def test_ingest_latest_requires_frozen_generation_versions(tmp_path):
+    data = tmp_path / "data"
+    generations = data / "diamond_generations"
+    generation = generations / "GEN-X"
+    generation.mkdir(parents=True)
+    manifest_path = data / "diamond_generation.json"
+    risk_path = data / "risk_assessment.json"
+    db_path = data / "learning.sqlite3"
+
+    manifest_path.write_text(json.dumps(manifest("GEN-X")), encoding="utf-8")
+    (generation / "diamond_candidates.json").write_text(
+        json.dumps([diamond_row()]), encoding="utf-8"
+    )
+    risk_path.write_text(
+        json.dumps(risk_payload([risk_row()], generation="GEN-X")),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        learning_ingest.LearningIngestError,
+        match="lacks frozen strategy_versions",
+    ):
+        learning_ingest.ingest_latest(
+            manifest_file=manifest_path,
+            generations_dir=generations,
+            risk_file=risk_path,
+            db_file=db_path,
+        )
+
+
+def test_extra_low_risk_rows_do_not_expand_learning_population(tmp_path):
+    candidate = diamond_row(token="token-a")
+    extra = risk_row(token="token-low", risk_ok=False, reason_codes=["NOT_DIAMOND"])
+    with LearningStore(tmp_path / "learning.sqlite3") as store:
+        result = learning_ingest.ingest_generation(
+            manifest(),
+            [candidate],
+            risk_payload([risk_row(token="token-a"), extra]),
+            store=store,
+            versions=versions(),
+        )
+        assert result["signals_seen"] == 1
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM signal_observations"
+        ).fetchone()[0] == 1
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM risk_decisions"
+        ).fetchone()[0] == 1
