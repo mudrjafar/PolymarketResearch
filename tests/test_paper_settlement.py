@@ -34,11 +34,28 @@ def test_identity_matches_exactly_one_supported_family(monkeypatch):
     )
 
     assert identity == {
+        "settlement_protocol": paper_settlement.PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
         "outcome_index": 0,
     }
+
+
+def test_protocol_v2_position_id_is_rejected_explicitly():
+    v2_condition = "0x01" + "00" * 30
+    v2_position = str(int("01" + "00" * 31, 16))
+
+    with pytest.raises(
+        paper_settlement.SettlementIdentityError,
+        match="UNSUPPORTED_PROTOCOL_V2",
+    ):
+        paper_settlement.resolve_position_identity(
+            v2_condition,
+            v2_position,
+            rpc_url="http://rpc",
+            validate_chain=False,
+        )
 
 
 def test_identity_zero_or_ambiguous_match_fails_closed(monkeypatch):
@@ -162,6 +179,7 @@ def position():
     return {
         "condition_id": CONDITION,
         "token_id": TOKEN,
+        "settlement_protocol": paper_settlement.PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
@@ -171,6 +189,7 @@ def position():
 
 def _identity():
     return {
+        "settlement_protocol": paper_settlement.PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
@@ -276,6 +295,15 @@ def test_frozen_identity_mismatch_fails_closed(monkeypatch):
 
     result = paper_settlement.check_settlement(position(), rpc_url="http://rpc")
     assert result["status"] == paper_settlement.IDENTITY_MISMATCH
+
+
+def test_wrong_frozen_protocol_fails_closed():
+    bad = position()
+    bad["settlement_protocol"] = "PROTOCOL_V2"
+
+    result = paper_settlement.check_settlement(bad, rpc_url="http://rpc")
+    assert result["status"] == paper_settlement.IDENTITY_MISMATCH
+    assert result["reason_code"] == "SETTLEMENT_PROTOCOL_INVALID"
 
 
 def test_wrong_rpc_chain_fails_closed(monkeypatch):
