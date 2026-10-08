@@ -232,6 +232,7 @@ def _matches_open_request(request, focus_payload):
 
 
 SETTLEMENT_IDENTITY_FIELDS = (
+    "settlement_protocol",
     "settlement_family",
     "ctf_contract",
     "position_collateral",
@@ -539,6 +540,18 @@ def _process_open(
 
     try:
         market_info = market_info_loader(condition_id)
+
+        market_neg_risk = market_info.get("nr") if isinstance(market_info, dict) else None
+        if market_neg_risk is not None:
+            if not isinstance(market_neg_risk, bool):
+                raise ValueError("MARKET_NEG_RISK_INVALID")
+            expected_neg_risk = (
+                settlement_identity.get("settlement_family")
+                == paper_settlement.FAMILY_NEGRISK
+            )
+            if market_neg_risk is not expected_neg_risk:
+                raise ValueError("SETTLEMENT_FAMILY_MARKET_MISMATCH")
+
         fee_info = paper_engine.parse_fee_info(market_info, token_id)
         entry = paper_engine.simulate_buy(
             raw_book,
@@ -574,6 +587,7 @@ def _process_open(
         "source_evidence_id": focus.get("last_evidence_id"),
         "focus_locked_at": focus.get("locked_at"),
         **settlement_identity,
+        "market_neg_risk": market_neg_risk,
         "settlement_status": None,
         "settlement_checked_at": None,
         "settlement_reason_code": None,
