@@ -19,9 +19,14 @@ def test_finalized_fractional_payout_uses_exact_finalized_block():
 
     def fake_rpc(url, method, params, timeout):
         calls.append((method, params))
+        if method == "eth_chainId":
+            return hex(settlement_reader.POLYGON_CHAIN_ID)
         if method == "eth_getBlockByNumber":
             assert params == ["finalized", False]
             return {"number": "0x64", "hash": BLOCK_HASH}
+        if method == "eth_getCode":
+            assert params == [settlement_reader.POLYMARKET_CTF_ADDRESS, "0x64"]
+            return "0x6000"
         assert method == "eth_call"
         assert params[1] == "0x64"
         data = params[0]["data"]
@@ -54,8 +59,12 @@ def test_unresolved_denominator_zero_does_not_invent_zero_payout():
 
     def fake_rpc(url, method, params, timeout):
         calls.append(method)
+        if method == "eth_chainId":
+            return hex(settlement_reader.POLYGON_CHAIN_ID)
         if method == "eth_getBlockByNumber":
             return {"number": "0x65", "hash": BLOCK_HASH}
+        if method == "eth_getCode":
+            return "0x6000"
         if method == "eth_call":
             return "0x0"
         raise AssertionError(method)
@@ -76,8 +85,12 @@ def test_unresolved_denominator_zero_does_not_invent_zero_payout():
 
 def test_invalid_binary_payout_vector_fails_closed():
     def fake_rpc(url, method, params, timeout):
+        if method == "eth_chainId":
+            return hex(settlement_reader.POLYGON_CHAIN_ID)
         if method == "eth_getBlockByNumber":
             return {"number": "0x66", "hash": BLOCK_HASH}
+        if method == "eth_getCode":
+            return "0x6000"
         data = params[0]["data"]
         if data.startswith("0x" + settlement_reader._selector("payoutDenominator(bytes32)")):
             return hex(3)
@@ -95,6 +108,8 @@ def test_invalid_binary_payout_vector_fails_closed():
 
 def test_finalized_tag_unavailable_fails_closed():
     def fake_rpc(url, method, params, timeout):
+        if method == "eth_chainId":
+            return hex(settlement_reader.POLYGON_CHAIN_ID)
         assert method == "eth_getBlockByNumber"
         return None
 
@@ -122,3 +137,26 @@ def test_wrong_ctf_contract_is_rejected():
             ctf_contract="0x" + "33" * 20,
             rpc_call=lambda *args: None,
         )
+
+
+def test_wrong_chain_fails_before_ctf_call():
+    calls = []
+
+    def fake_rpc(url, method, params, timeout):
+        calls.append(method)
+        if method == "eth_chainId":
+            return "0x1"
+        raise AssertionError("must stop before finalized block or eth_call")
+
+    with pytest.raises(
+        settlement_reader.SettlementReadError,
+        match="CHAIN_ID_MISMATCH",
+    ):
+        settlement_reader.read_finalized_settlement(
+            CONDITION,
+            0,
+            rpc_url="https://rpc.invalid",
+            rpc_call=fake_rpc,
+        )
+
+    assert calls == ["eth_chainId"]
