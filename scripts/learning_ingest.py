@@ -119,7 +119,7 @@ def _risk_payload(row):
 
 def ingest_generation(
     manifest,
-    analysis,
+    candidates,
     risk_payload,
     *,
     store,
@@ -131,8 +131,8 @@ def ingest_generation(
     published_at = manifest.get("published_at")
     if not generation_id or not published_at:
         raise LearningIngestError("Diamond generation manifest incomplete")
-    if not isinstance(analysis, list):
-        raise LearningIngestError("Diamond analysis must be a list")
+    if not isinstance(candidates, list):
+        raise LearningIngestError("Diamond candidates must be a list")
     if not isinstance(risk_payload, Mapping):
         raise LearningIngestError("Risk snapshot must be an object")
     if _text(risk_payload.get("source_generation_id")) != generation_id:
@@ -152,34 +152,26 @@ def ingest_generation(
             raise LearningIngestError("Duplicate Risk result identity")
         by_identity[key] = row
 
-    analysis_rows = []
-    analysis_identities = set()
-    for rank, row in enumerate(analysis, start=1):
+    candidate_rows = []
+    candidate_identities = set()
+    for rank, row in enumerate(candidates, start=1):
         if not isinstance(row, Mapping):
-            raise LearningIngestError("Diamond analysis row must be an object")
+            raise LearningIngestError("Diamond candidate row must be an object")
         key = _identity(row)
         if not all(key):
             raise LearningIngestError("Diamond signal identity incomplete")
-        if key in analysis_identities:
-            raise LearningIngestError("Duplicate Diamond signal identity")
-        analysis_identities.add(key)
-        analysis_rows.append((rank, row, key))
+        if key in candidate_identities:
+            raise LearningIngestError("Duplicate Diamond candidate identity")
+        candidate_identities.add(key)
+        candidate_rows.append((rank, row, key))
 
     risk_identities = set(by_identity)
-    if risk_identities != analysis_identities:
-        missing = analysis_identities - risk_identities
-        extra = risk_identities - analysis_identities
-        if missing:
-            raise LearningIngestError("Risk result missing for Diamond observation")
-        if extra:
-            raise LearningIngestError("Risk result has no Diamond observation")
-        raise LearningIngestError("Risk/Diamond observation mismatch")
+    missing = candidate_identities - risk_identities
+    if missing:
+        raise LearningIngestError("Risk result missing for Diamond candidate")
 
-    version_id = store.register_strategy_version(versions)
-    inserted_signals = 0
-    inserted_risks = 0
-
-    for rank, row, key in analysis_rows:
+    # Validate the complete candidate/Risk batch before the first DB write.
+    for _rank, _row, key in candidate_rows:
         risk_row = by_identity[key]
         if not _text(risk_row.get("checked_at")):
             raise LearningIngestError("Risk checked_at missing")
@@ -187,6 +179,15 @@ def ingest_generation(
             raise LearningIngestError("Risk decision boolean missing")
         if _text(risk_row.get("decision")) not in {"PASS", "BLOCK"}:
             raise LearningIngestError("Risk decision invalid")
+        if not isinstance(risk_row.get("reason_codes"), list):
+            raise LearningIngestError("Risk reason_codes invalid")
+
+    version_id = store.register_strategy_version(versions)
+    inserted_signals = 0
+    inserted_risks = 0
+
+    for rank, row, key in candidate_rows:
+        risk_row = by_identity[key]
 
         signal_id = _stable_id(
             "SIG", generation_id, key[0], key[1], key[2]
@@ -203,7 +204,7 @@ def ingest_generation(
     return {
         "generation_id": generation_id,
         "version_id": version_id,
-        "signals_seen": len(analysis),
+        "signals_seen": len(candidates),
         "signals_inserted": inserted_signals,
         "risk_decisions_inserted": inserted_risks,
     }
@@ -223,7 +224,7 @@ def ingest_latest(
         raise LearningIngestError("Diamond generation id missing")
 
     generation_dir = Path(generations_dir) / generation_id
-    analysis = _read_json(generation_dir / "diamond_analysis_v3.json")
+    candidates = _read_json(generation_dir / "diamond_candidates.json")
     risk_payload = _read_json(risk_file)
 
     versions = versions or manifest.get("strategy_versions")
@@ -234,7 +235,7 @@ def ingest_latest(
     with LearningStore(db_file) as store:
         return ingest_generation(
             manifest,
-            analysis,
+            candidates,
             risk_payload,
             store=store,
             versions=versions,
