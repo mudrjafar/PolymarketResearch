@@ -38,7 +38,8 @@ SETTLEMENT_CHECK_ERROR = "SETTLEMENT_CHECK_ERROR"
 IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
 
 DEFAULT_TIMEOUT_SECONDS = 8
-_BYTES32_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")\n_BYTES31_RE = re.compile(r"^0x[0-9a-fA-F]{62}$")
+_BYTES32_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+_BYTES31_RE = re.compile(r"^0x[0-9a-fA-F]{62}$")
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _V2_RESERVED_BITS_MASK = ((1 << 64) - 1) << 40
 
