@@ -13,7 +13,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from scripts.learning_contract import LEARNING_SCHEMA_VERSION, validate_strategy_versions
+from scripts.learning_contract import (
+    LEARNING_SCHEMA_VERSION,
+    SELECTION_PENDING,
+    SELECTION_STATUSES,
+    validate_strategy_versions,
+)
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DB_FILE = BASE_DIR / "data" / "learning.sqlite3"
@@ -455,6 +460,102 @@ class LearningStore:
         return self._insert_immutable(
             "focus_events", "focus_event_id", str(focus_event_id), values
         )
+
+    def insert_ready_opportunity(
+        self,
+        ready_id: str,
+        version_id: str,
+        focus_event_id: str,
+        row: Mapping[str, Any],
+    ):
+        if not isinstance(row, Mapping):
+            raise LearningStoreError("READY opportunity must be an object")
+        selection_status = str(row.get("selection_status") or SELECTION_PENDING)
+        if selection_status not in SELECTION_STATUSES:
+            raise LearningStoreError("READY selection_status invalid")
+        if selection_status != SELECTION_PENDING:
+            raise LearningStoreError("READY opportunity must be created as PENDING")
+
+        source_evidence_id = str(row.get("source_evidence_id") or "").strip()
+        if not source_evidence_id:
+            raise LearningStoreError("READY source_evidence_id is required")
+
+        values = {
+            "ready_id": str(ready_id),
+            "version_id": str(version_id),
+            "focus_event_id": str(focus_event_id),
+            "source_generation_id": str(row["source_generation_id"]),
+            "source_evidence_id": source_evidence_id,
+            "condition_id": str(row["condition_id"]),
+            "token_id": str(row["token_id"]),
+            "ready_at": str(row["ready_at"]),
+            "selection_status": SELECTION_PENDING,
+            "selected_paper_id": None,
+            "ended_at": None,
+            "payload_json": _json(dict(row)),
+        }
+
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO ready_opportunities "
+                    "(ready_id,version_id,focus_event_id,source_generation_id,"
+                    "source_evidence_id,condition_id,token_id,ready_at,"
+                    "selection_status,selected_paper_id,ended_at,payload_json) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    tuple(values.values()),
+                )
+            return True
+        except sqlite3.IntegrityError as exc:
+            existing = self.conn.execute(
+                "SELECT * FROM ready_opportunities WHERE ready_id=?",
+                (str(ready_id),),
+            ).fetchone()
+            if existing is None:
+                raise LearningStoreError(str(exc)) from exc
+
+            # READY identity/attribution is immutable. Selection linkage and
+            # ended_at are intentionally mutable in later learning phases.
+            for column in (
+                "version_id",
+                "focus_event_id",
+                "source_generation_id",
+                "source_evidence_id",
+                "condition_id",
+                "token_id",
+                "ready_at",
+                "payload_json",
+            ):
+                if existing[column] != values[column]:
+                    raise LearningDataConflict(
+                        f"ready_opportunities.ready_id={ready_id} conflicts on {column}"
+                    ) from exc
+            return False
+
+    def end_open_ready_opportunities(
+        self,
+        condition_id: str,
+        token_id: str,
+        ended_at: str,
+    ) -> int:
+        """End READY availability without deciding User selection.
+
+        LD-4 records the system population. SELECTED vs NOT_SELECTED remains
+        unresolved until Paper binding can prove whether the user opened a
+        Paper trade for that READY opportunity.
+        """
+        with self.conn:
+            cursor = self.conn.execute(
+                "UPDATE ready_opportunities "
+                "SET ended_at=? "
+                "WHERE condition_id=? AND token_id=? AND ended_at IS NULL",
+                (
+                    str(ended_at),
+                    str(condition_id),
+                    str(token_id),
+                ),
+            )
+        return int(cursor.rowcount or 0)
 
     def fetch_one(self, sql, params=()):
         return self.conn.execute(sql, params).fetchone()
