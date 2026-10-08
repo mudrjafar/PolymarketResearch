@@ -34,6 +34,7 @@ def test_identity_matches_exactly_one_supported_family(monkeypatch):
     )
 
     assert identity == {
+        "settlement_protocol": paper_settlement.SETTLEMENT_PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
@@ -163,6 +164,7 @@ def position():
         "condition_id": CONDITION,
         "token_id": TOKEN,
         "outcome": "Yes",
+        "settlement_protocol": paper_settlement.SETTLEMENT_PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
@@ -172,6 +174,7 @@ def position():
 
 def _identity():
     return {
+        "settlement_protocol": paper_settlement.SETTLEMENT_PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
@@ -439,3 +442,14 @@ def test_negrisk_fractional_payout_fails_closed_but_standard_remains_valid(monke
     assert result["payout_denominator"] == 1
 
 
+
+
+def test_unsupported_settlement_protocol_fails_closed():
+    candidate = position()
+    candidate["settlement_protocol"] = "POSITION_MANAGER_V2"
+
+    with pytest.raises(
+        paper_settlement.SettlementIdentityError,
+        match="SETTLEMENT_PROTOCOL_UNSUPPORTED",
+    ):
+        paper_settlement._frozen_identity(candidate)
