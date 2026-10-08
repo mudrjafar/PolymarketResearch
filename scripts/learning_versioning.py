@@ -103,3 +103,8 @@ def runtime_strategy_versions() -> dict:
         "git_commit_sha": RUNTIME_GIT_SHA,
         "config_fingerprint": RUNTIME_CONFIG_FINGERPRINT,
     }
+
+
+def current_strategy_versions() -> dict:
+    """Backward-compatible alias for runtime strategy version attribution."""
+    return runtime_strategy_versions()

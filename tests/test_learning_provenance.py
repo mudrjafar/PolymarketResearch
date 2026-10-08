@@ -2,6 +2,7 @@ import json
 
 from scripts import risk_engine, risk_worker
 from scripts.learning_contract import LEARNING_SCHEMA_VERSION
+from scripts import learning_versioning
 
 
 NOW = "2026-10-08T12:00:00+00:00"
@@ -130,3 +131,7 @@ def test_queue_uses_versions_frozen_inside_risk_snapshot(monkeypatch):
 
     assert seen["snapshot"] is payload
     assert seen["versions"] == frozen
+
+
+def test_current_strategy_versions_alias_matches_runtime():
+    assert learning_versioning.current_strategy_versions() == learning_versioning.runtime_strategy_versions()
