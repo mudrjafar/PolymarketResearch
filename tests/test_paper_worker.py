@@ -564,3 +564,75 @@ def test_legacy_backfill_rejects_outcome_identity_mismatch(monkeypatch, tmp_path
     assert position["settlement_reason_code"] == "OUTCOME_LABEL_INDEX_MISMATCH"
 
 
+
+
+
+@pytest.mark.parametrize(
+    ("settlement_result", "expected_reason"),
+    [
+        (final_settlement, "SETTLEMENT_OPEN_NOT_UNRESOLVED"),
+        (resolved_not_final, "SETTLEMENT_OPEN_NOT_UNRESOLVED"),
+        (settlement_error, "SETTLEMENT_OPEN_NOT_UNRESOLVED"),
+    ],
+)
+def test_paper_open_rejects_resolved_or_unknown_ctf_before_position_creation(
+    monkeypatch, tmp_path, settlement_result, expected_reason
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=settlement_result,
+    )
+
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == expected_reason
+
+
+def test_paper_open_blocks_unreadable_latest_resolution_diagnostic(
+    monkeypatch, tmp_path
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    def unknown_tip(position):
+        result = unresolved_settlement(position)
+        result["reason_code"] = "LATEST_DIAGNOSTIC_UNAVAILABLE"
+        return result
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=unknown_tip,
+    )
+
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["reason_code"] == "SETTLEMENT_OPEN_CURRENT_STATE_UNKNOWN"
+
+
+def test_paper_open_blocks_settlement_checker_exception(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    def broken_checker(_position):
+        raise RuntimeError("RPC_UNAVAILABLE")
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+        settlement_checker=broken_checker,
+    )
+
+    assert state["positions"] == []
+    assert events[0]["reason_code"] == "SETTLEMENT_OPEN_CHECK_ERROR"
