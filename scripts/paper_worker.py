@@ -372,6 +372,7 @@ def _check_position_settlement(position, now, binding_loader, settlement_checker
         "settlement_value_usd": quote["settlement_value_usd"],
         "finalized_block_number": resolution.get("finalized_block_number"),
         "finalized_block_hash": resolution.get("finalized_block_hash"),
+        "finality_source": resolution.get("finality_source"),
     }
     position["realized_pnl_usd"] = quote["realized_pnl_usd"]
     position["realized_return_pct"] = quote["realized_return_pct"]
