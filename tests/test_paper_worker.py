@@ -33,12 +33,19 @@ def configure(monkeypatch, tmp_path):
     return paths
 
 
-def write_gate(paths, *, state="READY", generation="GEN-X", evidence=None):
+def write_gate(
+    paths,
+    *,
+    state="READY",
+    generation="GEN-X",
+    evidence=None,
+    outcome="Yes",
+):
     evidence = evidence or ("0x" + "ab" * 32 + ":7")
     focus = {
         "token_id": "token-a",
         "condition_id": "condition-a",
-        "outcome": "Yes",
+        "outcome": outcome,
         "question": "Market A",
         "direction": "BUY",
         "price": 0.50,
@@ -504,3 +511,52 @@ def test_close_after_settlement_is_rejected(monkeypatch, tmp_path):
     rejected = [event for event in events if event["type"] == "REJECTED"]
     assert rejected
     assert rejected[0]["reason_code"] == "POSITION_ALREADY_SETTLED"
+
+
+def test_open_rejects_outcome_label_that_disagrees_with_token_identity(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths, outcome="No")
+    write_open_request(paths)
+    book_loader, market_loader = loaders()
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=book_loader,
+        market_info_loader=market_loader,
+    )
+
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == (
+        "SETTLEMENT_IDENTITY_OUTCOME_IDENTITY_MISMATCH"
+    )
+
+
+def test_legacy_backfill_rejects_outcome_identity_mismatch(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    position = state["positions"][0]
+    for field in paper_worker.SETTLEMENT_IDENTITY_FIELDS:
+        position.pop(field, None)
+    position["outcome"] = "No"
+    save_json_atomic(paths["state"], state)
+
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    position = state["positions"][0]
+    assert position["status"] == "OPEN"
+    assert position["settlement_status"] == paper_settlement.IDENTITY_MISMATCH
+    assert position["settlement_reason_code"] == "OUTCOME_IDENTITY_MISMATCH"
+
