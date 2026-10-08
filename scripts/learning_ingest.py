@@ -334,7 +334,7 @@ def _parse_time(value):
     return parsed if parsed.tzinfo is not None else None
 
 
-def _episode_bounds(store, version_id, condition_id, token_id, event_at):
+def _episode_bounds(store, condition_id, token_id, event_at):
     event_dt = _parse_time(event_at)
     if event_dt is None:
         raise LearningIngestError("Focus event_at invalid")
@@ -342,9 +342,9 @@ def _episode_bounds(store, version_id, condition_id, token_id, event_at):
     last_invalidated = None
     rows = store.conn.execute(
         "SELECT event_at FROM focus_events "
-        "WHERE version_id=? AND condition_id=? AND token_id=? "
+        "WHERE condition_id=? AND token_id=? "
         "AND event_type='INVALIDATED' ORDER BY event_at DESC",
-        (str(version_id), str(condition_id), str(token_id)),
+        (str(condition_id), str(token_id)),
     ).fetchall()
     for row in rows:
         value = _parse_time(row["event_at"])
@@ -357,20 +357,19 @@ def _episode_bounds(store, version_id, condition_id, token_id, event_at):
 
 def _first_signal_for_episode(
     store,
-    version_id,
     condition_id,
     token_id,
     event_at,
 ):
     lower, upper = _episode_bounds(
-        store, version_id, condition_id, token_id, event_at
+        store, condition_id, token_id, event_at
     )
     rows = store.conn.execute(
-        "SELECT observed_at,signal_price,payload_json "
+        "SELECT version_id,observed_at,signal_price,payload_json "
         "FROM signal_observations "
-        "WHERE version_id=? AND condition_id=? AND token_id=? "
+        "WHERE condition_id=? AND token_id=? "
         "ORDER BY observed_at ASC",
-        (str(version_id), str(condition_id), str(token_id)),
+        (str(condition_id), str(token_id)),
     ).fetchall()
 
     for row in rows:
@@ -385,7 +384,6 @@ def _first_signal_for_episode(
 
 def _latest_focus_event_payload(
     store,
-    version_id,
     condition_id,
     token_id,
     event_type,
@@ -399,11 +397,10 @@ def _latest_focus_event_payload(
         return None
 
     rows = store.conn.execute(
-        "SELECT event_at,payload_json FROM focus_events "
-        "WHERE version_id=? AND condition_id=? AND token_id=? "
+        "SELECT version_id,event_at,payload_json FROM focus_events "
+        "WHERE condition_id=? AND token_id=? "
         "AND event_type=? ORDER BY event_at DESC",
         (
-            str(version_id),
             str(condition_id),
             str(token_id),
             str(event_type),
@@ -420,6 +417,8 @@ def _latest_focus_event_payload(
         except (TypeError, ValueError):
             continue
         if isinstance(payload, dict):
+            payload = dict(payload)
+            payload["_event_version_id"] = row["version_id"]
             return payload
     return None
 
@@ -464,22 +463,24 @@ def ingest_focus_queue_file(queue_file, *, store: LearningStore):
 
     if event_type == "LOCKED":
         first_signal = _first_signal_for_episode(
-            store, version_id, condition_id, token_id, event_at
+            store, condition_id, token_id, event_at
         )
         if first_signal is None:
             raise LearningIngestError(
                 "Focus LOCKED signal lineage not ingested yet"
             )
         lineage["candidate_first_seen_at"] = first_signal["observed_at"]
+        lineage["candidate_first_seen_version_id"] = first_signal["version_id"]
         lineage["price_at_first_seen"] = first_signal["signal_price"]
         lineage["locked_at"] = event_at
+        lineage["lock_version_id"] = version_id
+        lineage["focus_episode_mixed_version"] = False
         lineage["price_at_lock"] = event.get("price_at_lock")
         lineage["first_ready_at"] = None
         lineage["price_at_first_ready"] = None
     else:
         lock = _latest_focus_event_payload(
             store,
-            version_id,
             condition_id,
             token_id,
             "LOCKED",
@@ -489,15 +490,20 @@ def ingest_focus_queue_file(queue_file, *, store: LearningStore):
             raise LearningIngestError("Focus episode LOCKED event missing")
         for field in (
             "candidate_first_seen_at",
+            "candidate_first_seen_version_id",
             "price_at_first_seen",
             "locked_at",
+            "lock_version_id",
             "price_at_lock",
         ):
             lineage[field] = lock.get(field)
+        lineage["focus_episode_mixed_version"] = (
+            str(lock.get("lock_version_id") or lock.get("_event_version_id") or "")
+            != str(version_id)
+        )
 
         first_ready = _latest_focus_event_payload(
             store,
-            version_id,
             condition_id,
             token_id,
             "READY",
