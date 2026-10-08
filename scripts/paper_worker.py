@@ -21,8 +21,8 @@ import requests
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
-from machine_common import fresh, save_json_atomic
-from scripts import book_engine, book_worker, paper_engine
+from machine_common import finite_number, fresh, save_json_atomic
+from scripts import book_engine, book_worker, paper_engine, settlement_reader
 
 DATA_DIR = BASE_DIR / "data"
 FOCUS_FILE = DATA_DIR / "focused_market.json"
@@ -280,6 +280,112 @@ def _position_mark(position, raw_book, now):
     }
 
 
+def _position_settlement(position, now, settlement_loader):
+    condition_id = str(position.get("condition_id") or "").strip()
+    ctf_contract = str(position.get("ctf_contract") or "").strip()
+    outcome_index = position.get("outcome_index")
+
+    if (
+        not condition_id
+        or not ctf_contract
+        or isinstance(outcome_index, bool)
+        or outcome_index not in (0, 1)
+    ):
+        position["settlement_status"] = "BINDING_MISSING"
+        position["settlement_checked_at"] = now.isoformat()
+        position["settlement_error"] = None
+        return None
+
+    try:
+        result = settlement_loader(
+            condition_id,
+            outcome_index,
+            ctf_contract=ctf_contract,
+        )
+    except Exception as exc:
+        position["settlement_status"] = "SETTLEMENT_CHECK_ERROR"
+        position["settlement_checked_at"] = now.isoformat()
+        position["settlement_error"] = str(exc).strip() or type(exc).__name__
+        return None
+
+    if not isinstance(result, dict):
+        position["settlement_status"] = "SETTLEMENT_CHECK_ERROR"
+        position["settlement_checked_at"] = now.isoformat()
+        position["settlement_error"] = "SETTLEMENT_PAYLOAD_INVALID"
+        return None
+
+    status = result.get("status")
+    if status == "UNRESOLVED":
+        position["settlement_status"] = "UNRESOLVED"
+        position["settlement_checked_at"] = now.isoformat()
+        position["settlement_error"] = None
+        return None
+
+    if status != "SETTLED":
+        position["settlement_status"] = "SETTLEMENT_CHECK_ERROR"
+        position["settlement_checked_at"] = now.isoformat()
+        position["settlement_error"] = "SETTLEMENT_STATUS_INVALID"
+        return None
+
+    payout = finite_number(result.get("payout_per_token"), None)
+    tokens = finite_number(position.get("tokens"), None)
+    investment = finite_number(position.get("investment_usd"), None)
+    if (
+        payout is None
+        or tokens is None
+        or investment is None
+        or not 0.0 <= payout <= 1.0
+        or tokens < 0
+        or investment <= 0
+    ):
+        position["settlement_status"] = "SETTLEMENT_CHECK_ERROR"
+        position["settlement_checked_at"] = now.isoformat()
+        position["settlement_error"] = "SETTLEMENT_VALUE_INVALID"
+        return None
+
+    value = float(tokens) * float(payout)
+    pnl = value - float(investment)
+    return_pct = pnl / float(investment) * 100.0
+
+    position["status"] = "SETTLED"
+    position["settled_at"] = now.isoformat()
+    position["settlement_status"] = "SETTLED"
+    position["settlement_checked_at"] = now.isoformat()
+    position["settlement_error"] = None
+    position["mark_status"] = "SETTLED"
+    position["mark_checked_at"] = now.isoformat()
+    position["settlement"] = {
+        "finality_source": result.get("finality_source"),
+        "finalized_block_number": result.get("finalized_block_number"),
+        "finalized_block_hash": result.get("finalized_block_hash"),
+        "ctf_contract": result.get("ctf_contract"),
+        "condition_id": result.get("condition_id"),
+        "outcome_index": result.get("outcome_index"),
+        "payout_numerator": result.get("payout_numerator"),
+        "payout_denominator": result.get("payout_denominator"),
+        "payout_per_token": float(payout),
+        "settlement_value_usd": round(value, 8),
+    }
+    position["realized_pnl_usd"] = round(pnl, 8)
+    position["realized_return_pct"] = round(return_pct, 4)
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "event_at": now.isoformat(),
+        "request_id": None,
+        "type": "SETTLED",
+        "paper_id": position.get("paper_id"),
+        "token_id": position.get("token_id"),
+        "condition_id": condition_id,
+        "payout_per_token": float(payout),
+        "settlement_value_usd": round(value, 8),
+        "realized_pnl_usd": round(pnl, 8),
+        "realized_return_pct": round(return_pct, 4),
+        "finalized_block_number": result.get("finalized_block_number"),
+        "finalized_block_hash": result.get("finalized_block_hash"),
+    }
+
+
 def _reject(request_id, now, reason):
     return _request_event(
         request_id,
@@ -317,6 +423,10 @@ def _process_open(
     focus = focus_payload["focus"]
     token_id = str(focus["token_id"]).strip()
     condition_id = str(focus["condition_id"]).strip()
+    try:
+        outcome_index = settlement_reader.outcome_index_for_label(focus.get("outcome"))
+    except settlement_reader.SettlementReadError as exc:
+        return _reject(request_id, now, str(exc))
 
     for position in state["positions"]:
         if (
@@ -374,6 +484,9 @@ def _process_open(
         "token_id": token_id,
         "condition_id": condition_id,
         "outcome": focus.get("outcome"),
+        "outcome_index": outcome_index,
+        "ctf_contract": settlement_reader.POLYMARKET_CTF_ADDRESS,
+        "settlement_source": "POLYGON_CTF_FINALIZED",
         "question": focus.get("question"),
         "direction": "BUY",
         "source_generation_id": focus_payload.get("source_generation_id"),
@@ -398,6 +511,10 @@ def _process_open(
         "mark_status": "PENDING",
         "mark_checked_at": None,
         "mark": None,
+        "settlement_status": "PENDING",
+        "settlement_checked_at": None,
+        "settlement_error": None,
+        "settlement": None,
     }
 
     state["positions"].append(position)
@@ -510,6 +627,7 @@ def run_once(
     now=None,
     book_loader=book_worker.fetch_book,
     market_info_loader=fetch_market_info,
+    settlement_loader=settlement_reader.read_finalized_settlement,
 ):
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
@@ -557,6 +675,16 @@ def run_once(
     for position in state["positions"]:
         if position.get("status") != "OPEN":
             continue
+
+        settlement_event = _position_settlement(
+            position,
+            now,
+            settlement_loader,
+        )
+        if settlement_event is not None:
+            events.append(settlement_event)
+            continue
+
         try:
             raw_book = book_loader(str(position.get("token_id") or ""))
             _position_mark(position, raw_book, now)
