@@ -162,6 +162,7 @@ def position():
     return {
         "condition_id": CONDITION,
         "token_id": TOKEN,
+        "outcome": "Yes",
         "settlement_family": paper_settlement.FAMILY_STANDARD,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
@@ -293,3 +294,147 @@ def test_wrong_rpc_chain_fails_closed(monkeypatch):
             rpc_url="http://rpc",
             heimdall_url="http://heimdall",
         )
+
+
+def test_outcome_label_must_match_derived_index():
+    assert paper_settlement.validate_outcome_identity("Yes", 0) is True
+    assert paper_settlement.validate_outcome_identity("No", 1) is True
+
+    with pytest.raises(
+        paper_settlement.SettlementIdentityError,
+        match="OUTCOME_IDENTITY_MISMATCH",
+    ):
+        paper_settlement.validate_outcome_identity("Yes", 1)
+
+    with pytest.raises(
+        paper_settlement.SettlementIdentityError,
+        match="OUTCOME_IDENTITY_MISMATCH",
+    ):
+        paper_settlement.validate_outcome_identity("No", 0)
+
+
+def test_frozen_outcome_index_requires_real_integer():
+    for bad in (True, False, 0.0, 1.0, "0", "1", None):
+        candidate = position()
+        candidate["outcome_index"] = bad
+        with pytest.raises(
+            paper_settlement.SettlementIdentityError,
+            match="OUTCOME_INDEX_INVALID",
+        ):
+            paper_settlement._frozen_identity(candidate)
+
+
+def test_heimdall_requires_polygon_bor_chain_id(monkeypatch):
+    milestone_hash = base64.b64encode(bytes.fromhex("ee" * 32)).decode()
+
+    class Response:
+        def __init__(self, chain_id_marker):
+            self.chain_id_marker = chain_id_marker
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            milestone = {
+                "end_block": "200",
+                "hash": milestone_hash,
+            }
+            if self.chain_id_marker is not None:
+                milestone["bor_chain_id"] = self.chain_id_marker
+            return {"milestone": milestone}
+
+    monkeypatch.setattr(
+        paper_settlement.requests,
+        "get",
+        lambda *a, **k: Response(None),
+    )
+    with pytest.raises(
+        paper_settlement.SettlementSourceError,
+        match="HEIMDALL_CHAIN_ID_MISSING",
+    ):
+        paper_settlement._latest_milestone("http://heimdall")
+
+    monkeypatch.setattr(
+        paper_settlement.requests,
+        "get",
+        lambda *a, **k: Response("1"),
+    )
+    with pytest.raises(
+        paper_settlement.SettlementSourceError,
+        match="HEIMDALL_CHAIN_ID_MISMATCH",
+    ):
+        paper_settlement._latest_milestone("http://heimdall")
+
+    monkeypatch.setattr(
+        paper_settlement.requests,
+        "get",
+        lambda *a, **k: Response("137"),
+    )
+    end_block, block_hash = paper_settlement._latest_milestone("http://heimdall")
+    assert end_block == 200
+    assert block_hash == "0x" + "ee" * 32
+
+
+def test_negrisk_fractional_payout_fails_closed_but_standard_remains_valid(monkeypatch):
+    monkeypatch.setattr(
+        paper_settlement,
+        "get_finalized_block",
+        lambda **kwargs: paper_settlement.FinalizedBlock(
+            100,
+            "0x" + "aa" * 32,
+            "RPC_FINALIZED",
+        ),
+    )
+
+    standard = position()
+    monkeypatch.setattr(
+        paper_settlement,
+        "resolve_position_identity",
+        lambda *a, **k: _identity(),
+    )
+    values = iter([2, 1, 1])
+    monkeypatch.setattr(
+        paper_settlement,
+        "_ctf_uint",
+        lambda *a, **k: next(values),
+    )
+    result = paper_settlement.check_settlement(standard, rpc_url="http://rpc")
+    assert result["status"] == paper_settlement.FINAL_SETTLED
+    assert result["payout_numerator"] == 1
+    assert result["payout_denominator"] == 2
+
+    negrisk = position()
+    negrisk["settlement_family"] = paper_settlement.FAMILY_NEGRISK
+    negrisk["position_collateral"] = paper_settlement.NEGRISK_WRAPPED_COLLATERAL
+    negrisk_identity = {
+        "settlement_family": paper_settlement.FAMILY_NEGRISK,
+        "ctf_contract": paper_settlement.CTF_CONTRACT,
+        "position_collateral": paper_settlement.NEGRISK_WRAPPED_COLLATERAL,
+        "outcome_index": 0,
+    }
+    monkeypatch.setattr(
+        paper_settlement,
+        "resolve_position_identity",
+        lambda *a, **k: negrisk_identity,
+    )
+    values = iter([2, 1, 1])
+    monkeypatch.setattr(
+        paper_settlement,
+        "_ctf_uint",
+        lambda *a, **k: next(values),
+    )
+    result = paper_settlement.check_settlement(negrisk, rpc_url="http://rpc")
+    assert result["status"] == paper_settlement.SETTLEMENT_CHECK_ERROR
+    assert result["reason_code"] == "NEGRISK_PAYOUT_STRUCTURE_INVALID"
+
+    values = iter([1, 1, 0])
+    monkeypatch.setattr(
+        paper_settlement,
+        "_ctf_uint",
+        lambda *a, **k: next(values),
+    )
+    result = paper_settlement.check_settlement(negrisk, rpc_url="http://rpc")
+    assert result["status"] == paper_settlement.FINAL_SETTLED
+    assert result["payout_numerator"] == 1
+    assert result["payout_denominator"] == 1
+
