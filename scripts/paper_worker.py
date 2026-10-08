@@ -22,7 +22,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import fresh, save_json_atomic
-from scripts import book_engine, book_worker, paper_engine
+from scripts import book_engine, book_worker, paper_engine, paper_settlement
 
 DATA_DIR = BASE_DIR / "data"
 FOCUS_FILE = DATA_DIR / "focused_market.json"
@@ -230,6 +230,177 @@ def _matches_open_request(request, focus_payload):
     return True, "OK"
 
 
+
+SETTLEMENT_IDENTITY_FIELDS = (
+    "settlement_protocol",
+    "settlement_family",
+    "ctf_contract",
+    "position_collateral",
+    "outcome_index",
+)
+
+
+def _paper_event(event_type, now, **extra):
+    event = {
+        "schema_version": SCHEMA_VERSION,
+        "event_at": now.isoformat(),
+        "type": event_type,
+    }
+    event.update(extra)
+    return event
+
+
+def _apply_settlement_identity(position, identity):
+    if not isinstance(identity, dict):
+        raise paper_settlement.SettlementIdentityError("IDENTITY_PAYLOAD_INVALID")
+    for field in SETTLEMENT_IDENTITY_FIELDS:
+        if field not in identity or identity.get(field) is None:
+            raise paper_settlement.SettlementIdentityError(
+                f"IDENTITY_{field.upper()}_MISSING"
+            )
+    for field in SETTLEMENT_IDENTITY_FIELDS:
+        position[field] = identity[field]
+
+
+def _ensure_settlement_identity(position, identity_loader):
+    if all(position.get(field) is not None for field in SETTLEMENT_IDENTITY_FIELDS):
+        return True, None, None
+
+    try:
+        identity = identity_loader(
+            position.get("condition_id"),
+            position.get("token_id"),
+        )
+        _apply_settlement_identity(position, identity)
+        return True, None, None
+    except paper_settlement.SettlementIdentityError as exc:
+        return False, paper_settlement.IDENTITY_MISMATCH, str(exc)
+    except paper_settlement.SettlementSourceError as exc:
+        return False, paper_settlement.SETTLEMENT_CHECK_ERROR, str(exc)
+    except Exception as exc:
+        return (
+            False,
+            paper_settlement.SETTLEMENT_CHECK_ERROR,
+            type(exc).__name__,
+        )
+
+
+def _settle_position(position, result, now):
+    settlement = paper_engine.calculate_settlement(
+        position.get("tokens"),
+        position.get("investment_usd"),
+        result.get("payout_numerator"),
+        result.get("payout_denominator"),
+    )
+
+    position["status"] = "SETTLED"
+    position["settled_at"] = now.isoformat()
+    position["settlement_status"] = paper_settlement.FINAL_SETTLED
+    position["settlement_checked_at"] = now.isoformat()
+    position["settlement_reason_code"] = None
+    position["mark_status"] = "SETTLED"
+    position["mark_checked_at"] = now.isoformat()
+
+    for field in (
+        "settlement_read_block",
+        "settlement_read_block_hash",
+        "settlement_authority",
+        "settlement_finality_source",
+    ):
+        position[field] = result.get(field)
+
+    position.update(settlement)
+
+    return _paper_event(
+        "SETTLED",
+        now,
+        paper_id=position.get("paper_id"),
+        token_id=position.get("token_id"),
+        condition_id=position.get("condition_id"),
+        payout_per_token=settlement.get("payout_per_token"),
+        settlement_value_usd=settlement.get("settlement_value_usd"),
+        realized_pnl_usd=settlement.get("realized_pnl_usd"),
+        realized_return_pct=settlement.get("realized_return_pct"),
+        settlement_read_block=result.get("settlement_read_block"),
+        settlement_read_block_hash=result.get("settlement_read_block_hash"),
+        settlement_finality_source=result.get("settlement_finality_source"),
+    )
+
+
+def _check_position_settlement(position, now, identity_loader, settlement_checker):
+    ok, status, reason = _ensure_settlement_identity(position, identity_loader)
+    if not ok:
+        position["settlement_status"] = status
+        position["settlement_checked_at"] = now.isoformat()
+        position["settlement_reason_code"] = reason
+        return None
+
+    try:
+        result = settlement_checker(position)
+    except Exception as exc:
+        result = {
+            "status": paper_settlement.SETTLEMENT_CHECK_ERROR,
+            "reason_code": type(exc).__name__,
+        }
+
+    if not isinstance(result, dict):
+        result = {
+            "status": paper_settlement.SETTLEMENT_CHECK_ERROR,
+            "reason_code": "SETTLEMENT_RESULT_INVALID",
+        }
+
+    status = result.get("status")
+    allowed = {
+        paper_settlement.UNRESOLVED,
+        paper_settlement.RESOLVED_NOT_FINAL,
+        paper_settlement.FINAL_SETTLED,
+        paper_settlement.SETTLEMENT_CHECK_ERROR,
+        paper_settlement.IDENTITY_MISMATCH,
+    }
+    if status not in allowed:
+        status = paper_settlement.SETTLEMENT_CHECK_ERROR
+        result = {
+            "status": status,
+            "reason_code": "SETTLEMENT_STATUS_INVALID",
+        }
+
+    position["settlement_status"] = status
+    position["settlement_checked_at"] = now.isoformat()
+    position["settlement_reason_code"] = result.get("reason_code")
+
+    if status == paper_settlement.FINAL_SETTLED:
+        return _settle_position(position, result, now)
+
+    return None
+
+
+def _refresh_settlements(
+    state,
+    now,
+    identity_loader,
+    settlement_checker,
+    paper_ids=None,
+):
+    events = []
+    selected = None if paper_ids is None else set(paper_ids)
+
+    for position in state.get("positions", []):
+        if not isinstance(position, dict) or position.get("status") != "OPEN":
+            continue
+        if selected is not None and position.get("paper_id") not in selected:
+            continue
+
+        event = _check_position_settlement(
+            position,
+            now,
+            identity_loader,
+            settlement_checker,
+        )
+        if event is not None:
+            events.append(event)
+
+    return events
+
 def _position_mark(position, raw_book, now):
     ok, reason = paper_engine.validate_book_identity(
         raw_book,
@@ -296,6 +467,7 @@ def _process_open(
     now,
     book_loader,
     market_info_loader,
+    identity_loader,
 ):
     amount = request.get("amount_usd")
     try:
@@ -326,6 +498,29 @@ def _process_open(
             return _reject(request_id, now, "POSITION_ALREADY_OPEN")
 
     try:
+        settlement_identity = identity_loader(condition_id, token_id)
+        identity_probe = {}
+        _apply_settlement_identity(identity_probe, settlement_identity)
+    except paper_settlement.SettlementIdentityError as exc:
+        return _reject(
+            request_id,
+            now,
+            "SETTLEMENT_IDENTITY_" + (str(exc) or "MISMATCH"),
+        )
+    except paper_settlement.SettlementSourceError as exc:
+        return _reject(
+            request_id,
+            now,
+            "SETTLEMENT_IDENTITY_SOURCE_" + (str(exc) or "ERROR"),
+        )
+    except Exception as exc:
+        return _reject(
+            request_id,
+            now,
+            "SETTLEMENT_IDENTITY_" + type(exc).__name__,
+        )
+
+    try:
         raw_book = book_loader(token_id)
     except Exception as exc:
         return _reject(
@@ -345,6 +540,18 @@ def _process_open(
 
     try:
         market_info = market_info_loader(condition_id)
+
+        market_neg_risk = market_info.get("nr") if isinstance(market_info, dict) else None
+        if market_neg_risk is not None:
+            if not isinstance(market_neg_risk, bool):
+                raise ValueError("MARKET_NEG_RISK_INVALID")
+            expected_neg_risk = (
+                settlement_identity.get("settlement_family")
+                == paper_settlement.FAMILY_NEGRISK
+            )
+            if market_neg_risk is not expected_neg_risk:
+                raise ValueError("SETTLEMENT_FAMILY_MARKET_MISMATCH")
+
         fee_info = paper_engine.parse_fee_info(market_info, token_id)
         entry = paper_engine.simulate_buy(
             raw_book,
@@ -379,6 +586,11 @@ def _process_open(
         "source_generation_id": focus_payload.get("source_generation_id"),
         "source_evidence_id": focus.get("last_evidence_id"),
         "focus_locked_at": focus.get("locked_at"),
+        **settlement_identity,
+        "market_neg_risk": market_neg_risk,
+        "settlement_status": None,
+        "settlement_checked_at": None,
+        "settlement_reason_code": None,
         "investment_usd": float(amount),
         "tokens": float(entry["net_tokens"]),
         "fee_rate": fee_info["fee_rate"],
@@ -426,11 +638,15 @@ def _process_close(state, request_id, request, now, book_loader):
         (
             row
             for row in state["positions"]
-            if row.get("paper_id") == paper_id and row.get("status") == "OPEN"
+            if row.get("paper_id") == paper_id
         ),
         None,
     )
     if position is None:
+        return _reject(request_id, now, "OPEN_POSITION_NOT_FOUND")
+    if position.get("status") == "SETTLED":
+        return _reject(request_id, now, "POSITION_ALREADY_SETTLED")
+    if position.get("status") != "OPEN":
         return _reject(request_id, now, "OPEN_POSITION_NOT_FOUND")
 
     token_id = str(position.get("token_id") or "").strip()
@@ -510,6 +726,8 @@ def run_once(
     now=None,
     book_loader=book_worker.fetch_book,
     market_info_loader=fetch_market_info,
+    identity_loader=paper_settlement.resolve_position_identity,
+    settlement_checker=paper_settlement.check_settlement,
 ):
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
@@ -518,6 +736,14 @@ def run_once(
     state = load_state(now=now)
     processed = set(str(x) for x in state.get("processed_request_ids", []))
     events = []
+    events.extend(
+        _refresh_settlements(
+            state,
+            now,
+            identity_loader,
+            settlement_checker,
+        )
+    )
 
     for request_id, request in _load_requests():
         if request_id in processed:
@@ -539,6 +765,7 @@ def run_once(
                 now,
                 book_loader,
                 market_info_loader,
+                identity_loader,
             )
         elif request.get("action") == "CLOSE":
             event = _process_close(
@@ -553,6 +780,24 @@ def run_once(
 
         processed.add(request_id)
         events.append(event)
+
+    opened_ids = {
+        event.get("paper_id")
+        for event in events
+        if isinstance(event, dict)
+        and event.get("type") == "OPENED"
+        and event.get("paper_id")
+    }
+    if opened_ids:
+        events.extend(
+            _refresh_settlements(
+                state,
+                now,
+                identity_loader,
+                settlement_checker,
+                paper_ids=opened_ids,
+            )
+        )
 
     for position in state["positions"]:
         if position.get("status") != "OPEN":
@@ -707,10 +952,26 @@ def self_test():
                     "fd": {"r": 0.05, "e": 1},
                 }
 
+            def fake_identity(condition_id, token_id):
+                return {
+                    "settlement_family": paper_settlement.FAMILY_STANDARD,
+                    "ctf_contract": paper_settlement.CTF_CONTRACT,
+                    "position_collateral": paper_settlement.STANDARD_USDCE,
+                    "outcome_index": 0,
+                }
+
+            def fake_settlement(position):
+                return {
+                    "status": paper_settlement.UNRESOLVED,
+                    "reason_code": None,
+                }
+
             state, events = run_once(
                 now=now,
                 book_loader=fake_book,
                 market_info_loader=fake_market,
+                identity_loader=fake_identity,
+                settlement_checker=fake_settlement,
             )
             assert events[0]["type"] == "OPENED"
             assert len(state["positions"]) == 1
@@ -736,6 +997,8 @@ def self_test():
                 now=now,
                 book_loader=fake_book,
                 market_info_loader=fake_market,
+                identity_loader=fake_identity,
+                settlement_checker=fake_settlement,
             )
             assert events[0]["type"] == "CLOSED"
             assert state["positions"][0]["status"] == "CLOSED"
