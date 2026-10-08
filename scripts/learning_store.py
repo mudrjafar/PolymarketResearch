@@ -354,6 +354,32 @@ class LearningStore:
             "signal_observations", "signal_id", str(signal_id), values
         )
 
+    def insert_risk_decision(self, risk_decision_id: str, signal_id: str, row: Mapping[str, Any]):
+        if not str(risk_decision_id or "").strip():
+            raise LearningStoreError("risk_decision_id is required")
+        if not str(signal_id or "").strip():
+            raise LearningStoreError("signal_id is required")
+        if not isinstance(row, Mapping):
+            raise LearningStoreError("risk decision must be an object")
+        reason_codes = row.get("reason_codes")
+        if not isinstance(reason_codes, list):
+            raise LearningStoreError("risk reason_codes must be a list")
+        risk_ok = row.get("risk_ok")
+        if not isinstance(risk_ok, bool):
+            raise LearningStoreError("risk_ok must be boolean")
+        values = {
+            "risk_decision_id": str(risk_decision_id),
+            "signal_id": str(signal_id),
+            "checked_at": str(row["checked_at"]),
+            "risk_ok": 1 if risk_ok else 0,
+            "decision": str(row["decision"]),
+            "reason_codes_json": _json(reason_codes),
+            "payload_json": _json(dict(row)),
+        }
+        return self._insert_immutable(
+            "risk_decisions", "risk_decision_id", str(risk_decision_id), values
+        )
+
     def insert_focus_event(self, focus_event_id: str, version_id: str, row: Mapping[str, Any]):
         values = {
             "focus_event_id": str(focus_event_id),
