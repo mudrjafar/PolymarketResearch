@@ -435,6 +435,22 @@ def resolve_position_identity(
     return matches[0]
 
 
+def validate_outcome_identity(outcome, outcome_index):
+    """Require the stored binary label to agree with the derived CTF slot."""
+    if not isinstance(outcome_index, int) or isinstance(outcome_index, bool):
+        raise SettlementIdentityError("OUTCOME_INDEX_INVALID")
+    if outcome_index not in (0, 1):
+        raise SettlementIdentityError("OUTCOME_INDEX_INVALID")
+
+    label = str(outcome or "").strip().lower()
+    expected = {"yes": 0, "no": 1}.get(label)
+    if expected is None:
+        raise SettlementIdentityError("OUTCOME_LABEL_INVALID")
+    if expected != outcome_index:
+        raise SettlementIdentityError("OUTCOME_LABEL_INDEX_MISMATCH")
+    return outcome_index
+
+
 def _frozen_identity(position):
     if not isinstance(position, dict):
         raise SettlementIdentityError("POSITION_INVALID")
