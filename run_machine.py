@@ -66,6 +66,7 @@ def self_test():
         BASE/"tests"/"test_learning_contract.py",
         BASE/"tests"/"test_learning_store.py",
         BASE/"tests"/"test_learning_ingest.py",
+        BASE/"tests"/"test_focus_learning.py",
     ]
     t=subprocess.run([PY,"-m","pytest","-q",*[str(p) for p in learning_tests]],cwd=BASE)
     if t.returncode: return t.returncode
