@@ -1,3 +1,5 @@
+import base64
+
 import pytest
 
 from scripts import settlement_resolver
@@ -124,3 +126,94 @@ def test_invalid_payout_vector_fails_closed():
                 "settlement_binding": binding,
             }
         )
+
+
+
+class _Response:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _HeimdallSession:
+    def __init__(self, milestone):
+        self.milestone = milestone
+        self.urls = []
+
+    def get(self, url, timeout):
+        self.urls.append(url)
+        return _Response({"milestone": self.milestone})
+
+
+class _FallbackResolver(settlement_resolver.PolygonFinalizedCtfResolver):
+    def __init__(self, milestone, bor_hash):
+        self.bor_hash = bor_hash
+        session = _HeimdallSession(milestone)
+        super().__init__(
+            rpc_url="https://rpc.invalid",
+            heimdall_rest_url="https://heimdall.invalid/",
+            session=session,
+        )
+
+    def _rpc(self, method, params):
+        assert method == "eth_getBlockByNumber"
+        if params[0] == "finalized":
+            raise settlement_resolver.SettlementSourceError("RPC_ERROR")
+        assert params == ["0xc8", False]
+        return {"number": "0xc8", "hash": self.bor_hash}
+
+
+def test_heimdall_v2_fallback_cross_checks_finalized_end_block_hash():
+    raw_hash = bytes.fromhex("44" * 32)
+    milestone = {
+        "start_block": "190",
+        "end_block": "200",
+        "hash": base64.b64encode(raw_hash).decode("ascii"),
+        "bor_chain_id": "137",
+        "milestone_id": "M-1",
+    }
+    resolver = _FallbackResolver(milestone, "0x" + "44" * 32)
+
+    block = resolver.finalized_block()
+
+    assert block["number"] == 200
+    assert block["hash"] == "0x" + "44" * 32
+    assert block["finality_source"] == "HEIMDALL_V2_MILESTONE"
+    assert resolver.session.urls == ["https://heimdall.invalid/milestones/latest"]
+
+
+def test_heimdall_v2_fallback_rejects_bor_hash_mismatch():
+    raw_hash = bytes.fromhex("44" * 32)
+    milestone = {
+        "end_block": "200",
+        "hash": base64.b64encode(raw_hash).decode("ascii"),
+        "bor_chain_id": "137",
+    }
+    resolver = _FallbackResolver(milestone, "0x" + "55" * 32)
+
+    with pytest.raises(
+        settlement_resolver.SettlementSourceError,
+        match="HEIMDALL_BOR_BLOCK_HASH_MISMATCH",
+    ):
+        resolver.finalized_block()
+
+
+def test_heimdall_v2_fallback_rejects_wrong_chain():
+    raw_hash = bytes.fromhex("44" * 32)
+    milestone = {
+        "end_block": "200",
+        "hash": base64.b64encode(raw_hash).decode("ascii"),
+        "bor_chain_id": "80002",
+    }
+    resolver = _FallbackResolver(milestone, "0x" + "44" * 32)
+
+    with pytest.raises(
+        settlement_resolver.SettlementSourceError,
+        match="HEIMDALL_CHAIN_ID_MISMATCH",
+    ):
+        resolver.finalized_block()
