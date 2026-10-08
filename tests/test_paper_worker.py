@@ -529,7 +529,7 @@ def test_open_rejects_outcome_label_that_disagrees_with_token_identity(monkeypat
     assert len(events) == 1
     assert events[0]["type"] == "REJECTED"
     assert events[0]["reason_code"] == (
-        "SETTLEMENT_IDENTITY_OUTCOME_IDENTITY_MISMATCH"
+        "SETTLEMENT_IDENTITY_OUTCOME_LABEL_INDEX_MISMATCH"
     )
 
 
@@ -558,7 +558,7 @@ def test_legacy_backfill_rejects_outcome_identity_mismatch(monkeypatch, tmp_path
     position = state["positions"][0]
     assert position["status"] == "OPEN"
     assert position["settlement_status"] == paper_settlement.IDENTITY_MISMATCH
-    assert position["settlement_reason_code"] == "OUTCOME_IDENTITY_MISMATCH"
+    assert position["settlement_reason_code"] == "OUTCOME_LABEL_INDEX_MISMATCH"
 
 
 
