@@ -1,0 +1,23 @@
+name: Temporary Settlement Dependency Validation
+
+on:
+  push:
+    branches:
+      - fix/paper-settlement-keccak-backend
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Settlement tests
+        run: python -m pytest -q tests/test_paper_settlement.py tests/test_paper_engine.py tests/test_paper_worker.py tests/test_telegram_focus_book.py
+      - name: Full project tests
+        run: python -m pytest -q
+      - name: Machine self-test
+        run: python run_machine.py --self-test
