@@ -282,6 +282,10 @@ def _ensure_settlement_identity(position, identity_loader):
             identity.get("outcome_index"),
         )
         _apply_settlement_identity(position, identity)
+        paper_settlement.validate_outcome_identity(
+            position.get("outcome"),
+            position.get("outcome_index"),
+        )
         return True, None, None
     except paper_settlement.SettlementIdentityError as exc:
         return False, paper_settlement.IDENTITY_MISMATCH, str(exc)
