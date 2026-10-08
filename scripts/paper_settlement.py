@@ -22,6 +22,7 @@ CTF_CONTRACT = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
 STANDARD_USDCE = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 NEGRISK_WRAPPED_COLLATERAL = "0x3a3bd7bb9528e159577f7c2e685cc81a765002e2"
 
+SETTLEMENT_PROTOCOL_LEGACY_CTF = "LEGACY_CTF"
 FAMILY_STANDARD = "CTF_STANDARD"
 FAMILY_NEGRISK = "CTF_NEGRISK"
 SUPPORTED_FAMILIES = {
@@ -397,6 +398,7 @@ def resolve_position_identity(
             if candidate == token:
                 matches.append(
                     {
+                        "settlement_protocol": SETTLEMENT_PROTOCOL_LEGACY_CTF,
                         "settlement_family": family,
                         "ctf_contract": CTF_CONTRACT,
                         "position_collateral": collateral,
@@ -431,6 +433,10 @@ def validate_outcome_identity(outcome, outcome_index):
 def _frozen_identity(position):
     if not isinstance(position, dict):
         raise SettlementIdentityError("POSITION_INVALID")
+    protocol = str(position.get("settlement_protocol") or "").strip()
+    if protocol != SETTLEMENT_PROTOCOL_LEGACY_CTF:
+        raise SettlementIdentityError("SETTLEMENT_PROTOCOL_UNSUPPORTED")
+
     family = str(position.get("settlement_family") or "").strip()
     if family not in SUPPORTED_FAMILIES:
         raise SettlementIdentityError("SETTLEMENT_FAMILY_INVALID")
@@ -459,6 +465,7 @@ def _frozen_identity(position):
     validate_outcome_identity(position.get("outcome"), outcome_index)
 
     return {
+        "settlement_protocol": protocol,
         "settlement_family": family,
         "ctf_contract": ctf_contract,
         "position_collateral": collateral,
