@@ -475,6 +475,11 @@ class SettlementReader:
         ]
         if sum(numerators) != denominator:
             raise SettlementReadError("PAYOUT_VECTOR_INVALID")
+        if (
+            binding["market_family"] == "NEG_RISK"
+            and (denominator != 1 or numerators not in ([1, 0], [0, 1]))
+        ):
+            raise SettlementReadError("NEG_RISK_PAYOUT_VECTOR_INVALID")
 
         numerator = numerators[binding["outcome_index"]]
         base.update(
