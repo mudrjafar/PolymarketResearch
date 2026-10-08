@@ -424,8 +424,8 @@ def validate_outcome_identity(outcome, outcome_index):
     if expected is None:
         raise SettlementIdentityError("OUTCOME_LABEL_INVALID")
     if expected != outcome_index:
-        raise SettlementIdentityError("OUTCOME_IDENTITY_MISMATCH")
-    return True
+        raise SettlementIdentityError("OUTCOME_LABEL_INDEX_MISMATCH")
+    return outcome_index
 
 
 def _frozen_identity(position):
