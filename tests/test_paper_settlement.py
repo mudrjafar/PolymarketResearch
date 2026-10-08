@@ -412,6 +412,7 @@ def test_negrisk_fractional_payout_fails_closed_but_standard_remains_valid(monke
     negrisk["settlement_family"] = paper_settlement.FAMILY_NEGRISK
     negrisk["position_collateral"] = paper_settlement.NEGRISK_WRAPPED_COLLATERAL
     negrisk_identity = {
+        "settlement_protocol": paper_settlement.SETTLEMENT_PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_NEGRISK,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.NEGRISK_WRAPPED_COLLATERAL,
@@ -549,6 +550,7 @@ def test_negrisk_fractional_payout_fails_closed(monkeypatch):
         }
     )
     observed = {
+        "settlement_protocol": paper_settlement.SETTLEMENT_PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_NEGRISK,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.NEGRISK_WRAPPED_COLLATERAL,
@@ -587,6 +589,7 @@ def test_negrisk_binary_payout_remains_supported(monkeypatch):
         }
     )
     observed = {
+        "settlement_protocol": paper_settlement.SETTLEMENT_PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_NEGRISK,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.NEGRISK_WRAPPED_COLLATERAL,
