@@ -134,6 +134,7 @@ def _default_state():
         "execution_ready_key": None,
         "paper_open_alerts": [],
         "paper_closed_alerts": [],
+        "paper_settled_alerts": [],
     }
 
 
@@ -554,7 +555,7 @@ def paper_position_message(position):
         f"Mark status: {position.get('mark_status') or 'UNKNOWN'}",
     ]
 
-    if mark:
+    if mark and position.get("status") != "SETTLED":
         lines += [
             (
                 f"Exit-now VWAP {num(mark.get('exit_vwap')):.4f} | "
@@ -566,7 +567,21 @@ def paper_position_message(position):
             ),
         ]
 
-    if position.get("status") == "CLOSED":
+    if position.get("status") == "SETTLED":
+        settlement = (
+            position.get("settlement")
+            if isinstance(position.get("settlement"), dict)
+            else {}
+        )
+        lines += [
+            (
+                f"CTF payout {num(settlement.get('payout_per_token')):.4f}/token | "
+                f"value {money(settlement.get('settlement_value_usd'))}"
+            ),
+            f"Finalized block: {settlement.get('finalized_block_number') or '?'}",
+        ]
+
+    if position.get("status") in ("CLOSED", "SETTLED"):
         lines += [
             (
                 f"Realized P/L {money(position.get('realized_pnl_usd'))} "
@@ -999,6 +1014,7 @@ async def watcher(app):
             if paper_status == "OK":
                 seen_open = set(current_state.get("paper_open_alerts") or [])
                 seen_closed = set(current_state.get("paper_closed_alerts") or [])
+                seen_settled = set(current_state.get("paper_settled_alerts") or [])
 
                 for position in paper_payload.get("positions", []):
                     if not isinstance(position, dict):
@@ -1031,8 +1047,20 @@ async def watcher(app):
                                 print("[TELEGRAM]", exc)
                         seen_closed.add(paper_id)
 
+                    if position.get("status") == "SETTLED" and paper_id not in seen_settled:
+                        for chat_id in chat_ids():
+                            try:
+                                await app.bot.send_message(
+                                    chat_id=chat_id,
+                                    text="✅ PAPER SETTLED\n\n" + paper_position_message(position),
+                                )
+                            except Exception as exc:
+                                print("[TELEGRAM]", exc)
+                        seen_settled.add(paper_id)
+
                 current_state["paper_open_alerts"] = sorted(seen_open)[-200:]
                 current_state["paper_closed_alerts"] = sorted(seen_closed)[-200:]
+                current_state["paper_settled_alerts"] = sorted(seen_settled)[-200:]
 
             current_state["active_diamonds"] = sorted(x for x in active if x)
             current_state["cashflow_levels"] = cash_levels
