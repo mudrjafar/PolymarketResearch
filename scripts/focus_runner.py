@@ -20,6 +20,13 @@ sys.path.insert(0, str(BASE_DIR))
 from machine_common import fresh, save_json_atomic
 from scripts import focus_engine
 
+try:
+    from scripts.learning_queue import enqueue_focus_event
+    _LEARNING_INIT_ERROR = None
+except Exception as exc:  # Learning must never prevent Focus from starting.
+    enqueue_focus_event = None
+    _LEARNING_INIT_ERROR = f"{type(exc).__name__}: {exc}"
+
 DATA_DIR = BASE_DIR / "data"
 RISK_FILE = DATA_DIR / "risk_assessment.json"
 STATE_FILE = DATA_DIR / "focus_state.json"
@@ -149,6 +156,98 @@ def _append_events(events, source_generation_id):
         os.fsync(stream.fileno())
 
 
+def _candidate_for_focus(payload, focus):
+    if not isinstance(payload, dict) or not isinstance(focus, dict):
+        return None
+    token_id = str(focus.get("token_id") or "").strip()
+    evidence_id = str(focus.get("last_evidence_id") or "").strip()
+    for row in payload.get("results") or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("token_id") or "").strip() != token_id:
+            continue
+        if evidence_id and str(row.get("evidence_id") or "").strip() != evidence_id:
+            continue
+        return row
+    return None
+
+
+def _focus_snapshot_for_event(event, state):
+    if not isinstance(event, dict) or not isinstance(state, dict):
+        return None
+    if event.get("type") == "INVALIDATED":
+        value = state.get("last_invalidated")
+    else:
+        value = state.get("focus")
+    return value if isinstance(value, dict) else None
+
+
+def _learning_event(event, state, payload):
+    focus = _focus_snapshot_for_event(event, state)
+    if focus is None:
+        return None
+
+    candidate = _candidate_for_focus(payload, focus)
+    challenger = state.get("challenger") if isinstance(state.get("challenger"), dict) else None
+    event_type = str(event.get("type") or "").strip().upper()
+    event_at = event.get("at")
+
+    return {
+        "event_type": event_type,
+        "event_at": event_at,
+        "source_generation_id": payload.get("source_generation_id"),
+        "source_generated_at": payload.get("source_generated_at"),
+        "source_evidence_id": focus.get("last_evidence_id"),
+        "source_evidence_cursor": focus.get("last_evidence_cursor"),
+        "source_evidence_at": (
+            candidate.get("evidence_at") if isinstance(candidate, dict) else None
+        ),
+        "condition_id": focus.get("condition_id"),
+        "token_id": focus.get("token_id"),
+        "outcome": focus.get("outcome"),
+        "question": focus.get("question"),
+        "direction": focus.get("direction"),
+        "price": focus.get("price"),
+        "state": event.get("state"),
+        "progress": focus.get("progress"),
+        "fail_count": focus.get("fail_count"),
+        "locked_at": focus.get("locked_at"),
+        "price_at_lock": focus.get("price_at_lock"),
+        "ready_at": event_at if event_type == "READY" else None,
+        "price_at_ready": focus.get("price") if event_type == "READY" else None,
+        "invalidated_at": event_at if event_type == "INVALIDATED" else None,
+        "invalidation_reason_codes": (
+            list(event.get("reasons") or [])
+            if event_type == "INVALIDATED"
+            else []
+        ),
+        "challenger_present": challenger is not None,
+        "challenger": dict(challenger) if challenger is not None else None,
+    }
+
+
+def _publish_learning_events(events, state, payload):
+    if not events or _LEARNING_INIT_ERROR is not None:
+        return
+    versions = payload.get("strategy_versions") if isinstance(payload, dict) else None
+    if not isinstance(versions, dict):
+        return
+
+    try:
+        for event in events:
+            row = _learning_event(event, state, payload)
+            if row is None:
+                continue
+            enqueue_focus_event(
+                row,
+                data_dir=DATA_DIR,
+                strategy_versions=versions,
+            )
+    except Exception as exc:
+        # Learning is observational and can never block Focus authority.
+        print(f"[LEARNING] FOCUS_QUEUE_ERROR: {type(exc).__name__}: {exc}")
+
+
 def run_once(now=None):
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
@@ -179,6 +278,7 @@ def run_once(now=None):
         _state_wrapper(new_state, generation_id, now),
     )
     _append_events(events, generation_id)
+    _publish_learning_events(events, new_state, payload)
     save_json_atomic(
         FOCUS_FILE,
         _view(new_state, "OK", payload, now),

@@ -15,7 +15,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
-from scripts.learning_ingest import ingest_queue_file
+from scripts.learning_ingest import ingest_focus_queue_file, ingest_queue_file
 from scripts.learning_store import LearningStore
 
 DATA_DIR = BASE_DIR / "data"
@@ -34,6 +34,18 @@ def _generation_id(path):
     except Exception:
         pass
     return None
+
+
+def _focus_queue_sort_key(path):
+    try:
+        with Path(path).open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        event = payload.get("event") if isinstance(payload, dict) else None
+        event_at = str(event.get("event_at") or "") if isinstance(event, dict) else ""
+        event_id = str(payload.get("focus_event_id") or "") if isinstance(payload, dict) else ""
+        return (0 if event_at else 1, event_at, event_id, Path(path).name)
+    except Exception:
+        return (2, "", "", Path(path).name)
 
 
 def run_once(*, data_dir=DATA_DIR, db_path=DB_FILE):
@@ -88,6 +100,32 @@ def run_once(*, data_dir=DATA_DIR, db_path=DB_FILE):
                 except OSError:
                     pass
 
+        # Focus lifecycle events are processed only after Risk generation
+        # ingestion attempts, so LOCK lineage can resolve its signal history.
+        for path in sorted(
+            queue_dir.glob("focus_*.json"),
+            key=_focus_queue_sort_key,
+        ):
+            try:
+                result = ingest_focus_queue_file(path, store=store)
+            except Exception as exc:
+                outcomes.append(
+                    {
+                        "status": "ERROR",
+                        "focus_event_id": None,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "queue_file": path.name,
+                    }
+                )
+                continue
+
+            outcomes.append(result)
+            if result.get("status") in {"INGESTED", "ALREADY_INGESTED"}:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
     return outcomes
 
 
@@ -102,7 +140,13 @@ def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
             for row in outcomes:
                 status = row.get("status")
                 generation_id = row.get("generation_id") or "?"
-                if status == "INGESTED":
+                if status == "INGESTED" and row.get("focus_event_id"):
+                    print(
+                        f"[LEARNING] FOCUS {row.get('event_type')} "
+                        f"token={row.get('token_id')} "
+                        f"event={row.get('focus_event_id')}"
+                    )
+                elif status == "INGESTED":
                     print(
                         f"[LEARNING] INGESTED generation={generation_id} "
                         f"signals={row.get('signals_ingested', 0)}"
