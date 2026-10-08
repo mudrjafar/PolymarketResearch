@@ -34,6 +34,8 @@ def test_identity_matches_exactly_one_supported_family(monkeypatch):
     )
 
     assert identity == {
+        "settlement_protocol": paper_settlement.SETTLEMENT_PROTOCOL_LEGACY_CTF,
+        "settlement_protocol": paper_settlement.SETTLEMENT_PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
@@ -163,6 +165,7 @@ def position():
         "condition_id": CONDITION,
         "token_id": TOKEN,
         "outcome": "Yes",
+        "settlement_protocol": paper_settlement.SETTLEMENT_PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
@@ -173,6 +176,7 @@ def position():
 
 def _identity():
     return {
+        "settlement_protocol": paper_settlement.SETTLEMENT_PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
@@ -611,3 +615,11 @@ def test_negrisk_binary_payout_remains_supported(monkeypatch):
     assert result["status"] == paper_settlement.FINAL_SETTLED
     assert result["payout_numerator"] == 1
     assert result["payout_denominator"] == 1
+
+
+def test_frozen_identity_rejects_unknown_protocol():
+    row = position()
+    row["settlement_protocol"] = "V2"
+    result = paper_settlement.check_settlement(row, rpc_url="http://rpc")
+    assert result["status"] == paper_settlement.IDENTITY_MISMATCH
+    assert result["reason_code"] == "SETTLEMENT_PROTOCOL_INVALID"
