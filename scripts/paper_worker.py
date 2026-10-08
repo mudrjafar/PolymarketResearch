@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import requests
@@ -22,7 +23,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import fresh, save_json_atomic
-from scripts import book_engine, book_worker, paper_engine
+from scripts import book_engine, book_worker, paper_engine, settlement_reader
 
 DATA_DIR = BASE_DIR / "data"
 FOCUS_FILE = DATA_DIR / "focused_market.json"
@@ -280,6 +281,134 @@ def _position_mark(position, raw_book, now):
     }
 
 
+def _record_settlement_error(position, now, exc):
+    code = str(exc).strip() or type(exc).__name__
+    position["settlement_status"] = "SETTLEMENT_CHECK_ERROR"
+    position["settlement_checked_at"] = now.isoformat()
+    position["settlement_error"] = code
+
+
+def _apply_settlement(position, result, now):
+    if not isinstance(result, dict):
+        raise ValueError("SETTLEMENT_RESULT_INVALID")
+
+    condition_id = str(position.get("condition_id") or "").strip()
+    token_id = str(position.get("token_id") or "").strip()
+    if str(result.get("condition_id") or "").strip().lower() != condition_id.lower():
+        raise ValueError("SETTLEMENT_CONDITION_ID_MISMATCH")
+    if str(result.get("token_id") or "").strip() != token_id:
+        raise ValueError("SETTLEMENT_TOKEN_ID_MISMATCH")
+
+    status = result.get("status")
+    try:
+        denominator = int(result.get("payout_denominator"))
+    except (TypeError, ValueError):
+        raise ValueError("SETTLEMENT_DENOMINATOR_INVALID") from None
+
+    position["settlement_checked_at"] = now.isoformat()
+    position["settlement_error"] = None
+
+    if status == "UNRESOLVED":
+        if denominator != 0:
+            raise ValueError("SETTLEMENT_UNRESOLVED_DENOMINATOR_INVALID")
+        position["settlement_status"] = "UNRESOLVED"
+        position["settlement"] = dict(result)
+        return None
+
+    if status != "SETTLED" or denominator <= 0:
+        raise ValueError("SETTLEMENT_RESULT_INVALID")
+
+    numerators = result.get("payout_numerators")
+    if not isinstance(numerators, list) or len(numerators) != 2:
+        raise ValueError("SETTLEMENT_PAYOUT_VECTOR_INVALID")
+    try:
+        numerators = [int(value) for value in numerators]
+        outcome_index = int(result.get("outcome_index"))
+        numerator = int(result.get("payout_numerator"))
+    except (TypeError, ValueError):
+        raise ValueError("SETTLEMENT_PAYOUT_VECTOR_INVALID") from None
+    if (
+        outcome_index not in (0, 1)
+        or any(value < 0 for value in numerators)
+        or sum(numerators) != denominator
+        or numerator != numerators[outcome_index]
+    ):
+        raise ValueError("SETTLEMENT_PAYOUT_VECTOR_INVALID")
+
+    expected_outcome = "YES" if outcome_index == 0 else "NO"
+    if str(result.get("outcome") or "").strip().upper() != expected_outcome:
+        raise ValueError("SETTLEMENT_OUTCOME_BINDING_INVALID")
+    stored_outcome = str(position.get("outcome") or "").strip().upper()
+    if stored_outcome in ("YES", "NO") and stored_outcome != expected_outcome:
+        raise ValueError("SETTLEMENT_OUTCOME_MISMATCH")
+
+    if str(result.get("ctf_contract") or "").lower() != settlement_reader.CTF_ADDRESS.lower():
+        raise ValueError("SETTLEMENT_CTF_CONTRACT_MISMATCH")
+    if result.get("market_family") not in ("STANDARD", "NEG_RISK"):
+        raise ValueError("SETTLEMENT_MARKET_FAMILY_INVALID")
+    if result.get("finality_source") not in ("RPC_FINALIZED", "HEIMDALL_MILESTONE"):
+        raise ValueError("SETTLEMENT_FINALITY_SOURCE_INVALID")
+    block_hash = str(result.get("finalized_block_hash") or "")
+    try:
+        finalized_block = int(result.get("finalized_block_number"))
+    except (TypeError, ValueError):
+        raise ValueError("SETTLEMENT_FINALIZED_BLOCK_INVALID") from None
+    if finalized_block < 0 or len(block_hash) != 66 or not block_hash.startswith("0x"):
+        raise ValueError("SETTLEMENT_FINALIZED_BLOCK_INVALID")
+
+    try:
+        tokens = Decimal(str(position.get("tokens")))
+        investment = Decimal(str(position.get("investment_usd")))
+        payout = Decimal(numerator) / Decimal(denominator)
+        value = tokens * payout
+        pnl = value - investment
+    except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
+        raise ValueError("SETTLEMENT_ACCOUNTING_INVALID") from None
+    if (
+        not tokens.is_finite()
+        or not investment.is_finite()
+        or tokens <= 0
+        or investment <= 0
+        or not value.is_finite()
+        or not pnl.is_finite()
+    ):
+        raise ValueError("SETTLEMENT_ACCOUNTING_INVALID")
+
+    return_pct = pnl / investment * Decimal("100")
+    settlement = dict(result)
+    settlement["payout_per_token"] = float(payout)
+    settlement["tokens"] = float(tokens)
+    settlement["settlement_value_usd"] = round(float(value), 8)
+
+    position["status"] = "SETTLED"
+    position["settled_at"] = now.isoformat()
+    position["settlement_status"] = "SETTLED"
+    position["settlement"] = settlement
+    position["mark_status"] = "SETTLED"
+    position["mark_checked_at"] = now.isoformat()
+    position["realized_pnl_usd"] = round(float(pnl), 8)
+    position["realized_return_pct"] = round(float(return_pct), 4)
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "event_at": now.isoformat(),
+        "type": "SETTLED",
+        "paper_id": position.get("paper_id"),
+        "token_id": token_id,
+        "condition_id": condition_id,
+        "finalized_block_number": finalized_block,
+        "finalized_block_hash": block_hash,
+        "market_family": result.get("market_family"),
+        "outcome_index": outcome_index,
+        "payout_numerator": numerator,
+        "payout_denominator": denominator,
+        "payout_per_token": float(payout),
+        "settlement_value_usd": round(float(value), 8),
+        "realized_pnl_usd": round(float(pnl), 8),
+        "realized_return_pct": round(float(return_pct), 4),
+    }
+
+
 def _reject(request_id, now, reason):
     return _request_event(
         request_id,
@@ -398,6 +527,10 @@ def _process_open(
         "mark_status": "PENDING",
         "mark_checked_at": None,
         "mark": None,
+        "settlement_status": "PENDING",
+        "settlement_checked_at": None,
+        "settlement_error": None,
+        "settlement": None,
     }
 
     state["positions"].append(position)
@@ -432,6 +565,12 @@ def _process_close(state, request_id, request, now, book_loader):
     )
     if position is None:
         return _reject(request_id, now, "OPEN_POSITION_NOT_FOUND")
+
+    if (
+        position.get("settlement_status") != "UNRESOLVED"
+        or position.get("settlement_checked_at") != now.isoformat()
+    ):
+        return _reject(request_id, now, "SETTLEMENT_STATE_UNKNOWN")
 
     token_id = str(position.get("token_id") or "").strip()
 
@@ -510,6 +649,7 @@ def run_once(
     now=None,
     book_loader=book_worker.fetch_book,
     market_info_loader=fetch_market_info,
+    settlement_loader=None,
 ):
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
@@ -518,6 +658,25 @@ def run_once(
     state = load_state(now=now)
     processed = set(str(x) for x in state.get("processed_request_ids", []))
     events = []
+    if settlement_loader is None:
+        settlement_loader = settlement_reader.read_settlement
+
+    # Settlement is checked before CLOSE requests. A finalized CTF payout is
+    # terminal and must win over any later CLOB sell simulation. If settlement
+    # authority is unreadable, the position stays OPEN and CLOSE fails closed.
+    for position in state["positions"]:
+        if position.get("status") != "OPEN":
+            continue
+        try:
+            result = settlement_loader(
+                str(position.get("condition_id") or ""),
+                str(position.get("token_id") or ""),
+            )
+            event = _apply_settlement(position, result, now)
+            if event is not None:
+                events.append(event)
+        except Exception as exc:
+            _record_settlement_error(position, now, exc)
 
     for request_id, request in _load_requests():
         if request_id in processed:
@@ -707,10 +866,25 @@ def self_test():
                     "fd": {"r": 0.05, "e": 1},
                 }
 
+            def fake_settlement(condition_id, token_id):
+                assert condition_id == "condition-a"
+                assert token_id == "token-a"
+                return {
+                    "status": "UNRESOLVED",
+                    "condition_id": condition_id,
+                    "token_id": token_id,
+                    "finalized_block_number": 1,
+                    "finalized_block_hash": "0x" + "11" * 32,
+                    "finality_source": "RPC_FINALIZED",
+                    "ctf_contract": settlement_reader.CTF_ADDRESS,
+                    "payout_denominator": 0,
+                }
+
             state, events = run_once(
                 now=now,
                 book_loader=fake_book,
                 market_info_loader=fake_market,
+                settlement_loader=fake_settlement,
             )
             assert events[0]["type"] == "OPENED"
             assert len(state["positions"]) == 1
@@ -736,6 +910,7 @@ def self_test():
                 now=now,
                 book_loader=fake_book,
                 market_info_loader=fake_market,
+                settlement_loader=fake_settlement,
             )
             assert events[0]["type"] == "CLOSED"
             assert state["positions"][0]["status"] == "CLOSED"
