@@ -483,6 +483,7 @@ def _process_open(
     book_loader,
     market_info_loader,
     identity_loader,
+    settlement_checker,
 ):
     amount = request.get("amount_usd")
     try:
@@ -618,6 +619,25 @@ def _process_open(
         "mark": None,
     }
 
+    # A fresh Focus/Book snapshot is not proof that a market remains
+    # unresolved. Reject synthetic entries if the authoritative CTF already
+    # has a payout (even if the CLOB still returns stale asks), if resolution
+    # is visible only at the tip, or if current finality cannot be checked.
+    try:
+        settlement = settlement_checker(position)
+    except Exception:
+        return _reject(request_id, now, "SETTLEMENT_OPEN_CHECK_ERROR")
+
+    if not isinstance(settlement, dict):
+        return _reject(request_id, now, "SETTLEMENT_OPEN_CHECK_ERROR")
+    if settlement.get("status") != paper_settlement.UNRESOLVED:
+        return _reject(request_id, now, "SETTLEMENT_OPEN_NOT_UNRESOLVED")
+    if settlement.get("reason_code") is not None:
+        return _reject(request_id, now, "SETTLEMENT_OPEN_CURRENT_STATE_UNKNOWN")
+
+    position["settlement_status"] = paper_settlement.UNRESOLVED
+    position["settlement_checked_at"] = now.isoformat()
+    position["settlement_reason_code"] = None
     state["positions"].append(position)
 
     return _request_event(
@@ -772,6 +792,7 @@ def run_once(
                 book_loader,
                 market_info_loader,
                 identity_loader,
+                settlement_checker,
             )
         elif request.get("action") == "CLOSE":
             event = _process_close(
