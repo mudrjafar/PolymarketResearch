@@ -15,7 +15,11 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
-from scripts.learning_ingest import ingest_focus_queue_file, ingest_queue_file
+from scripts.learning_ingest import (
+    ingest_book_queue_file,
+    ingest_focus_queue_file,
+    ingest_queue_file,
+)
 from scripts.learning_store import LearningStore
 
 DATA_DIR = BASE_DIR / "data"
@@ -126,6 +130,29 @@ def run_once(*, data_dir=DATA_DIR, db_path=DB_FILE):
                 except OSError:
                     pass
 
+        # Book can race ahead of READY ingestion. A missing READY is therefore
+        # retryable: keep the queue file until Focus lineage is available.
+        for path in sorted(queue_dir.glob("book_*.json")):
+            try:
+                result = ingest_book_queue_file(path, store=store)
+            except Exception as exc:
+                outcomes.append(
+                    {
+                        "status": "ERROR",
+                        "book_observation_id": None,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "queue_file": path.name,
+                    }
+                )
+                continue
+
+            outcomes.append(result)
+            if result.get("status") in {"INGESTED", "ALREADY_INGESTED"}:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
     return outcomes
 
 
@@ -140,7 +167,13 @@ def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
             for row in outcomes:
                 status = row.get("status")
                 generation_id = row.get("generation_id") or "?"
-                if status == "INGESTED" and row.get("focus_event_id"):
+                if status == "INGESTED" and row.get("book_decision_id"):
+                    print(
+                        f"[LEARNING] BOOK status={row.get('book_status')} "
+                        f"ready={row.get('ready_id')} "
+                        f"ok={row.get('book_ok')}"
+                    )
+                elif status == "INGESTED" and row.get("focus_event_id"):
                     print(
                         f"[LEARNING] FOCUS {row.get('event_type')} "
                         f"token={row.get('token_id')} "
