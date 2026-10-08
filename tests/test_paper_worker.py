@@ -90,6 +90,7 @@ def market_info():
     return {
         "t": [{"t": "token-a"}],
         "fd": {"r": 0.05, "e": 1},
+        "nr": False,
     }
 
 
@@ -136,6 +137,7 @@ def loaders():
 
 def fake_identity(condition_id, token_id):
     return {
+        "settlement_protocol": paper_settlement.PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
@@ -467,10 +469,38 @@ def test_legacy_open_position_identity_is_backfilled_deterministically(monkeypat
     )
 
     position = state["positions"][0]
+    assert position["settlement_protocol"] == paper_settlement.PROTOCOL_LEGACY_CTF
     assert position["settlement_family"] == paper_settlement.FAMILY_STANDARD
     assert position["ctf_contract"] == paper_settlement.CTF_CONTRACT
     assert position["position_collateral"] == paper_settlement.STANDARD_USDCE
     assert position["outcome_index"] == 0
+    assert position["market_neg_risk"] is False
+
+
+def test_market_neg_risk_must_match_frozen_settlement_family(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    def negrisk_identity(condition_id, token_id):
+        return {
+            "settlement_protocol": paper_settlement.PROTOCOL_LEGACY_CTF,
+            "settlement_family": paper_settlement.FAMILY_NEGRISK,
+            "ctf_contract": paper_settlement.CTF_CONTRACT,
+            "position_collateral": paper_settlement.NEGRISK_WRAPPED_COLLATERAL,
+            "outcome_index": 0,
+        }
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+        identity_loader=negrisk_identity,
+    )
+
+    assert state["positions"] == []
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == "SETTLEMENT_FAMILY_MARKET_MISMATCH"
 
 
 def test_close_after_settlement_is_rejected(monkeypatch, tmp_path):
