@@ -1,3 +1,4 @@
+# branch-only validation; remove after green run
 name: TEMP Settlement Live Preflight Validation
 
 on:
