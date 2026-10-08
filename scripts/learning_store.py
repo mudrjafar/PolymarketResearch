@@ -15,7 +15,9 @@ from typing import Any, Mapping
 
 from scripts.learning_contract import (
     LEARNING_SCHEMA_VERSION,
+    SELECTION_NOT_SELECTED,
     SELECTION_PENDING,
+    SELECTION_SELECTED,
     SELECTION_STATUSES,
     validate_strategy_versions,
 )
@@ -595,6 +597,149 @@ class LearningStore:
                 ),
             )
         return int(cursor.rowcount or 0)
+
+    def bind_paper_open(
+        self,
+        *,
+        paper_id: str,
+        ready_id: str,
+        version_id: str,
+        open_request_id: str,
+        row: Mapping[str, Any],
+    ):
+        """Atomically bind one successful Paper OPEN to one SYSTEM_READY."""
+        if not isinstance(row, Mapping):
+            raise LearningStoreError("Paper OPEN row must be an object")
+        required = (
+            "opened_at",
+            "condition_id",
+            "token_id",
+            "outcome",
+            "direction",
+            "investment_usd",
+            "immutable",
+            "mutable",
+        )
+        for field in required:
+            if field not in row or row.get(field) is None:
+                raise LearningStoreError(f"Paper OPEN {field} is required")
+
+        immutable_json = _json(row["immutable"])
+        mutable_json = _json(row["mutable"])
+        values = {
+            "paper_id": str(paper_id),
+            "ready_id": str(ready_id),
+            "version_id": str(version_id),
+            "open_request_id": str(open_request_id),
+            "opened_at": str(row["opened_at"]),
+            "status": str(row.get("status") or "OPEN"),
+            "condition_id": str(row["condition_id"]),
+            "token_id": str(row["token_id"]),
+            "outcome": str(row["outcome"]),
+            "direction": str(row["direction"]),
+            "investment_usd": float(row["investment_usd"]),
+            "immutable_json": immutable_json,
+            "mutable_json": mutable_json,
+        }
+
+        try:
+            with self.conn:
+                ready = self.conn.execute(
+                    "SELECT selection_status,selected_paper_id "
+                    "FROM ready_opportunities WHERE ready_id=?",
+                    (str(ready_id),),
+                ).fetchone()
+                if ready is None:
+                    raise LearningStoreError("READY opportunity not found")
+
+                selection_status = str(ready["selection_status"])
+                selected_paper_id = ready["selected_paper_id"]
+                if selection_status == SELECTION_SELECTED:
+                    if str(selected_paper_id or "") != str(paper_id):
+                        raise LearningDataConflict(
+                            f"ready_opportunities.ready_id={ready_id} "
+                            "already selected by another Paper trade"
+                        )
+                elif selection_status == SELECTION_NOT_SELECTED:
+                    raise LearningDataConflict(
+                        f"ready_opportunities.ready_id={ready_id} "
+                        "already finalized NOT_SELECTED"
+                    )
+                elif selection_status != SELECTION_PENDING:
+                    raise LearningStoreError("READY selection_status invalid")
+
+                existing = self.conn.execute(
+                    "SELECT * FROM paper_trades WHERE paper_id=?",
+                    (str(paper_id),),
+                ).fetchone()
+                if existing is None:
+                    self.conn.execute(
+                        "INSERT INTO paper_trades "
+                        "(paper_id,ready_id,version_id,open_request_id,opened_at,"
+                        "status,condition_id,token_id,outcome,direction,"
+                        "investment_usd,immutable_json,mutable_json) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        tuple(values.values()),
+                    )
+                    inserted = True
+                else:
+                    for column, expected in values.items():
+                        if existing[column] != expected:
+                            raise LearningDataConflict(
+                                f"paper_trades.paper_id={paper_id} "
+                                f"conflicts on {column}"
+                            )
+                    inserted = False
+
+                self.conn.execute(
+                    "UPDATE ready_opportunities "
+                    "SET selection_status=?, selected_paper_id=? "
+                    "WHERE ready_id=?",
+                    (
+                        SELECTION_SELECTED,
+                        str(paper_id),
+                        str(ready_id),
+                    ),
+                )
+            return inserted
+        except sqlite3.IntegrityError as exc:
+            raise LearningStoreError(str(exc)) from exc
+
+    def finalize_ready_not_selected(self, ready_id: str) -> bool:
+        """Finalize one ended, still-unselected READY opportunity."""
+        with self.conn:
+            row = self.conn.execute(
+                "SELECT selection_status,selected_paper_id,ended_at "
+                "FROM ready_opportunities WHERE ready_id=?",
+                (str(ready_id),),
+            ).fetchone()
+            if row is None:
+                raise LearningStoreError("READY opportunity not found")
+            if row["selection_status"] == SELECTION_SELECTED:
+                return False
+            if row["selection_status"] == SELECTION_NOT_SELECTED:
+                return False
+            if row["selection_status"] != SELECTION_PENDING:
+                raise LearningStoreError("READY selection_status invalid")
+            if row["selected_paper_id"] is not None:
+                raise LearningDataConflict(
+                    f"READY {ready_id} has Paper linkage but PENDING status"
+                )
+            if row["ended_at"] is None:
+                return False
+
+            cursor = self.conn.execute(
+                "UPDATE ready_opportunities "
+                "SET selection_status=? "
+                "WHERE ready_id=? AND selection_status=? "
+                "AND selected_paper_id IS NULL AND ended_at IS NOT NULL",
+                (
+                    SELECTION_NOT_SELECTED,
+                    str(ready_id),
+                    SELECTION_PENDING,
+                ),
+            )
+        return bool(cursor.rowcount)
 
     def fetch_one(self, sql, params=()):
         return self.conn.execute(sql, params).fetchone()
