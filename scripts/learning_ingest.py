@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -690,6 +691,226 @@ def ingest_book_queue_file(queue_file, *, store: LearningStore):
         "ready_id": ready["ready_id"],
         "book_status": status,
         "book_ok": book_ok,
+    }
+
+
+def ingest_paper_open_queue_file(queue_file, *, store: LearningStore):
+    """Bind one authoritative successful Paper OPEN to exactly one READY."""
+    snapshot = _read_json(Path(queue_file))
+    if not isinstance(snapshot, dict):
+        raise LearningIngestError("Paper OPEN queue snapshot must be an object")
+
+    snapshot_id = _text(snapshot.get("paper_open_snapshot_id"))
+    versions = snapshot.get("strategy_versions")
+    paper_open = snapshot.get("paper_open")
+    if not snapshot_id:
+        raise LearningIngestError("paper_open_snapshot_id missing")
+    if not isinstance(versions, dict):
+        raise LearningIngestError("Paper OPEN strategy_versions missing")
+    if not isinstance(paper_open, dict):
+        raise LearningIngestError("Paper OPEN payload missing")
+
+    required = (
+        "paper_id",
+        "open_request_id",
+        "opened_at",
+        "source_generation_id",
+        "source_evidence_id",
+        "condition_id",
+        "token_id",
+        "outcome",
+        "direction",
+        "investment_usd",
+        "entry",
+    )
+    for field in required:
+        if paper_open.get(field) is None or (
+            field != "investment_usd"
+            and field != "entry"
+            and not _text(paper_open.get(field))
+        ):
+            raise LearningIngestError(f"Paper OPEN {field} missing")
+
+    if not isinstance(paper_open.get("entry"), dict):
+        raise LearningIngestError("Paper OPEN entry must be an object")
+
+    paper_id = _text(paper_open.get("paper_id"))
+    request_id = _text(paper_open.get("open_request_id"))
+    opened_at = _text(paper_open.get("opened_at"))
+    generation_id = _text(paper_open.get("source_generation_id"))
+    evidence_id = _text(paper_open.get("source_evidence_id"))
+    condition_id = _text(paper_open.get("condition_id"))
+    token_id = _text(paper_open.get("token_id"))
+
+    rows = store.conn.execute(
+        "SELECT ready_id,version_id,ready_at,ended_at,payload_json "
+        "FROM ready_opportunities "
+        "WHERE source_generation_id=? AND source_evidence_id=? "
+        "AND condition_id=? AND token_id=?",
+        (generation_id, evidence_id, condition_id, token_id),
+    ).fetchall()
+    if len(rows) != 1:
+        raise LearningIngestError(
+            "Paper OPEN must match exactly one SYSTEM_READY opportunity"
+        )
+
+    ready = rows[0]
+    opened_dt = _parse_time(opened_at)
+    ready_dt = _parse_time(ready["ready_at"])
+    ended_dt = _parse_time(ready["ended_at"]) if ready["ended_at"] else None
+    if opened_dt is None or ready_dt is None:
+        raise LearningIngestError("Paper OPEN/READY timestamp invalid")
+    if opened_dt < ready_dt:
+        raise LearningIngestError("Paper OPEN predates READY")
+    if ended_dt is not None and opened_dt > ended_dt:
+        raise LearningIngestError("Paper OPEN occurs after READY ended")
+
+    try:
+        ready_payload = json.loads(ready["payload_json"])
+    except (TypeError, ValueError) as exc:
+        raise LearningIngestError("READY payload unreadable") from exc
+    if not isinstance(ready_payload, dict):
+        raise LearningIngestError("READY payload invalid")
+
+    if _text(ready_payload.get("outcome")).casefold() != _text(
+        paper_open.get("outcome")
+    ).casefold():
+        raise LearningIngestError("Paper OPEN outcome does not match READY")
+    if _text(ready_payload.get("direction")).upper() != _text(
+        paper_open.get("direction")
+    ).upper():
+        raise LearningIngestError("Paper OPEN direction does not match READY")
+
+    try:
+        investment = float(paper_open.get("investment_usd"))
+    except (TypeError, ValueError) as exc:
+        raise LearningIngestError("Paper OPEN investment_usd invalid") from exc
+    if not math.isfinite(investment) or investment <= 0:
+        raise LearningIngestError("Paper OPEN investment_usd invalid")
+
+    version_id = store.register_strategy_version(versions)
+
+    immutable = {
+        "paper_open_snapshot_id": snapshot_id,
+        "paper_open": dict(paper_open),
+        "ready": ready_payload,
+        "ready_version_id": ready["version_id"],
+    }
+    mutable = {
+        "status": "OPEN",
+    }
+    inserted = store.bind_paper_open(
+        paper_id=paper_id,
+        ready_id=ready["ready_id"],
+        version_id=version_id,
+        open_request_id=request_id,
+        row={
+            "opened_at": opened_at,
+            "status": "OPEN",
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "outcome": paper_open.get("outcome"),
+            "direction": _text(paper_open.get("direction")).upper(),
+            "investment_usd": investment,
+            "immutable": immutable,
+            "mutable": mutable,
+        },
+    )
+
+    return {
+        "status": "INGESTED" if inserted else "ALREADY_INGESTED",
+        "paper_open_snapshot_id": snapshot_id,
+        "paper_id": paper_id,
+        "ready_id": ready["ready_id"],
+        "open_request_id": request_id,
+    }
+
+
+def finalize_ready_selection_from_paper_state(*, data_dir, store: LearningStore):
+    """Finalize ended READYs only after Paper authority has advanced past them.
+
+    A matching Paper position keeps the READY unresolved until its durable
+    Paper OPEN queue is ingested. This prevents a scheduler race from creating
+    false NOT_SELECTED labels.
+    """
+    state_path = Path(data_dir) / "paper_state.json"
+    if not state_path.exists():
+        return {"status": "NO_PAPER_STATE", "finalized": 0, "deferred": 0}
+
+    try:
+        state = _read_json(state_path)
+    except Exception as exc:
+        return {
+            "status": "PAPER_STATE_UNREADABLE",
+            "finalized": 0,
+            "deferred": 0,
+            "error": type(exc).__name__,
+        }
+
+    if (
+        not isinstance(state, dict)
+        or state.get("schema_version") != 1
+        or not isinstance(state.get("positions"), list)
+    ):
+        return {"status": "PAPER_STATE_INVALID", "finalized": 0, "deferred": 0}
+
+    state_updated = _parse_time(state.get("updated_at"))
+    if state_updated is None:
+        return {"status": "PAPER_STATE_INVALID", "finalized": 0, "deferred": 0}
+
+    pending = store.conn.execute(
+        "SELECT ready_id,source_generation_id,source_evidence_id,"
+        "condition_id,token_id,ready_at,ended_at "
+        "FROM ready_opportunities "
+        "WHERE selection_status='PENDING' "
+        "AND selected_paper_id IS NULL AND ended_at IS NOT NULL "
+        "ORDER BY ended_at"
+    ).fetchall()
+
+    finalized = 0
+    deferred = 0
+    positions = [row for row in state.get("positions", []) if isinstance(row, dict)]
+
+    for ready in pending:
+        ended_dt = _parse_time(ready["ended_at"])
+        ready_dt = _parse_time(ready["ready_at"])
+        if ended_dt is None or ready_dt is None or state_updated <= ended_dt:
+            deferred += 1
+            continue
+
+        matching_positions = []
+        for position in positions:
+            if (
+                _text(position.get("source_generation_id"))
+                != _text(ready["source_generation_id"])
+                or _text(position.get("source_evidence_id"))
+                != _text(ready["source_evidence_id"])
+                or _text(position.get("condition_id"))
+                != _text(ready["condition_id"])
+                or _text(position.get("token_id"))
+                != _text(ready["token_id"])
+            ):
+                continue
+
+            opened_dt = _parse_time(position.get("opened_at"))
+            if opened_dt is None:
+                matching_positions.append(position)
+                continue
+            if ready_dt <= opened_dt <= ended_dt:
+                matching_positions.append(position)
+
+        if matching_positions:
+            # A successful Paper OPEN exists. Its queue may simply be lagging.
+            deferred += 1
+            continue
+
+        if store.finalize_ready_not_selected(ready["ready_id"]):
+            finalized += 1
+
+    return {
+        "status": "OK",
+        "finalized": finalized,
+        "deferred": deferred,
     }
 
 
