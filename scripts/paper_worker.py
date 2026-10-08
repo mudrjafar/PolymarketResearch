@@ -22,7 +22,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import fresh, save_json_atomic
-from scripts import book_engine, book_worker, paper_engine
+from scripts import book_engine, book_worker, paper_engine, settlement_resolver
 
 DATA_DIR = BASE_DIR / "data"
 FOCUS_FILE = DATA_DIR / "focused_market.json"
@@ -280,6 +280,107 @@ def _position_mark(position, raw_book, now):
     }
 
 
+
+def _settlement_event(position, now):
+    settlement = position.get("settlement") or {}
+    return _request_event(
+        position.get("request_id"),
+        "SETTLED",
+        now,
+        paper_id=position.get("paper_id"),
+        token_id=position.get("token_id"),
+        condition_id=position.get("condition_id"),
+        payout_per_token=settlement.get("payout_per_token"),
+        settlement_value_usd=settlement.get("settlement_value_usd"),
+        realized_pnl_usd=position.get("realized_pnl_usd"),
+        realized_return_pct=position.get("realized_return_pct"),
+        finalized_block_number=settlement.get("finalized_block_number"),
+        finalized_block_hash=settlement.get("finalized_block_hash"),
+    )
+
+
+def _check_position_settlement(position, now, binding_loader, settlement_checker):
+    if not isinstance(position.get("settlement_binding"), dict):
+        try:
+            binding = binding_loader(
+                position.get("token_id"),
+                position.get("condition_id"),
+            )
+            if not isinstance(binding, dict):
+                raise ValueError("SETTLEMENT_BINDING_INVALID")
+            position["settlement_binding"] = binding
+        except Exception as exc:
+            position["settlement_status"] = "SETTLEMENT_CHECK_ERROR"
+            position["settlement_checked_at"] = now.isoformat()
+            position["settlement_error"] = str(exc).strip() or type(exc).__name__
+            return None
+
+    try:
+        resolution = settlement_checker(position)
+    except Exception as exc:
+        position["settlement_status"] = "SETTLEMENT_CHECK_ERROR"
+        position["settlement_checked_at"] = now.isoformat()
+        position["settlement_error"] = str(exc).strip() or type(exc).__name__
+        return None
+
+    if not isinstance(resolution, dict):
+        position["settlement_status"] = "SETTLEMENT_CHECK_ERROR"
+        position["settlement_checked_at"] = now.isoformat()
+        position["settlement_error"] = "SETTLEMENT_RESULT_INVALID"
+        return None
+
+    status = resolution.get("status")
+    position["settlement_checked_at"] = now.isoformat()
+    position["settlement_error"] = None
+
+    if status == "UNRESOLVED":
+        position["settlement_status"] = "UNRESOLVED"
+        return None
+    if status != "RESOLVED":
+        position["settlement_status"] = "SETTLEMENT_CHECK_ERROR"
+        position["settlement_error"] = "SETTLEMENT_STATUS_INVALID"
+        return None
+
+    try:
+        quote = paper_engine.settlement_quote(
+            position.get("tokens"),
+            resolution.get("payout_numerator"),
+            resolution.get("payout_denominator"),
+            position.get("investment_usd"),
+        )
+    except Exception as exc:
+        position["settlement_status"] = "SETTLEMENT_CHECK_ERROR"
+        position["settlement_error"] = str(exc).strip() or type(exc).__name__
+        return None
+
+    position["status"] = "SETTLED"
+    position["settled_at"] = now.isoformat()
+    position["settlement_status"] = "SETTLED"
+    position["settlement"] = {
+        "source": resolution.get("source"),
+        "chain_id": resolution.get("chain_id"),
+        "ctf_contract": resolution.get("ctf_contract"),
+        "market_family": resolution.get("market_family"),
+        "exchange_contract": resolution.get("exchange_contract"),
+        "ctf_collateral": resolution.get("ctf_collateral"),
+        "outcome_index": resolution.get("outcome_index"),
+        "index_set": resolution.get("index_set"),
+        "payout_numerators": resolution.get("payout_numerators"),
+        "payout_numerator": quote["payout_numerator"],
+        "payout_denominator": quote["payout_denominator"],
+        "payout_per_token": quote["payout_per_token"],
+        "settlement_value_usd": quote["settlement_value_usd"],
+        "finalized_block_number": resolution.get("finalized_block_number"),
+        "finalized_block_hash": resolution.get("finalized_block_hash"),
+    }
+    position["realized_pnl_usd"] = quote["realized_pnl_usd"]
+    position["realized_return_pct"] = quote["realized_return_pct"]
+    position["mark_status"] = "SETTLED"
+    position["mark_checked_at"] = now.isoformat()
+
+    return _settlement_event(position, now)
+
+
 def _reject(request_id, now, reason):
     return _request_event(
         request_id,
@@ -296,6 +397,7 @@ def _process_open(
     now,
     book_loader,
     market_info_loader,
+    settlement_binding_loader,
 ):
     amount = request.get("amount_usd")
     try:
@@ -346,6 +448,9 @@ def _process_open(
     try:
         market_info = market_info_loader(condition_id)
         fee_info = paper_engine.parse_fee_info(market_info, token_id)
+        settlement_binding = settlement_binding_loader(token_id, condition_id)
+        if not isinstance(settlement_binding, dict):
+            raise ValueError("SETTLEMENT_BINDING_INVALID")
         entry = paper_engine.simulate_buy(
             raw_book,
             amount,
@@ -383,6 +488,11 @@ def _process_open(
         "tokens": float(entry["net_tokens"]),
         "fee_rate": fee_info["fee_rate"],
         "fee_exponent": fee_info["fee_exponent"],
+        "settlement_binding": settlement_binding,
+        "settlement_status": "PENDING",
+        "settlement_checked_at": None,
+        "settlement_error": None,
+        "settlement": None,
         "entry": {
             "book_hash": raw_book.get("hash"),
             "book_timestamp": raw_book.get("timestamp"),
@@ -510,10 +620,17 @@ def run_once(
     now=None,
     book_loader=book_worker.fetch_book,
     market_info_loader=fetch_market_info,
+    settlement_binding_loader=None,
+    settlement_checker=None,
 ):
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
+
+    settlement_binding_loader = (
+        settlement_binding_loader or settlement_resolver.bind_position
+    )
+    settlement_checker = settlement_checker or settlement_resolver.check_position
 
     state = load_state(now=now)
     processed = set(str(x) for x in state.get("processed_request_ids", []))
@@ -539,6 +656,7 @@ def run_once(
                 now,
                 book_loader,
                 market_info_loader,
+                settlement_binding_loader,
             )
         elif request.get("action") == "CLOSE":
             event = _process_close(
@@ -557,6 +675,17 @@ def run_once(
     for position in state["positions"]:
         if position.get("status") != "OPEN":
             continue
+
+        settlement_event = _check_position_settlement(
+            position,
+            now,
+            settlement_binding_loader,
+            settlement_checker,
+        )
+        if settlement_event is not None:
+            events.append(settlement_event)
+            continue
+
         try:
             raw_book = book_loader(str(position.get("token_id") or ""))
             _position_mark(position, raw_book, now)
