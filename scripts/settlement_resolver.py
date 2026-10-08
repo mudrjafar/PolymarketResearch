@@ -9,6 +9,7 @@ valid position ids from each currently supported CTF Exchange V2 family and
 requiring exactly one match.
 """
 
+import base64
 import os
 
 import requests
@@ -21,6 +22,7 @@ CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 STANDARD_EXCHANGE_V2 = "0xE111180000d2663C0091e4f400237545B87B996B"
 NEG_RISK_EXCHANGE_V2 = "0xe2222d279d744050d28e00520010520000310F59"
 DEFAULT_TIMEOUT_SECONDS = 8
+HEIMDALL_REST_URL_ENV = "POLYGON_HEIMDALL_REST_URL"
 
 
 class SettlementSourceError(RuntimeError):
@@ -56,10 +58,21 @@ def _token_int(value):
 
 
 class PolygonFinalizedCtfResolver:
-    def __init__(self, rpc_url=None, timeout=DEFAULT_TIMEOUT_SECONDS, session=None):
+    def __init__(
+        self,
+        rpc_url=None,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
+        session=None,
+        heimdall_rest_url=None,
+    ):
         self.rpc_url = str(rpc_url or os.getenv("POLYMARKET_RPC_URL", "")).strip()
         if not self.rpc_url:
             raise SettlementSourceError("POLYMARKET_RPC_URL_MISSING")
+        self.heimdall_rest_url = str(
+            heimdall_rest_url
+            if heimdall_rest_url is not None
+            else os.getenv(HEIMDALL_REST_URL_ENV, "")
+        ).strip().rstrip("/")
         self.timeout = timeout
         self.session = session or requests
 
@@ -85,25 +98,97 @@ class PolygonFinalizedCtfResolver:
             raise SettlementSourceError("RPC_RESULT_MISSING")
         return payload["result"]
 
-    def finalized_block(self):
-        result = self._rpc("eth_getBlockByNumber", ["finalized", False])
+    @staticmethod
+    def _parse_rpc_block(result, source):
         if not isinstance(result, dict):
-            raise SettlementSourceError("FINALIZED_BLOCK_UNAVAILABLE")
+            raise SettlementSourceError(f"{source}_BLOCK_UNAVAILABLE")
         number = result.get("number")
         block_hash = str(result.get("hash") or "").lower()
         if not isinstance(number, str) or not number.startswith("0x"):
-            raise SettlementSourceError("FINALIZED_BLOCK_NUMBER_INVALID")
+            raise SettlementSourceError(f"{source}_BLOCK_NUMBER_INVALID")
         try:
             number_int = int(number, 16)
         except ValueError as exc:
-            raise SettlementSourceError("FINALIZED_BLOCK_NUMBER_INVALID") from exc
+            raise SettlementSourceError(f"{source}_BLOCK_NUMBER_INVALID") from exc
         if number_int < 0 or len(block_hash) != 66 or not block_hash.startswith("0x"):
-            raise SettlementSourceError("FINALIZED_BLOCK_INVALID")
+            raise SettlementSourceError(f"{source}_BLOCK_INVALID")
         return {
             "number": number_int,
             "tag": hex(number_int),
             "hash": block_hash,
+            "finality_source": source,
         }
+
+    @staticmethod
+    def _milestone_hash(value):
+        raw = str(value or "").strip()
+        if raw.startswith("0x"):
+            try:
+                data = bytes.fromhex(raw[2:])
+            except ValueError as exc:
+                raise SettlementSourceError("HEIMDALL_MILESTONE_HASH_INVALID") from exc
+        else:
+            try:
+                data = base64.b64decode(raw, validate=True)
+            except Exception as exc:
+                raise SettlementSourceError("HEIMDALL_MILESTONE_HASH_INVALID") from exc
+        if len(data) != 32:
+            raise SettlementSourceError("HEIMDALL_MILESTONE_HASH_INVALID")
+        return "0x" + data.hex()
+
+    def _heimdall_finalized_block(self):
+        if not self.heimdall_rest_url:
+            raise SettlementSourceError("HEIMDALL_REST_URL_MISSING")
+
+        try:
+            response = self.session.get(
+                f"{self.heimdall_rest_url}/milestones/latest",
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            raise SettlementSourceError(f"HEIMDALL_{type(exc).__name__}") from exc
+        except ValueError as exc:
+            raise SettlementSourceError("HEIMDALL_INVALID_JSON") from exc
+
+        milestone = payload.get("milestone") if isinstance(payload, dict) else None
+        if not isinstance(milestone, dict):
+            raise SettlementSourceError("HEIMDALL_MILESTONE_INVALID")
+
+        if str(milestone.get("bor_chain_id") or "").strip() != str(CHAIN_ID):
+            raise SettlementSourceError("HEIMDALL_CHAIN_ID_MISMATCH")
+
+        end_raw = milestone.get("end_block")
+        try:
+            end_block = int(end_raw)
+        except (TypeError, ValueError) as exc:
+            raise SettlementSourceError("HEIMDALL_END_BLOCK_INVALID") from exc
+        if end_block < 0:
+            raise SettlementSourceError("HEIMDALL_END_BLOCK_INVALID")
+
+        milestone_hash = self._milestone_hash(milestone.get("hash"))
+        bor_result = self._rpc("eth_getBlockByNumber", [hex(end_block), False])
+        bor_block = self._parse_rpc_block(bor_result, "HEIMDALL_MILESTONE")
+        if bor_block["number"] != end_block:
+            raise SettlementSourceError("HEIMDALL_BOR_BLOCK_NUMBER_MISMATCH")
+        if bor_block["hash"] != milestone_hash:
+            raise SettlementSourceError("HEIMDALL_BOR_BLOCK_HASH_MISMATCH")
+
+        bor_block["finality_source"] = "HEIMDALL_V2_MILESTONE"
+        return bor_block
+
+    def finalized_block(self):
+        rpc_error = None
+        try:
+            result = self._rpc("eth_getBlockByNumber", ["finalized", False])
+            return self._parse_rpc_block(result, "RPC_FINALIZED")
+        except SettlementSourceError as exc:
+            rpc_error = exc
+
+        if self.heimdall_rest_url:
+            return self._heimdall_finalized_block()
+        raise rpc_error
 
     def _eth_call(self, to, data, block_tag):
         result = self._rpc(
@@ -225,6 +310,7 @@ class PolygonFinalizedCtfResolver:
             **binding,
             "verified_block_number": block["number"],
             "verified_block_hash": block["hash"],
+            "finality_source": block.get("finality_source"),
         }
 
     def check_position(self, position):
@@ -272,6 +358,7 @@ class PolygonFinalizedCtfResolver:
             "ctf_contract": CTF_CONTRACT.lower(),
             "finalized_block_number": block["number"],
             "finalized_block_hash": block["hash"],
+            "finality_source": block.get("finality_source"),
             **current,
         }
 
