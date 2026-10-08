@@ -333,3 +333,136 @@ def test_existing_authoritative_paper_position_defers_not_selected(tmp_path):
         ).fetchone()
         assert row["selection_status"] == SELECTION_SELECTED
         assert row["selected_paper_id"] == "PAPER-open"
+
+
+
+def test_explicit_open_request_marks_user_selected_before_execution(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    request_dir = data / "paper_requests"
+    request_dir.mkdir()
+    db = data / "learning.sqlite3"
+
+    with LearningStore(db) as store:
+        seed_ready(store, data)
+        requested_at = READY_AT + timedelta(seconds=5)
+        save_json_atomic(
+            request_dir / "REQ-choice.json",
+            {
+                "schema_version": 1,
+                "request_id": "REQ-choice",
+                "requested_at": requested_at.isoformat(),
+                "action": "OPEN",
+                "amount_usd": 25,
+                "token_id": "token-a",
+                "condition_id": "condition-a",
+                "source_generation_id": "GEN-R",
+                "source_evidence_id": EVIDENCE,
+                "focus_locked_at": T0.isoformat(),
+                "chat_id": "ignored-by-learning",
+            },
+        )
+
+        result = finalize_ready_selection_from_paper_state(
+            data_dir=data,
+            store=store,
+        )
+        assert result["selected"] == 1
+
+        ready = store.conn.execute(
+            "SELECT selection_status,selected_paper_id FROM ready_opportunities"
+        ).fetchone()
+        assert ready["selection_status"] == SELECTION_SELECTED
+        assert ready["selected_paper_id"] is None
+
+
+def test_selected_request_is_not_relabelled_not_selected_when_execution_rejects(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    request_dir = data / "paper_requests"
+    request_dir.mkdir()
+    db = data / "learning.sqlite3"
+
+    with LearningStore(db) as store:
+        seed_ready(store, data)
+        ended_at = READY_AT + timedelta(seconds=10)
+        store.end_open_ready_opportunities(
+            "condition-a",
+            "token-a",
+            ended_at.isoformat(),
+        )
+
+        save_json_atomic(
+            request_dir / "REQ-choice.json",
+            {
+                "schema_version": 1,
+                "request_id": "REQ-choice",
+                "requested_at": (READY_AT + timedelta(seconds=5)).isoformat(),
+                "action": "OPEN",
+                "amount_usd": 25,
+                "token_id": "token-a",
+                "condition_id": "condition-a",
+                "source_generation_id": "GEN-R",
+                "source_evidence_id": EVIDENCE,
+                "focus_locked_at": T0.isoformat(),
+            },
+        )
+        save_json_atomic(
+            data / "paper_state.json",
+            {
+                "schema_version": 1,
+                "updated_at": (ended_at + timedelta(seconds=5)).isoformat(),
+                "positions": [],
+                "processed_request_ids": ["REQ-choice"],
+            },
+        )
+
+        result = finalize_ready_selection_from_paper_state(
+            data_dir=data,
+            store=store,
+        )
+
+        assert result["selected"] == 1
+        assert result["finalized"] == 0
+        ready = store.conn.execute(
+            "SELECT selection_status,selected_paper_id FROM ready_opportunities"
+        ).fetchone()
+        assert ready["selection_status"] == SELECTION_SELECTED
+        assert ready["selected_paper_id"] is None
+
+
+def test_successful_entry_can_attach_paper_id_after_selection_intent(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    request_dir = data / "paper_requests"
+    request_dir.mkdir()
+    db = data / "learning.sqlite3"
+
+    with LearningStore(db) as store:
+        ready_id = seed_ready(store, data)
+        save_json_atomic(
+            request_dir / "REQ-open.json",
+            {
+                "schema_version": 1,
+                "request_id": "REQ-open",
+                "requested_at": (READY_AT + timedelta(seconds=3)).isoformat(),
+                "action": "OPEN",
+                "amount_usd": 25,
+                "token_id": "token-a",
+                "condition_id": "condition-a",
+                "source_generation_id": "GEN-R",
+                "source_evidence_id": EVIDENCE,
+                "focus_locked_at": T0.isoformat(),
+            },
+        )
+        finalize_ready_selection_from_paper_state(data_dir=data, store=store)
+
+        queued = queue_open(data, paper_open())
+        result = ingest_paper_open_queue_file(queued["path"], store=store)
+
+        assert result["ready_id"] == ready_id
+        ready = store.conn.execute(
+            "SELECT selection_status,selected_paper_id FROM ready_opportunities"
+        ).fetchone()
+        assert ready["selection_status"] == SELECTION_SELECTED
+        assert ready["selected_paper_id"] == "PAPER-open"
