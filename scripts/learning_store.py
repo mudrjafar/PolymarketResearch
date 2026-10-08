@@ -81,6 +81,19 @@ CREATE TABLE IF NOT EXISTS strategy_versions (
     payload_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS generation_ingestions (
+    generation_id TEXT PRIMARY KEY,
+    version_id TEXT NOT NULL,
+    source_generated_at TEXT NOT NULL,
+    risk_generated_at TEXT NOT NULL,
+    risk_markets_checked INTEGER NOT NULL,
+    risk_passed INTEGER NOT NULL,
+    signals_ingested INTEGER NOT NULL,
+    ingested_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    FOREIGN KEY (version_id) REFERENCES strategy_versions(version_id)
+);
+
 CREATE TABLE IF NOT EXISTS signal_observations (
     signal_id TEXT PRIMARY KEY,
     version_id TEXT NOT NULL,
@@ -210,10 +223,14 @@ CREATE TABLE IF NOT EXISTS market_outcomes (
     UNIQUE (condition_id, token_id)
 );
 
+CREATE INDEX IF NOT EXISTS idx_generation_version
+    ON generation_ingestions(version_id, source_generated_at);
 CREATE INDEX IF NOT EXISTS idx_signal_market
     ON signal_observations(condition_id, token_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_signal_version
     ON signal_observations(version_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_risk_decision
+    ON risk_decisions(decision, checked_at);
 CREATE INDEX IF NOT EXISTS idx_focus_market
     ON focus_events(condition_id, token_id, event_at);
 CREATE INDEX IF NOT EXISTS idx_ready_selection
@@ -327,6 +344,45 @@ class LearningStore:
         )
         return version_id
 
+    def generation_ingested(self, generation_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM generation_ingestions WHERE generation_id=?",
+            (str(generation_id),),
+        ).fetchone()
+        return row is not None
+
+    def ingested_generation_ids(self) -> set[str]:
+        return {
+            str(row["generation_id"])
+            for row in self.conn.execute(
+                "SELECT generation_id FROM generation_ingestions"
+            )
+        }
+
+    def insert_generation_ingestion(
+        self,
+        generation_id: str,
+        version_id: str,
+        row: Mapping[str, Any],
+    ):
+        values = {
+            "generation_id": str(generation_id),
+            "version_id": str(version_id),
+            "source_generated_at": str(row["source_generated_at"]),
+            "risk_generated_at": str(row["risk_generated_at"]),
+            "risk_markets_checked": int(row["risk_markets_checked"]),
+            "risk_passed": int(row["risk_passed"]),
+            "signals_ingested": int(row["signals_ingested"]),
+            "ingested_at": str(row.get("ingested_at") or _utc_now()),
+            "payload_json": _json(dict(row)),
+        }
+        return self._insert_immutable(
+            "generation_ingestions",
+            "generation_id",
+            str(generation_id),
+            values,
+        )
+
     def insert_signal_observation(self, signal_id: str, version_id: str, row: Mapping[str, Any]):
         if not str(signal_id or "").strip():
             raise LearningStoreError("signal_id is required")
@@ -352,6 +408,36 @@ class LearningStore:
         }
         return self._insert_immutable(
             "signal_observations", "signal_id", str(signal_id), values
+        )
+
+    def insert_risk_decision(
+        self,
+        risk_decision_id: str,
+        signal_id: str,
+        row: Mapping[str, Any],
+    ):
+        if not isinstance(row, Mapping):
+            raise LearningStoreError("risk decision must be an object")
+        if not isinstance(row.get("risk_ok"), bool):
+            raise LearningStoreError("risk_ok must be boolean")
+        reason_codes = row.get("reason_codes")
+        if not isinstance(reason_codes, list):
+            raise LearningStoreError("risk reason_codes must be a list")
+
+        values = {
+            "risk_decision_id": str(risk_decision_id),
+            "signal_id": str(signal_id),
+            "checked_at": str(row["checked_at"]),
+            "risk_ok": 1 if row["risk_ok"] else 0,
+            "decision": str(row["decision"]),
+            "reason_codes_json": _json(reason_codes),
+            "payload_json": _json(dict(row)),
+        }
+        return self._insert_immutable(
+            "risk_decisions",
+            "risk_decision_id",
+            str(risk_decision_id),
+            values,
         )
 
     def insert_focus_event(self, focus_event_id: str, version_id: str, row: Mapping[str, Any]):
