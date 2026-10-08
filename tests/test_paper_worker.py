@@ -143,6 +143,7 @@ def loaders():
 
 def fake_identity(condition_id, token_id):
     return {
+        "settlement_protocol": paper_settlement.PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,
         "ctf_contract": paper_settlement.CTF_CONTRACT,
         "position_collateral": paper_settlement.STANDARD_USDCE,
@@ -183,6 +184,7 @@ def test_open_requires_exact_ready_book_binding_and_marks_from_bids(monkeypatch,
     assert len(state["positions"]) == 1
     position = state["positions"][0]
     assert position["status"] == "OPEN"
+    assert position["settlement_protocol"] == paper_settlement.PROTOCOL_LEGACY_CTF
     assert position["entry"]["fee_usd"] > 0
     assert position["tokens"] < 50
     assert position["mark_status"] == "OK"
@@ -474,6 +476,7 @@ def test_legacy_open_position_identity_is_backfilled_deterministically(monkeypat
     )
 
     position = state["positions"][0]
+    assert position["settlement_protocol"] == paper_settlement.PROTOCOL_LEGACY_CTF
     assert position["settlement_family"] == paper_settlement.FAMILY_STANDARD
     assert position["ctf_contract"] == paper_settlement.CTF_CONTRACT
     assert position["position_collateral"] == paper_settlement.STANDARD_USDCE

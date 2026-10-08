@@ -232,6 +232,7 @@ def _matches_open_request(request, focus_payload):
 
 
 SETTLEMENT_IDENTITY_FIELDS = (
+    "settlement_protocol",
     "settlement_family",
     "ctf_contract",
     "position_collateral",
@@ -959,6 +960,7 @@ def self_test():
 
             def fake_identity(condition_id, token_id):
                 return {
+                    "settlement_protocol": paper_settlement.PROTOCOL_LEGACY_CTF,
                     "settlement_family": paper_settlement.FAMILY_STANDARD,
                     "ctf_contract": paper_settlement.CTF_CONTRACT,
                     "position_collateral": paper_settlement.STANDARD_USDCE,
