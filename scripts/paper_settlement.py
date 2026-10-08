@@ -38,7 +38,7 @@ SETTLEMENT_CHECK_ERROR = "SETTLEMENT_CHECK_ERROR"
 IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
 
 DEFAULT_TIMEOUT_SECONDS = 8
-_BYTES32_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+_BYTES32_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")\n_BYTES31_RE = re.compile(r"^0x[0-9a-fA-F]{62}$")
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _V2_RESERVED_BITS_MASK = ((1 << 64) - 1) << 40
 
@@ -361,9 +361,13 @@ def resolve_position_identity(
     if validate_chain:
         _assert_polygon_chain(rpc_url, timeout=timeout)
     token = _token_int(token_id)
-    if _is_protocol_v2_position_id(token_id):
+    condition_text = str(condition_id or "").strip()
+    if (
+        _BYTES31_RE.fullmatch(condition_text) is not None
+        and _is_protocol_v2_position_id(token_id)
+    ):
         raise SettlementIdentityError("UNSUPPORTED_PROTOCOL_V2")
-    condition = _condition_bytes(condition_id)
+    condition = _condition_bytes(condition_text)
 
     slots = _ctf_uint(
         "getOutcomeSlotCount(bytes32)",
