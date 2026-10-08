@@ -51,6 +51,14 @@ def save_json_atomic(path, data):
     atomic_save(path, data)
 
 
+def learning_versions_snapshot():
+    try:
+        return strategy_versions(BASE_DIR)
+    except Exception as exc:
+        print(f"[V3] Learning provenance unavailable ({type(exc).__name__})")
+        return None
+
+
 def load_required_json(path):
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -327,7 +335,7 @@ def run_once(verbose=True):
         "markets_analyzed":len(results),
         "candidates":len(watch),
         "diamonds":len(diamonds),
-        "strategy_versions":strategy_versions(BASE_DIR),
+        "strategy_versions":learning_versions_snapshot(),
     }
     save_json_atomic(GENERATION_MANIFEST_FILE,manifest)
     if verbose:
