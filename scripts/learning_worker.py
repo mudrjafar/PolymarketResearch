@@ -187,14 +187,13 @@ def run_once(*, data_dir=DATA_DIR, db_path=DB_FILE):
             or selection_result.get("finalized")
             or selection_result.get("deferred")
         ):
-            outcomes.append(
-                {
-                    "status": "SELECTION_RECONCILED",
-                    "reconciliation_status": selection_result.get("status"),
-                    **selection_result,
-                    "status": "SELECTION_RECONCILED",
-                }
+            reconciliation = dict(selection_result)
+            reconciliation["reconciliation_status"] = reconciliation.pop(
+                "status",
+                None,
             )
+            reconciliation["status"] = "SELECTION_RECONCILED"
+            outcomes.append(reconciliation)
 
     return outcomes
 
