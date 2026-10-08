@@ -80,6 +80,29 @@ def _token_int(token_id):
     return parsed
 
 
+def _outcome_index_from_label(outcome):
+    if not isinstance(outcome, str):
+        raise SettlementIdentityError("OUTCOME_LABEL_INVALID")
+    label = outcome.strip().casefold()
+    if label == "yes":
+        return 0
+    if label == "no":
+        return 1
+    raise SettlementIdentityError("OUTCOME_LABEL_INVALID")
+
+
+def validate_outcome_identity(outcome, outcome_index):
+    if (
+        not isinstance(outcome_index, int)
+        or isinstance(outcome_index, bool)
+        or outcome_index not in (0, 1)
+    ):
+        raise SettlementIdentityError("OUTCOME_INDEX_INVALID")
+    if _outcome_index_from_label(outcome) != outcome_index:
+        raise SettlementIdentityError("OUTCOME_IDENTITY_MISMATCH")
+    return True
+
+
 def _selector(signature):
     return keccak(text=signature)[:4]
 
@@ -197,7 +220,9 @@ def _latest_milestone(heimdall_url, timeout=DEFAULT_TIMEOUT_SECONDS):
         or milestone.get("borChainId")
         or ""
     ).strip()
-    if chain_id and chain_id != str(POLYGON_CHAIN_ID):
+    if not chain_id:
+        raise SettlementSourceError("HEIMDALL_CHAIN_ID_MISSING")
+    if chain_id != str(POLYGON_CHAIN_ID):
         raise SettlementSourceError("HEIMDALL_CHAIN_ID_MISMATCH")
 
     return end_block, _normalize_milestone_hash(milestone.get("hash"))
@@ -431,12 +456,14 @@ def _frozen_identity(position):
     if collateral != SUPPORTED_FAMILIES[family]:
         raise SettlementIdentityError("POSITION_COLLATERAL_MISMATCH")
 
-    try:
-        outcome_index = int(position.get("outcome_index"))
-    except (TypeError, ValueError):
-        raise SettlementIdentityError("OUTCOME_INDEX_INVALID") from None
-    if outcome_index not in (0, 1):
+    outcome_index = position.get("outcome_index")
+    if (
+        not isinstance(outcome_index, int)
+        or isinstance(outcome_index, bool)
+        or outcome_index not in (0, 1)
+    ):
         raise SettlementIdentityError("OUTCOME_INDEX_INVALID")
+    validate_outcome_identity(position.get("outcome"), outcome_index)
 
     return {
         "settlement_family": family,
@@ -532,6 +559,12 @@ def check_settlement(
             raise SettlementSourceError("PAYOUT_STRUCTURE_INVALID")
         if numerator0 + numerator1 != denominator:
             raise SettlementSourceError("PAYOUT_STRUCTURE_INVALID")
+        if (
+            frozen["settlement_family"] == FAMILY_NEGRISK
+            and (numerator0, numerator1)
+            not in ((denominator, 0), (0, denominator))
+        ):
+            raise SettlementSourceError("NEGRISK_PAYOUT_STRUCTURE_INVALID")
 
         numerator = (numerator0, numerator1)[frozen["outcome_index"]]
         return {
