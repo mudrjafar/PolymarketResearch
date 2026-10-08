@@ -140,9 +140,24 @@ def test_standard_yes_binding_and_payout():
     assert result["collateral"].lower() == STANDARD_COLLATERAL.lower()
 
 
-def test_neg_risk_no_binding_supports_fractional_payout():
+def test_standard_fractional_payout_is_supported():
     calls = []
-    rpc = resolved_rpc(212, 2, [1, 1], calls)
+    rpc = resolved_rpc(111, 2, [1, 1], calls)
+    reader = settlement_reader.SettlementReader(rpc_transport=rpc)
+
+    result = reader.read(CONDITION, "111")
+
+    assert rpc.remaining == []
+    assert result["status"] == "SETTLED"
+    assert result["market_family"] == "STANDARD"
+    assert result["outcome_index"] == 0
+    assert result["payout_numerators"] == [1, 1]
+    assert result["payout_per_token"] == 0.5
+
+
+def test_neg_risk_no_binding_uses_binary_payout():
+    calls = []
+    rpc = resolved_rpc(212, 1, [0, 1], calls)
     reader = settlement_reader.SettlementReader(rpc_transport=rpc)
 
     result = reader.read(CONDITION, "212")
@@ -152,10 +167,22 @@ def test_neg_risk_no_binding_supports_fractional_payout():
     assert result["market_family"] == "NEG_RISK"
     assert result["outcome_index"] == 1
     assert result["outcome"] == "NO"
-    assert result["payout_numerators"] == [1, 1]
+    assert result["payout_numerators"] == [0, 1]
     assert result["payout_numerator"] == 1
-    assert result["payout_per_token"] == 0.5
+    assert result["payout_per_token"] == 1.0
     assert result["collateral"].lower() == NEG_COLLATERAL.lower()
+
+
+def test_fractional_neg_risk_payout_fails_closed():
+    calls = []
+    rpc = resolved_rpc(212, 2, [1, 1], calls)
+    reader = settlement_reader.SettlementReader(rpc_transport=rpc)
+
+    with pytest.raises(
+        settlement_reader.SettlementReadError,
+        match="NEG_RISK_PAYOUT_VECTOR_INVALID",
+    ):
+        reader.read(CONDITION, "212")
 
 
 def test_unknown_token_id_fails_closed():
