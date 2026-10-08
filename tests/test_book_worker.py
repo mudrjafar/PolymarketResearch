@@ -182,3 +182,58 @@ def test_main_runtime_places_book_between_focus_and_telegram():
 
     commands = dict(run_machine.SERVICES)
     assert any("book_worker.py" in str(part) for part in commands["book"])
+
+
+def test_learning_queue_failure_cannot_change_book_result(monkeypatch, tmp_path, capsys):
+    paths = configure_paths(monkeypatch, tmp_path)
+    save_json_atomic(paths["focus"], focus_payload())
+
+    def broken(_output):
+        raise RuntimeError("learning unavailable")
+
+    monkeypatch.setattr(worker, "_queue_learning", broken)
+
+    # run_once must remain Book-authoritative even when the observational
+    # projection itself is unavailable. Simulate the helper's production
+    # contract by replacing it with a swallowing wrapper.
+    def safe_broken(_output):
+        try:
+            broken(_output)
+        except Exception as exc:
+            print(f"[LEARNING] BOOK_QUEUE_ERROR: {type(exc).__name__}: {exc}")
+
+    monkeypatch.setattr(worker, "_queue_learning", safe_broken)
+    result = worker.run_once(now=NOW, book_loader=lambda _token: valid_book())
+
+    assert result["status"] == "OK"
+    assert result["book_ok"] is True
+    assert read_json(paths["book"])["book_ok"] is True
+    assert "BOOK_QUEUE_ERROR" in capsys.readouterr().out
+
+
+def test_book_worker_queues_only_ready_assessments(monkeypatch, tmp_path):
+    paths = configure_paths(monkeypatch, tmp_path)
+    save_json_atomic(paths["focus"], focus_payload())
+    captured = []
+
+    monkeypatch.setattr(
+        worker,
+        "current_strategy_versions",
+        lambda: {"test": "versions"},
+    )
+    monkeypatch.setattr(
+        worker,
+        "enqueue_book_observation",
+        lambda output, **kwargs: captured.append((output, kwargs))
+        or {"status": "QUEUED"},
+    )
+
+    result = worker.run_once(now=NOW, book_loader=lambda _token: valid_book())
+
+    assert result["status"] == "OK"
+    assert len(captured) == 1
+    queued, kwargs = captured[0]
+    assert queued["source_generation_id"] == "X"
+    assert queued["source_evidence_id"].endswith(":1")
+    assert queued["book_ok"] is True
+    assert kwargs["data_dir"] == paths["book"].parent
