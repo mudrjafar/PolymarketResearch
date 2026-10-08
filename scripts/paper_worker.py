@@ -960,6 +960,7 @@ def self_test():
 
             def fake_identity(condition_id, token_id):
                 return {
+                    "settlement_protocol": paper_settlement.SETTLEMENT_PROTOCOL_LEGACY_CTF,
                     "settlement_family": paper_settlement.FAMILY_STANDARD,
                     "ctf_contract": paper_settlement.CTF_CONTRACT,
                     "position_collateral": paper_settlement.STANDARD_USDCE,
