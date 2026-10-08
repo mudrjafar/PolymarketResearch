@@ -1,0 +1,19 @@
+name: LD2 validation
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [ld2-diamond-risk-learning-ingestion]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest
+      - run: python -m py_compile scripts/learning_contract.py scripts/learning_store.py scripts/learning_versioning.py scripts/learning_queue.py scripts/learning_ingest.py scripts/learning_worker.py scripts/risk_worker.py run_machine.py
+      - run: python -m pytest -q tests/test_learning_contract.py tests/test_learning_store.py tests/test_learning_ingest.py
