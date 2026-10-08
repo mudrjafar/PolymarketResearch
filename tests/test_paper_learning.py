@@ -17,7 +17,7 @@ from scripts.learning_ingest import (
     ingest_paper_open_queue_file,
 )
 from scripts.learning_queue import enqueue_focus_event, enqueue_paper_open_snapshot
-from scripts.learning_store import LearningDataConflict, LearningStore
+from scripts.learning_store import LearningStore
 
 
 T0 = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
@@ -201,22 +201,39 @@ def test_paper_open_replay_is_idempotent(tmp_path):
         ).fetchone()[0] == 1
 
 
-def test_second_paper_trade_cannot_claim_same_ready(tmp_path):
+def test_multiple_successful_paper_entries_can_link_same_ready(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
     db = data / "learning.sqlite3"
 
     with LearningStore(db) as store:
-        seed_ready(store, data)
+        ready_id = seed_ready(store, data)
         first = queue_open(data, paper_open())
         ingest_paper_open_queue_file(first["path"], store=store)
 
         second = queue_open(
             data,
-            paper_open(paper_id="PAPER-other", request_id="REQ-other"),
+            paper_open(
+                opened_at=READY_AT + timedelta(seconds=8),
+                paper_id="PAPER-other",
+                request_id="REQ-other",
+            ),
         )
-        with pytest.raises(LearningDataConflict):
-            ingest_paper_open_queue_file(second["path"], store=store)
+        result = ingest_paper_open_queue_file(second["path"], store=store)
+
+        assert result["ready_id"] == ready_id
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM paper_trades WHERE ready_id=?",
+            (ready_id,),
+        ).fetchone()[0] == 2
+
+        ready = store.conn.execute(
+            "SELECT selection_status,selected_paper_id "
+            "FROM ready_opportunities WHERE ready_id=?",
+            (ready_id,),
+        ).fetchone()
+        assert ready["selection_status"] == SELECTION_SELECTED
+        assert ready["selected_paper_id"] == "PAPER-open"
 
 
 def test_open_after_ready_ended_is_rejected(tmp_path):
