@@ -655,7 +655,9 @@ class LearningStore:
                 selection_status = str(ready["selection_status"])
                 selected_paper_id = ready["selected_paper_id"]
                 if selection_status == SELECTION_SELECTED:
-                    if str(selected_paper_id or "") != str(paper_id):
+                    if selected_paper_id is not None and (
+                        str(selected_paper_id) != str(paper_id)
+                    ):
                         raise LearningDataConflict(
                             f"ready_opportunities.ready_id={ready_id} "
                             "already selected by another Paper trade"
@@ -704,6 +706,55 @@ class LearningStore:
             return inserted
         except sqlite3.IntegrityError as exc:
             raise LearningStoreError(str(exc)) from exc
+
+    def mark_ready_selected(self, ready_id: str, paper_id=None) -> bool:
+        """Record explicit user selection; Paper entry may bind later."""
+        with self.conn:
+            row = self.conn.execute(
+                "SELECT selection_status,selected_paper_id "
+                "FROM ready_opportunities WHERE ready_id=?",
+                (str(ready_id),),
+            ).fetchone()
+            if row is None:
+                raise LearningStoreError("READY opportunity not found")
+
+            current = str(row["selection_status"])
+            current_paper = row["selected_paper_id"]
+            if current == SELECTION_NOT_SELECTED:
+                raise LearningDataConflict(
+                    f"READY {ready_id} already finalized NOT_SELECTED"
+                )
+            if current == SELECTION_SELECTED:
+                if (
+                    paper_id is not None
+                    and current_paper is not None
+                    and str(current_paper) != str(paper_id)
+                ):
+                    raise LearningDataConflict(
+                        f"READY {ready_id} already selected by another Paper trade"
+                    )
+                if paper_id is not None and current_paper is None:
+                    self.conn.execute(
+                        "UPDATE ready_opportunities SET selected_paper_id=? "
+                        "WHERE ready_id=?",
+                        (str(paper_id), str(ready_id)),
+                    )
+                    return True
+                return False
+            if current != SELECTION_PENDING:
+                raise LearningStoreError("READY selection_status invalid")
+
+            self.conn.execute(
+                "UPDATE ready_opportunities "
+                "SET selection_status=?, selected_paper_id=? "
+                "WHERE ready_id=?",
+                (
+                    SELECTION_SELECTED,
+                    str(paper_id) if paper_id is not None else None,
+                    str(ready_id),
+                ),
+            )
+        return True
 
     def finalize_ready_not_selected(self, ready_id: str) -> bool:
         """Finalize one ended, still-unselected READY opportunity."""
