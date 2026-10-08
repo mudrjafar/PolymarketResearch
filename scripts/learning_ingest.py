@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import subprocess
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -23,25 +21,6 @@ DATA_DIR = BASE_DIR / "data"
 GENERATION_MANIFEST_FILE = DATA_DIR / "diamond_generation.json"
 GENERATIONS_DIR = DATA_DIR / "diamond_generations"
 RISK_FILE = DATA_DIR / "risk_assessment.json"
-
-COMPONENT_VERSION_LABELS = {
-    "pipeline_version": "pipeline-v1",
-    "diamond_version": "diamond-v3.1",
-    "risk_version": "risk-v2",
-    "focus_version": "focus-v3",
-    "book_version": "book-v1",
-    "paper_version": "paper-v1",
-}
-
-FINGERPRINT_FILES = (
-    "machine_common.py",
-    "scripts/diamond_filter_v3.py",
-    "scripts/risk_engine.py",
-    "scripts/focus_engine.py",
-    "scripts/book_engine.py",
-    "scripts/paper_engine.py",
-)
-
 
 class LearningIngestError(RuntimeError):
     pass
@@ -67,55 +46,6 @@ def _identity(row):
 def _stable_id(prefix, *parts):
     payload = "|".join(str(part) for part in parts).encode("utf-8")
     return prefix + "-" + hashlib.sha256(payload).hexdigest()[:24]
-
-
-def _git_sha(repo_root=BASE_DIR):
-    env_sha = _text(os.getenv("POLYMARKET_GIT_SHA"))
-    if env_sha:
-        return env_sha
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-        )
-    except Exception as exc:
-        raise LearningIngestError(
-            "Git commit SHA unavailable; set POLYMARKET_GIT_SHA"
-        ) from exc
-    sha = _text(result.stdout)
-    if not sha:
-        raise LearningIngestError("Git commit SHA unavailable")
-    return sha
-
-
-def _config_fingerprint(repo_root=BASE_DIR):
-    digest = hashlib.sha256()
-    for relative in FINGERPRINT_FILES:
-        path = Path(repo_root) / relative
-        try:
-            payload = path.read_bytes()
-        except OSError as exc:
-            raise LearningIngestError(
-                f"strategy fingerprint source unavailable: {relative}"
-            ) from exc
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(payload)
-        digest.update(b"\0")
-    return "CFG-" + digest.hexdigest()[:24]
-
-
-def build_strategy_versions(repo_root=BASE_DIR):
-    return {
-        **COMPONENT_VERSION_LABELS,
-        "learning_schema_version": LEARNING_SCHEMA_VERSION,
-        "git_commit_sha": _git_sha(repo_root),
-        "config_fingerprint": _config_fingerprint(repo_root),
-    }
 
 
 def _signal_payload(row, generation_id, published_at, rank):
@@ -222,19 +152,41 @@ def ingest_generation(
             raise LearningIngestError("Duplicate Risk result identity")
         by_identity[key] = row
 
-    version_id = store.register_strategy_version(versions)
-    inserted_signals = 0
-    inserted_risks = 0
-
+    analysis_rows = []
+    analysis_identities = set()
     for rank, row in enumerate(analysis, start=1):
         if not isinstance(row, Mapping):
             raise LearningIngestError("Diamond analysis row must be an object")
         key = _identity(row)
         if not all(key):
             raise LearningIngestError("Diamond signal identity incomplete")
-        risk_row = by_identity.get(key)
-        if risk_row is None:
+        if key in analysis_identities:
+            raise LearningIngestError("Duplicate Diamond signal identity")
+        analysis_identities.add(key)
+        analysis_rows.append((rank, row, key))
+
+    risk_identities = set(by_identity)
+    if risk_identities != analysis_identities:
+        missing = analysis_identities - risk_identities
+        extra = risk_identities - analysis_identities
+        if missing:
             raise LearningIngestError("Risk result missing for Diamond observation")
+        if extra:
+            raise LearningIngestError("Risk result has no Diamond observation")
+        raise LearningIngestError("Risk/Diamond observation mismatch")
+
+    version_id = store.register_strategy_version(versions)
+    inserted_signals = 0
+    inserted_risks = 0
+
+    for rank, row, key in analysis_rows:
+        risk_row = by_identity[key]
+        if not _text(risk_row.get("checked_at")):
+            raise LearningIngestError("Risk checked_at missing")
+        if risk_row.get("risk_ok") not in (True, False):
+            raise LearningIngestError("Risk decision boolean missing")
+        if _text(risk_row.get("decision")) not in {"PASS", "BLOCK"}:
+            raise LearningIngestError("Risk decision invalid")
 
         signal_id = _stable_id(
             "SIG", generation_id, key[0], key[1], key[2]
@@ -247,11 +199,6 @@ def ingest_generation(
         risk = _risk_payload(risk_row)
         if store.insert_risk_decision(risk_decision_id, signal_id, risk):
             inserted_risks += 1
-
-    if len(by_identity) != len(analysis):
-        raise LearningIngestError(
-            "Risk/Diamond observation count mismatch"
-        )
 
     return {
         "generation_id": generation_id,
@@ -279,7 +226,11 @@ def ingest_latest(
     analysis = _read_json(generation_dir / "diamond_analysis_v3.json")
     risk_payload = _read_json(risk_file)
 
-    versions = versions or build_strategy_versions(BASE_DIR)
+    versions = versions or manifest.get("strategy_versions")
+    if not isinstance(versions, Mapping):
+        raise LearningIngestError(
+            "Diamond generation lacks frozen strategy_versions"
+        )
     with LearningStore(db_file) as store:
         return ingest_generation(
             manifest,
