@@ -225,3 +225,72 @@ def enqueue_book_observation(observation, *, data_dir, strategy_versions):
         "book_observation_id": observation_id,
         "path": str(target),
     }
+
+
+def paper_open_snapshot_id(snapshot):
+    if not isinstance(snapshot, Mapping):
+        raise LearningQueueError("Paper OPEN snapshot must be an object")
+    required = (
+        "paper_id",
+        "open_request_id",
+        "opened_at",
+        "source_generation_id",
+        "source_evidence_id",
+        "condition_id",
+        "token_id",
+    )
+    for field in required:
+        if not _text(snapshot.get(field)):
+            raise LearningQueueError(f"Paper OPEN snapshot {field} missing")
+
+    raw = "\x00".join(
+        [
+            _text(snapshot.get("paper_id")),
+            _text(snapshot.get("open_request_id")),
+            _text(snapshot.get("opened_at")),
+            _text(snapshot.get("source_generation_id")),
+            _text(snapshot.get("source_evidence_id")),
+            _text(snapshot.get("condition_id")),
+            _text(snapshot.get("token_id")),
+        ]
+    ).encode("utf-8")
+    return "PAPEROPEN-" + hashlib.sha256(raw).hexdigest()[:24]
+
+
+def enqueue_paper_open_snapshot(snapshot, *, data_dir, strategy_versions):
+    """Queue one successful Paper OPEN for Learning only."""
+    if not isinstance(snapshot, Mapping):
+        raise LearningQueueError("Paper OPEN snapshot must be an object")
+    if not isinstance(strategy_versions, Mapping):
+        raise LearningQueueError("strategy_versions must be an object")
+
+    snapshot_id = paper_open_snapshot_id(snapshot)
+    payload = {
+        "schema_version": 1,
+        "paper_open_snapshot_id": snapshot_id,
+        "strategy_versions": dict(strategy_versions),
+        "paper_open": dict(snapshot),
+    }
+
+    queue_dir = Path(data_dir) / "learning_queue"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    target = queue_dir / f"paper_open_{snapshot_id}.json"
+
+    if target.exists():
+        existing = _read_json(target)
+        if existing != payload:
+            raise LearningQueueError(
+                f"Paper OPEN learning queue conflict for {snapshot_id}"
+            )
+        return {
+            "status": "ALREADY_QUEUED",
+            "paper_open_snapshot_id": snapshot_id,
+            "path": str(target),
+        }
+
+    save_json_atomic(target, payload)
+    return {
+        "status": "QUEUED",
+        "paper_open_snapshot_id": snapshot_id,
+        "path": str(target),
+    }
