@@ -263,12 +263,23 @@ def _apply_settlement_identity(position, identity):
 
 def _ensure_settlement_identity(position, identity_loader):
     if all(position.get(field) is not None for field in SETTLEMENT_IDENTITY_FIELDS):
-        return True, None, None
+        try:
+            paper_settlement.validate_outcome_identity(
+                position.get("outcome"),
+                position.get("outcome_index"),
+            )
+            return True, None, None
+        except paper_settlement.SettlementIdentityError as exc:
+            return False, paper_settlement.IDENTITY_MISMATCH, str(exc)
 
     try:
         identity = identity_loader(
             position.get("condition_id"),
             position.get("token_id"),
+        )
+        paper_settlement.validate_outcome_identity(
+            position.get("outcome"),
+            identity.get("outcome_index"),
         )
         _apply_settlement_identity(position, identity)
         return True, None, None
@@ -498,6 +509,10 @@ def _process_open(
 
     try:
         settlement_identity = identity_loader(condition_id, token_id)
+        paper_settlement.validate_outcome_identity(
+            focus.get("outcome"),
+            settlement_identity.get("outcome_index"),
+        )
         identity_probe = {}
         _apply_settlement_identity(identity_probe, settlement_identity)
     except paper_settlement.SettlementIdentityError as exc:
