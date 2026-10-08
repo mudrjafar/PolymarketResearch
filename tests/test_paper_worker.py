@@ -10,6 +10,37 @@ from scripts import paper_worker
 NOW = datetime.now(timezone.utc)
 
 
+def settlement_binding():
+    return {
+        "source": "POLYGON_FINALIZED_CTF",
+        "chain_id": 137,
+        "ctf_contract": "0xctf",
+        "condition_id": "condition-a",
+        "token_id": "token-a",
+        "market_family": "STANDARD_CTF_V2",
+        "exchange_contract": "0xexchange",
+        "ctf_collateral": "0xcollateral",
+        "outcome_index": 0,
+        "index_set": 1,
+        "verified_block_number": 100,
+        "verified_block_hash": "0x" + "11" * 32,
+    }
+
+
+def unresolved_resolution(position):
+    binding = position["settlement_binding"]
+    return {
+        **binding,
+        "status": "UNRESOLVED",
+        "finalized_block_number": 101,
+        "finalized_block_hash": "0x" + "22" * 32,
+        "payout_denominator": 0,
+        "payout_numerators": None,
+        "payout_numerator": None,
+        "payout_per_token": None,
+    }
+
+
 def configure(monkeypatch, tmp_path):
     data = tmp_path / "data"
     request_dir = data / "paper_requests"
@@ -30,6 +61,16 @@ def configure(monkeypatch, tmp_path):
     monkeypatch.setattr(paper_worker, "REQUEST_DIR", paths["requests"], raising=False)
     monkeypatch.setattr(paper_worker, "STATE_FILE", paths["state"], raising=False)
     monkeypatch.setattr(paper_worker, "EVENTS_FILE", paths["events"], raising=False)
+    monkeypatch.setattr(
+        paper_worker.settlement_resolver,
+        "bind_position",
+        lambda token_id, condition_id: settlement_binding(),
+    )
+    monkeypatch.setattr(
+        paper_worker.settlement_resolver,
+        "check_position",
+        unresolved_resolution,
+    )
     return paths
 
 
@@ -292,3 +333,159 @@ def test_runtime_orders_book_before_paper_before_telegram():
     telegram_index = source.index('("telegram",')
 
     assert book_index < paper_index < telegram_index
+
+
+def test_open_persists_finalized_ctf_settlement_binding(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    book_loader, market_loader = loaders()
+
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=book_loader,
+        market_info_loader=market_loader,
+    )
+
+    assert events[0]["type"] == "OPENED"
+    position = state["positions"][0]
+    assert position["status"] == "OPEN"
+    assert position["settlement_binding"]["source"] == "POLYGON_FINALIZED_CTF"
+    assert position["settlement_binding"]["outcome_index"] == 0
+    assert position["settlement_binding"]["index_set"] == 1
+    assert position["settlement_status"] == "UNRESOLVED"
+
+
+def test_resolved_position_settles_before_book_fetch_with_fractional_payout(
+    monkeypatch,
+    tmp_path,
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    book_loader, market_loader = loaders()
+
+    state, _ = paper_worker.run_once(
+        now=NOW,
+        book_loader=book_loader,
+        market_info_loader=market_loader,
+    )
+    tokens = state["positions"][0]["tokens"]
+
+    def resolved(position):
+        return {
+            **position["settlement_binding"],
+            "status": "RESOLVED",
+            "finalized_block_number": 102,
+            "finalized_block_hash": "0x" + "33" * 32,
+            "payout_denominator": 2,
+            "payout_numerators": [1, 1],
+            "payout_numerator": 1,
+            "payout_per_token": 0.5,
+        }
+
+    monkeypatch.setattr(
+        paper_worker.settlement_resolver,
+        "check_position",
+        resolved,
+    )
+
+    def forbidden_book(_):
+        raise AssertionError("book must not be fetched after finalized resolution")
+
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=forbidden_book,
+        market_info_loader=market_loader,
+    )
+
+    settled = [event for event in events if event["type"] == "SETTLED"]
+    assert len(settled) == 1
+    position = state["positions"][0]
+    assert position["status"] == "SETTLED"
+    assert position["settlement_status"] == "SETTLED"
+    assert position["settlement"]["payout_per_token"] == 0.5
+    assert position["settlement"]["payout_denominator"] == 2
+    assert position["settlement"]["settlement_value_usd"] == round(tokens * 0.5, 8)
+    assert position["mark_status"] == "SETTLED"
+    assert "exit" not in position
+    assert position["realized_pnl_usd"] == round(tokens * 0.5 - 25.0, 8)
+
+
+def test_settlement_source_error_keeps_position_open_and_book_mark_available(
+    monkeypatch,
+    tmp_path,
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    book_loader, market_loader = loaders()
+
+    state, _ = paper_worker.run_once(
+        now=NOW,
+        book_loader=book_loader,
+        market_info_loader=market_loader,
+    )
+
+    def broken(_):
+        raise RuntimeError("RPC_DOWN")
+
+    monkeypatch.setattr(
+        paper_worker.settlement_resolver,
+        "check_position",
+        broken,
+    )
+
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=book_loader,
+        market_info_loader=market_loader,
+    )
+
+    assert not [event for event in events if event["type"] == "SETTLED"]
+    position = state["positions"][0]
+    assert position["status"] == "OPEN"
+    assert position["settlement_status"] == "SETTLEMENT_CHECK_ERROR"
+    assert position["settlement_error"] == "RPC_DOWN"
+    assert position["mark_status"] == "OK"
+
+
+def test_legacy_open_position_backfills_binding_before_settlement_check(
+    monkeypatch,
+    tmp_path,
+):
+    paths = configure(monkeypatch, tmp_path)
+    state = paper_worker.new_state(NOW)
+    state["positions"].append(
+        {
+            "paper_id": "PAPER-legacy",
+            "request_id": "REQ-legacy",
+            "status": "OPEN",
+            "opened_at": NOW.isoformat(),
+            "token_id": "token-a",
+            "condition_id": "condition-a",
+            "outcome": "Yes",
+            "question": "Market A",
+            "direction": "BUY",
+            "investment_usd": 25.0,
+            "tokens": 50.0,
+            "fee_rate": 0.0,
+            "fee_exponent": 0.0,
+            "entry": {},
+            "mark_status": "PENDING",
+            "mark_checked_at": None,
+            "mark": None,
+        }
+    )
+    save_json_atomic(paths["state"], state)
+
+    state, _ = paper_worker.run_once(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+
+    position = state["positions"][0]
+    assert position["status"] == "OPEN"
+    assert position["settlement_binding"]["source"] == "POLYGON_FINALIZED_CTF"
+    assert position["settlement_status"] == "UNRESOLVED"
