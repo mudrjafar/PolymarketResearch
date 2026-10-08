@@ -80,29 +80,6 @@ def _token_int(token_id):
     return parsed
 
 
-def _outcome_index_from_label(outcome):
-    if not isinstance(outcome, str):
-        raise SettlementIdentityError("OUTCOME_LABEL_INVALID")
-    label = outcome.strip().casefold()
-    if label == "yes":
-        return 0
-    if label == "no":
-        return 1
-    raise SettlementIdentityError("OUTCOME_LABEL_INVALID")
-
-
-def validate_outcome_identity(outcome, outcome_index):
-    if (
-        not isinstance(outcome_index, int)
-        or isinstance(outcome_index, bool)
-        or outcome_index not in (0, 1)
-    ):
-        raise SettlementIdentityError("OUTCOME_INDEX_INVALID")
-    if _outcome_index_from_label(outcome) != outcome_index:
-        raise SettlementIdentityError("OUTCOME_IDENTITY_MISMATCH")
-    return True
-
-
 def _selector(signature):
     return keccak(text=signature)[:4]
 
