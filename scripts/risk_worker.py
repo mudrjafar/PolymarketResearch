@@ -17,11 +17,9 @@ from scripts import risk_engine
 
 try:
     from scripts.learning_queue import enqueue_risk_snapshot
-    from scripts.learning_versioning import runtime_strategy_versions
     _LEARNING_INIT_ERROR = None
 except Exception as exc:  # Learning must never prevent Risk from starting.
     enqueue_risk_snapshot = None
-    runtime_strategy_versions = None
     _LEARNING_INIT_ERROR = f"{type(exc).__name__}: {exc}"
 
 DEFAULT_INTERVAL_SECONDS = 5
@@ -35,10 +33,13 @@ def _publish_learning_snapshot():
         payload = risk_engine.existing_risk_output()
         if not isinstance(payload, dict):
             return
+        versions = payload.get("strategy_versions")
+        if not isinstance(versions, dict):
+            return
         result = enqueue_risk_snapshot(
             payload,
             data_dir=risk_engine.DATA_DIR,
-            strategy_versions=runtime_strategy_versions(),
+            strategy_versions=versions,
         )
         if result.get("status") == "QUEUED":
             print(

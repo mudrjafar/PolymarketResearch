@@ -55,6 +55,15 @@ def existing_risk_output():
     return None
 
 
+def learning_strategy_versions():
+    """Best-effort provenance only; Risk authority must never depend on it."""
+    try:
+        from scripts.learning_versioning import runtime_strategy_versions
+        return runtime_strategy_versions()
+    except Exception:
+        return None
+
+
 def text(value):
     return "" if value is None else str(value).strip()
 
@@ -395,6 +404,7 @@ def run_once(verbose=True):
         "source_generation_id": generation_id,
         "source_generated_at": source_generated_at,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "strategy_versions": learning_strategy_versions(),
         "markets_checked": len(results),
         "passed": len(passed),
         "results": results,
