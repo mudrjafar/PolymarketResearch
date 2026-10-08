@@ -24,6 +24,15 @@ sys.path.insert(0, str(BASE_DIR))
 from machine_common import fresh, save_json_atomic
 from scripts import book_engine, book_worker, paper_engine, paper_settlement
 
+try:
+    from scripts.learning_queue import enqueue_paper_open_snapshot
+    from scripts.learning_versioning import runtime_strategy_versions
+    _LEARNING_IMPORT_ERROR = None
+except Exception as exc:
+    enqueue_paper_open_snapshot = None
+    runtime_strategy_versions = None
+    _LEARNING_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
 DATA_DIR = BASE_DIR / "data"
 FOCUS_FILE = DATA_DIR / "focused_market.json"
 BOOK_FILE = DATA_DIR / "book_assessment.json"
@@ -37,6 +46,7 @@ DEFAULT_INTERVAL_SECONDS = 5
 DEFAULT_TIMEOUT_SECONDS = 5
 ALLOWED_OPEN_AMOUNTS = (25.0, 50.0, 100.0)
 MAX_PROCESSED_REQUEST_IDS = 1000
+_LEARNING_QUEUE_ERROR = None
 
 
 class PaperStateError(RuntimeError):
@@ -475,6 +485,88 @@ def _reject(request_id, now, reason):
     )
 
 
+def _learning_versions_at_open():
+    if _LEARNING_IMPORT_ERROR is not None or runtime_strategy_versions is None:
+        return None
+    try:
+        return runtime_strategy_versions()
+    except Exception:
+        return None
+
+
+def _learning_open_snapshot(position):
+    if not isinstance(position, dict):
+        return None
+    versions = position.get("learning_strategy_versions")
+    if not isinstance(versions, dict):
+        return None
+
+    entry = position.get("entry")
+    if not isinstance(entry, dict):
+        return None
+
+    return {
+        "paper_id": position.get("paper_id"),
+        "open_request_id": position.get("request_id"),
+        "opened_at": position.get("opened_at"),
+        "status": "OPEN",
+        "condition_id": position.get("condition_id"),
+        "token_id": position.get("token_id"),
+        "outcome": position.get("outcome"),
+        "question": position.get("question"),
+        "direction": position.get("direction"),
+        "source_generation_id": position.get("source_generation_id"),
+        "source_evidence_id": position.get("source_evidence_id"),
+        "focus_locked_at": position.get("focus_locked_at"),
+        "investment_usd": position.get("investment_usd"),
+        "tokens": position.get("tokens"),
+        "fee_rate": position.get("fee_rate"),
+        "fee_exponent": position.get("fee_exponent"),
+        "settlement_protocol": position.get("settlement_protocol"),
+        "settlement_family": position.get("settlement_family"),
+        "ctf_contract": position.get("ctf_contract"),
+        "position_collateral": position.get("position_collateral"),
+        "outcome_index": position.get("outcome_index"),
+        "entry": dict(entry),
+    }
+
+
+def _queue_learning_open_positions(state, now):
+    """Best-effort durable projection after Paper authority is committed."""
+    global _LEARNING_QUEUE_ERROR
+    if enqueue_paper_open_snapshot is None:
+        return False
+
+    changed = False
+    for position in state.get("positions", []):
+        if not isinstance(position, dict):
+            continue
+        if position.get("learning_open_queued_at"):
+            continue
+
+        snapshot = _learning_open_snapshot(position)
+        versions = position.get("learning_strategy_versions")
+        if snapshot is None or not isinstance(versions, dict):
+            continue
+
+        try:
+            enqueue_paper_open_snapshot(
+                snapshot,
+                data_dir=DATA_DIR,
+                strategy_versions=versions,
+            )
+            position["learning_open_queued_at"] = now.isoformat()
+            changed = True
+            _LEARNING_QUEUE_ERROR = None
+        except Exception as exc:
+            signature = f"{type(exc).__name__}: {exc}"
+            if signature != _LEARNING_QUEUE_ERROR:
+                print(f"[LEARNING] PAPER_QUEUE_ERROR: {signature}")
+                _LEARNING_QUEUE_ERROR = signature
+
+    return changed
+
+
 def _process_open(
     state,
     request_id,
@@ -593,6 +685,8 @@ def _process_open(
         "source_generation_id": focus_payload.get("source_generation_id"),
         "source_evidence_id": focus.get("last_evidence_id"),
         "focus_locked_at": focus.get("locked_at"),
+        "learning_strategy_versions": _learning_versions_at_open(),
+        "learning_open_queued_at": None,
         **settlement_identity,
         "settlement_status": None,
         "settlement_checked_at": None,
@@ -822,6 +916,11 @@ def run_once(
 
     save_json_atomic(STATE_FILE, state)
     _append_events(events)
+
+    # Learning is downstream of committed Paper authority. A queue failure
+    # cannot reject, close, or otherwise alter the Paper trade.
+    if _queue_learning_open_positions(state, now):
+        save_json_atomic(STATE_FILE, state)
 
     return state, events
 

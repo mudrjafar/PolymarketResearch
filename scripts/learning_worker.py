@@ -16,8 +16,10 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 from scripts.learning_ingest import (
+    finalize_ready_selection_from_paper_state,
     ingest_book_queue_file,
     ingest_focus_queue_file,
+    ingest_paper_open_queue_file,
     ingest_queue_file,
 )
 from scripts.learning_store import LearningStore
@@ -153,6 +155,46 @@ def run_once(*, data_dir=DATA_DIR, db_path=DB_FILE):
                 except OSError:
                     pass
 
+        # Paper OPEN attribution runs after READY/Book ingestion. Missing READY
+        # remains retryable and never mutates Paper authority.
+        for path in sorted(queue_dir.glob("paper_open_*.json")):
+            try:
+                result = ingest_paper_open_queue_file(path, store=store)
+            except Exception as exc:
+                outcomes.append(
+                    {
+                        "status": "ERROR",
+                        "paper_open_snapshot_id": None,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "queue_file": path.name,
+                    }
+                )
+                continue
+
+            outcomes.append(result)
+            if result.get("status") in {"INGESTED", "ALREADY_INGESTED"}:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+        selection_result = finalize_ready_selection_from_paper_state(
+            data_dir=data_dir,
+            store=store,
+        )
+        if (
+            selection_result.get("selected")
+            or selection_result.get("finalized")
+            or selection_result.get("deferred")
+        ):
+            reconciliation = dict(selection_result)
+            reconciliation["reconciliation_status"] = reconciliation.pop(
+                "status",
+                None,
+            )
+            reconciliation["status"] = "SELECTION_RECONCILED"
+            outcomes.append(reconciliation)
+
     return outcomes
 
 
@@ -167,7 +209,18 @@ def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
             for row in outcomes:
                 status = row.get("status")
                 generation_id = row.get("generation_id") or "?"
-                if status == "INGESTED" and row.get("book_decision_id"):
+                if status == "INGESTED" and row.get("paper_id"):
+                    print(
+                        f"[LEARNING] PAPER_OPEN paper={row.get('paper_id')} "
+                        f"ready={row.get('ready_id')}"
+                    )
+                elif status == "SELECTION_RECONCILED":
+                    print(
+                        f"[LEARNING] SELECTION selected={row.get('selected', 0)} "
+                        f"finalized={row.get('finalized', 0)} "
+                        f"deferred={row.get('deferred', 0)}"
+                    )
+                elif status == "INGESTED" and row.get("book_decision_id"):
                     print(
                         f"[LEARNING] BOOK status={row.get('book_status')} "
                         f"ready={row.get('ready_id')} "
