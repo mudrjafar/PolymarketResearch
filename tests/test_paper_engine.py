@@ -134,3 +134,24 @@ def test_settlement_math_rejects_invalid_payouts():
 
     with pytest.raises(ValueError, match="PAYOUT_STRUCTURE_INVALID"):
         paper_engine.calculate_settlement(40, 25, 0, 0)
+
+
+@pytest.mark.parametrize("bad_numerator,bad_denominator", [
+    (1.0, 2),
+    ("1", 2),
+    (1, 2.0),
+    (1, "2"),
+    (True, 2),
+    (1, False),
+])
+def test_settlement_payout_structure_requires_real_integers(
+    bad_numerator,
+    bad_denominator,
+):
+    with pytest.raises(ValueError, match="PAYOUT_STRUCTURE_INVALID"):
+        paper_engine.calculate_settlement(
+            10.0,
+            5.0,
+            bad_numerator,
+            bad_denominator,
+        )
