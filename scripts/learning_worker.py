@@ -140,16 +140,16 @@ def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
             for row in outcomes:
                 status = row.get("status")
                 generation_id = row.get("generation_id") or "?"
-                if status == "INGESTED":
-                    print(
-                        f"[LEARNING] INGESTED generation={generation_id} "
-                        f"signals={row.get('signals_ingested', 0)}"
-                    )
-                elif status == "INGESTED" and row.get("focus_event_id"):
+                if status == "INGESTED" and row.get("focus_event_id"):
                     print(
                         f"[LEARNING] FOCUS {row.get('event_type')} "
                         f"token={row.get('token_id')} "
                         f"event={row.get('focus_event_id')}"
+                    )
+                elif status == "INGESTED":
+                    print(
+                        f"[LEARNING] INGESTED generation={generation_id} "
+                        f"signals={row.get('signals_ingested', 0)}"
                     )
                 elif status == "ERROR":
                     signature = (
