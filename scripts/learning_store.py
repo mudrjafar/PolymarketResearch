@@ -655,13 +655,10 @@ class LearningStore:
                 selection_status = str(ready["selection_status"])
                 selected_paper_id = ready["selected_paper_id"]
                 if selection_status == SELECTION_SELECTED:
-                    if selected_paper_id is not None and (
-                        str(selected_paper_id) != str(paper_id)
-                    ):
-                        raise LearningDataConflict(
-                            f"ready_opportunities.ready_id={ready_id} "
-                            "already selected by another Paper trade"
-                        )
+                    # One READY may legitimately produce multiple user Paper
+                    # entries after a manual close/re-open cycle. The READY's
+                    # selected_paper_id remains the first successful entry.
+                    pass
                 elif selection_status == SELECTION_NOT_SELECTED:
                     raise LearningDataConflict(
                         f"ready_opportunities.ready_id={ready_id} "
@@ -695,7 +692,8 @@ class LearningStore:
 
                 self.conn.execute(
                     "UPDATE ready_opportunities "
-                    "SET selection_status=?, selected_paper_id=? "
+                    "SET selection_status=?, "
+                    "selected_paper_id=COALESCE(selected_paper_id, ?) "
                     "WHERE ready_id=?",
                     (
                         SELECTION_SELECTED,
@@ -725,14 +723,6 @@ class LearningStore:
                     f"READY {ready_id} already finalized NOT_SELECTED"
                 )
             if current == SELECTION_SELECTED:
-                if (
-                    paper_id is not None
-                    and current_paper is not None
-                    and str(current_paper) != str(paper_id)
-                ):
-                    raise LearningDataConflict(
-                        f"READY {ready_id} already selected by another Paper trade"
-                    )
                 if paper_id is not None and current_paper is None:
                     self.conn.execute(
                         "UPDATE ready_opportunities SET selected_paper_id=? "
