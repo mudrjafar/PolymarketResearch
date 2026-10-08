@@ -22,6 +22,8 @@ CTF_CONTRACT = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
 STANDARD_USDCE = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 NEGRISK_WRAPPED_COLLATERAL = "0x3a3bd7bb9528e159577f7c2e685cc81a765002e2"
 
+PROTOCOL_LEGACY_CTF = "LEGACY_CTF"
+
 FAMILY_STANDARD = "CTF_STANDARD"
 FAMILY_NEGRISK = "CTF_NEGRISK"
 SUPPORTED_FAMILIES = {
@@ -38,6 +40,7 @@ IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
 DEFAULT_TIMEOUT_SECONDS = 8
 _BYTES32_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_V2_RESERVED_BITS_MASK = ((1 << 64) - 1) << 40
 
 
 class SettlementSourceError(RuntimeError):
@@ -78,6 +81,12 @@ def _token_int(token_id):
     if parsed < 0:
         raise SettlementIdentityError("TOKEN_ID_INVALID")
     return parsed
+
+
+def _is_protocol_v2_position_id(token_id):
+    """Mirror Polymarket's reserved-bit namespace check for protocol-v2 position IDs."""
+    token = _token_int(token_id)
+    return (token & _V2_RESERVED_BITS_MASK) == 0
 
 
 def _selector(signature):
@@ -351,8 +360,10 @@ def resolve_position_identity(
     rpc_url = str(rpc_url or os.getenv("POLYMARKET_RPC_URL", "")).strip()
     if validate_chain:
         _assert_polygon_chain(rpc_url, timeout=timeout)
-    condition = _condition_bytes(condition_id)
     token = _token_int(token_id)
+    if _is_protocol_v2_position_id(token_id):
+        raise SettlementIdentityError("UNSUPPORTED_PROTOCOL_V2")
+    condition = _condition_bytes(condition_id)
 
     slots = _ctf_uint(
         "getOutcomeSlotCount(bytes32)",
@@ -395,6 +406,7 @@ def resolve_position_identity(
             if candidate == token:
                 matches.append(
                     {
+                        "settlement_protocol": PROTOCOL_LEGACY_CTF,
                         "settlement_family": family,
                         "ctf_contract": CTF_CONTRACT,
                         "position_collateral": collateral,
@@ -413,6 +425,11 @@ def resolve_position_identity(
 def _frozen_identity(position):
     if not isinstance(position, dict):
         raise SettlementIdentityError("POSITION_INVALID")
+
+    protocol = str(position.get("settlement_protocol") or "").strip()
+    if protocol != PROTOCOL_LEGACY_CTF:
+        raise SettlementIdentityError("SETTLEMENT_PROTOCOL_INVALID")
+
     family = str(position.get("settlement_family") or "").strip()
     if family not in SUPPORTED_FAMILIES:
         raise SettlementIdentityError("SETTLEMENT_FAMILY_INVALID")
@@ -439,6 +456,7 @@ def _frozen_identity(position):
         raise SettlementIdentityError("OUTCOME_INDEX_INVALID")
 
     return {
+        "settlement_protocol": protocol,
         "settlement_family": family,
         "ctf_contract": ctf_contract,
         "position_collateral": collateral,
