@@ -1,0 +1,36 @@
+name: Paper Settlement Validation
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        shell: cmd
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Targeted Paper settlement tests
+        shell: cmd
+        run: python -m pytest -q tests/test_paper_engine.py tests/test_paper_settlement.py tests/test_paper_worker.py tests/test_telegram_focus_book.py
+
+      - name: Full project tests
+        shell: cmd
+        run: python -m pytest -q
+
+      - name: Machine self-test
+        shell: cmd
+        run: python run_machine.py --self-test
