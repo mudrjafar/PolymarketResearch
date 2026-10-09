@@ -575,6 +575,7 @@ def _process_open(
     book_loader,
     market_info_loader,
     identity_loader,
+    settlement_checker,
 ):
     amount = request.get("amount_usd")
     try:
@@ -610,7 +611,11 @@ def _process_open(
             focus.get("outcome"),
             settlement_identity.get("outcome_index"),
         )
-        identity_probe = {}
+        identity_probe = {
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "outcome": focus.get("outcome"),
+        }
         _apply_settlement_identity(identity_probe, settlement_identity)
     except paper_settlement.SettlementIdentityError as exc:
         return _reject(
@@ -667,6 +672,39 @@ def _process_open(
 
     if entry.get("complete") is not True or float(entry.get("net_tokens") or 0) <= 0:
         return _reject(request_id, now, "ENTRY_NOT_FULLY_EXECUTABLE")
+
+    # A fresh CLOB quote does not establish that a market is still unresolved.
+    # Only finalized on-chain CTF state may authorize a new Paper entry.
+    settlement_probe = {
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "outcome": focus.get("outcome"),
+        **settlement_identity,
+    }
+    try:
+        settlement = settlement_checker(settlement_probe)
+    except Exception as exc:
+        return _reject(
+            request_id,
+            now,
+            f"SETTLEMENT_CHECK_ERROR_{type(exc).__name__}",
+        )
+
+    if not isinstance(settlement, dict):
+        return _reject(request_id, now, "SETTLEMENT_RESPONSE_INVALID")
+    if settlement.get("status") != paper_settlement.UNRESOLVED:
+        status = str(settlement.get("status") or "UNKNOWN").strip()
+        if status not in {
+            paper_settlement.FINAL_SETTLED,
+            paper_settlement.RESOLVED_NOT_FINAL,
+            paper_settlement.SETTLEMENT_CHECK_ERROR,
+            paper_settlement.IDENTITY_MISMATCH,
+        }:
+            status = "UNKNOWN"
+        return _reject(request_id, now, f"SETTLEMENT_{status}")
+    if settlement.get("reason_code") is not None:
+        reason = str(settlement.get("reason_code") or "UNKNOWN").strip()
+        return _reject(request_id, now, f"SETTLEMENT_UNRESOLVED_{reason}")
 
     suffix = request_id.split("-", 1)[-1]
     paper_id = f"PAPER-{suffix}"
@@ -866,6 +904,7 @@ def run_once(
                 book_loader,
                 market_info_loader,
                 identity_loader,
+                settlement_checker,
             )
         elif request.get("action") == "CLOSE":
             event = _process_close(
