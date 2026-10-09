@@ -211,6 +211,72 @@ def test_focus_wait_rejects_open_without_fetching_execution_book(monkeypatch, tm
     assert events[0]["reason_code"] == "FOCUS_NOT_READY"
 
 
+@pytest.mark.parametrize(
+    ("settlement", "expected_reason"),
+    [
+        (lambda position: final_settlement(position), "SETTLEMENT_FINAL_SETTLED"),
+        (lambda position: resolved_not_final(position), "SETTLEMENT_RESOLVED_NOT_FINAL"),
+        (lambda position: settlement_error(position), "SETTLEMENT_SETTLEMENT_CHECK_ERROR"),
+        (
+            lambda _: {
+                "status": paper_settlement.UNRESOLVED,
+                "reason_code": "LATEST_DIAGNOSTIC_UNAVAILABLE",
+            },
+            "SETTLEMENT_UNRESOLVED_LATEST_DIAGNOSTIC_UNAVAILABLE",
+        ),
+        (lambda _: {"status": "UNRECOGNIZED"}, "SETTLEMENT_UNKNOWN"),
+        (lambda _: None, "SETTLEMENT_RESPONSE_INVALID"),
+        (lambda _: (_ for _ in ()).throw(RuntimeError("offline")),
+         "SETTLEMENT_CHECK_ERROR_RuntimeError"),
+    ],
+)
+def test_open_rejects_resolved_unknown_or_unavailable_settlement(
+    monkeypatch, tmp_path, settlement, expected_reason
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    book_loader, market_loader = loaders()
+    checked = []
+
+    def check(position):
+        checked.append(position)
+        return settlement(position)
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=book_loader,
+        market_info_loader=market_loader,
+        settlement_checker=check,
+    )
+
+    assert state["positions"] == []
+    rejected = [event for event in events if event["type"] == "REJECTED"]
+    assert len(rejected) == 1
+    assert rejected[0]["reason_code"] == expected_reason
+    assert len(checked) == 1
+    assert checked[0]["condition_id"] == "condition-a"
+    assert checked[0]["token_id"] == "token-a"
+    assert checked[0]["outcome_index"] == 0
+
+
+def test_open_settlement_gate_accepts_only_clean_unresolved(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    book_loader, market_loader = loaders()
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=book_loader,
+        market_info_loader=market_loader,
+        settlement_checker=unresolved_settlement,
+    )
+
+    assert [event["type"] for event in events] == ["OPENED"]
+    assert len(state["positions"]) == 1
+
+
 def test_generation_mismatch_rejects_request(monkeypatch, tmp_path):
     paths = configure(monkeypatch, tmp_path)
     write_gate(paths, generation="GEN-X")
