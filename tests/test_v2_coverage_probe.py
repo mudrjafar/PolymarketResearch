@@ -124,15 +124,27 @@ def test_run_probe_is_read_only_and_counts_unknown_positions_fail_closed():
     assert all(call["method"] != "eth_sendRawTransaction" for call in session.calls)
 
 
-def test_gamma_only_accepts_exact_token_match(monkeypatch):
+def test_gamma_only_accepts_exact_position_id_match():
     class GammaSession:
         def get(self, _url, params, timeout):
             assert timeout == 15
-            return FakeResponse([{"clobTokenIds": json.dumps([params["clob_token_ids"]]),
+            assert params == {"position_ids": "123", "limit": 100}
+            return FakeResponse([{"positionIds": json.dumps([params["position_ids"]]),
                                  "conditionId": "0xcondition", "question": "Q"}])
 
     match = probe._gamma_exact_match("123", session=GammaSession())
     assert match == {"status": "EXACT_MATCH", "condition_id": "0xcondition", "question": "Q"}
+
+
+def test_gamma_ignores_clob_token_id_match_without_position_id_match():
+    class GammaSession:
+        def get(self, _url, params, timeout):
+            assert "position_ids" in params
+            return FakeResponse([{"clobTokenIds": json.dumps([params["position_ids"]]),
+                                  "positionIds": json.dumps(["456"])}])
+
+    result = probe._gamma_exact_match("123", session=GammaSession())
+    assert result == {"status": "NO_POSITION_ID_MATCH_NOT_PROOF_OF_ABSENCE"}
 
 
 def test_wrong_chain_fails_before_log_scan():

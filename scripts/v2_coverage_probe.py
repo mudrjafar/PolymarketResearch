@@ -188,11 +188,11 @@ def _scan_logs(rpc: JsonRpcReader, address: str, start: int, end: int, chunk_siz
 
 
 def _gamma_exact_match(position_id: str, session: Any = requests) -> dict[str, Any]:
-    """Check for an exact Gamma CLOB token match; a miss is not proof of absence."""
+    """Check Gamma's position-ID identity field; a miss is not proof of absence."""
     try:
         response = session.get(
             f"{GAMMA_API}/markets",
-            params={"clob_token_ids": position_id, "closed": "false", "limit": 100},
+            params={"position_ids": position_id, "limit": 100},
             timeout=15,
         )
         response.raise_for_status()
@@ -204,19 +204,19 @@ def _gamma_exact_match(position_id: str, session: Any = requests) -> dict[str, A
     for market in markets:
         if not isinstance(market, dict):
             continue
-        token_ids = market.get("clobTokenIds", [])
-        if isinstance(token_ids, str):
+        position_ids = market.get("positionIds", [])
+        if isinstance(position_ids, str):
             try:
-                token_ids = json.loads(token_ids)
+                position_ids = json.loads(position_ids)
             except (TypeError, ValueError):
-                token_ids = []
-        if isinstance(token_ids, list) and position_id in {str(item) for item in token_ids}:
+                position_ids = []
+        if isinstance(position_ids, list) and position_id in {str(item) for item in position_ids}:
             return {
                 "status": "EXACT_MATCH",
                 "condition_id": market.get("conditionId"),
                 "question": market.get("question"),
             }
-    return {"status": "NO_EXACT_MATCH_NOT_PROOF_OF_ABSENCE"}
+    return {"status": "NO_POSITION_ID_MATCH_NOT_PROOF_OF_ABSENCE"}
 
 
 def _rpc_url_from_config(env_file: str | None) -> str:
@@ -342,7 +342,7 @@ def run_probe(
             "sampled_position_ids": len(gamma_results),
             "result_counts": dict(sorted(gamma_counts.items())),
             "results": gamma_results,
-            "interpretation": "No exact Gamma match is inconclusive; V2 asset identity mapping requires separate validation.",
+            "interpretation": "No exact Gamma position-ID match is inconclusive; V2 asset identity mapping requires separate validation.",
         },
         "observed_at_utc": datetime.now(timezone.utc).isoformat(),
         "limitations": [
