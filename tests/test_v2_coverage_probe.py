@@ -143,3 +143,44 @@ def test_wrong_chain_fails_before_log_scan():
 
     with pytest.raises(probe.ProbeError, match="Wrong chain"):
         probe.run_probe("http://rpc.invalid", session=WrongChainSession([]))
+
+
+def test_env_file_reader_extracts_only_rpc_value_without_echoing_it(tmp_path, capsys, monkeypatch):
+    secret = "https://rpc.example.invalid/?token=do-not-print"
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "TELEGRAM_BOT_TOKEN=also-secret\n"
+        f"POLYMARKET_RPC_URL=\"{secret}\"\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("POLYMARKET_RPC_URL", raising=False)
+    assert probe._rpc_url_from_config(str(env_file)) == secret
+    assert secret not in capsys.readouterr().out
+
+
+def test_environment_rpc_value_takes_precedence_over_file(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("POLYMARKET_RPC_URL=https://file.invalid/key\n", encoding="utf-8")
+    monkeypatch.setenv("POLYMARKET_RPC_URL", "https://environment.invalid/key")
+    assert probe._rpc_url_from_config(str(env_file)) == "https://environment.invalid/key"
+
+
+def test_log_scan_splits_http_413_ranges_until_provider_accepts_them():
+    class RangeLimitedRpc:
+        def __init__(self):
+            self.ranges = []
+
+        def call(self, method, params):
+            assert method == "eth_getLogs"
+            query = params[0]
+            first = int(query["fromBlock"], 16)
+            last = int(query["toBlock"], 16)
+            self.ranges.append((first, last))
+            if last - first + 1 > 2:
+                raise probe.ProbeError("large", http_status=413)
+            return [{"blockNumber": hex(block)} for block in range(first, last + 1)]
+
+    rpc = RangeLimitedRpc()
+    logs = probe._scan_logs(rpc, "0x" + "11" * 20, 10, 17, 8)
+    assert [int(log["blockNumber"], 16) for log in logs] == list(range(10, 18))
+    assert rpc.ranges == [(10, 17), (10, 13), (10, 11), (12, 13), (14, 17), (14, 15), (16, 17)]
