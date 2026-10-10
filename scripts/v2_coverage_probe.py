@@ -44,6 +44,11 @@ MODULE_NAMES = {1: "BINARY", 2: "NEG_RISK", 3: "COMBINATORIAL"}
 class ProbeError(RuntimeError):
     """A safe, endpoint-redacted read failure."""
 
+    def __init__(self, message: str, *, http_status: int | None = None, rpc_code: int | None = None):
+        super().__init__(message)
+        self.http_status = http_status
+        self.rpc_code = rpc_code
+
 
 def parse_position_id(value: int) -> dict[str, Any]:
     """Decode the documented PositionId bit fields without guessing identity."""
@@ -118,6 +123,7 @@ class JsonRpcReader:
 
     def call(self, method: str, params: list[Any]) -> Any:
         self._request_id += 1
+        response = None
         try:
             response = self._session.post(
                 self._url,
@@ -127,12 +133,17 @@ class JsonRpcReader:
             response.raise_for_status()
             body = response.json()
         except Exception as exc:
-            raise ProbeError(f"RPC read failed for {method}") from exc
+            failed_response = getattr(exc, "response", None)
+            if failed_response is None:
+                failed_response = response
+            status = getattr(failed_response, "status_code", None)
+            detail = f"HTTP {status}" if status is not None else type(exc).__name__
+            raise ProbeError(f"RPC read failed for {method} ({detail})", http_status=status) from exc
         if not isinstance(body, dict) or body.get("id") != self._request_id:
             raise ProbeError(f"RPC response invalid for {method}")
         if body.get("error"):
             code = body["error"].get("code") if isinstance(body["error"], dict) else None
-            raise ProbeError(f"RPC returned an error for {method} (code={code})")
+            raise ProbeError(f"RPC returned an error for {method} (code={code})", rpc_code=code)
         if "result" not in body:
             raise ProbeError(f"RPC response missing result for {method}")
         return body["result"]
@@ -150,18 +161,28 @@ def _hex_block(value: Any, label: str) -> int:
 
 def _scan_logs(rpc: JsonRpcReader, address: str, start: int, end: int, chunk_size: int) -> list[Any]:
     logs: list[Any] = []
+
+    def fetch_range(first: int, last: int) -> list[Any]:
+        try:
+            batch = rpc.call("eth_getLogs", [{
+                "address": address,
+                "fromBlock": hex(first),
+                "toBlock": hex(last),
+                "topics": [ORDER_FILLED_TOPIC],
+            }])
+        except ProbeError as exc:
+            if (exc.http_status == 413 or exc.rpc_code == -32005) and first < last:
+                midpoint = (first + last) // 2
+                return fetch_range(first, midpoint) + fetch_range(midpoint + 1, last)
+            raise
+        if not isinstance(batch, list):
+            raise ProbeError("RPC returned an invalid eth_getLogs result")
+        return batch
+
     first = start
     while first <= end:
         last = min(end, first + chunk_size - 1)
-        batch = rpc.call("eth_getLogs", [{
-            "address": address,
-            "fromBlock": hex(first),
-            "toBlock": hex(last),
-            "topics": [ORDER_FILLED_TOPIC],
-        }])
-        if not isinstance(batch, list):
-            raise ProbeError("RPC returned an invalid eth_getLogs result")
-        logs.extend(batch)
+        logs.extend(fetch_range(first, last))
         first = last + 1
     return logs
 
@@ -196,6 +217,30 @@ def _gamma_exact_match(position_id: str, session: Any = requests) -> dict[str, A
                 "question": market.get("question"),
             }
     return {"status": "NO_EXACT_MATCH_NOT_PROOF_OF_ABSENCE"}
+
+
+def _rpc_url_from_config(env_file: str | None) -> str:
+    """Read only POLYMARKET_RPC_URL; never return file contents or report errors verbatim."""
+    configured = os.getenv("POLYMARKET_RPC_URL", "").strip()
+    if configured or not env_file:
+        return configured
+    try:
+        with open(env_file, "r", encoding="utf-8-sig") as handle:
+            for line in handle:
+                candidate = line.strip()
+                if not candidate or candidate.startswith("#"):
+                    continue
+                if candidate.startswith("export "):
+                    candidate = candidate[7:].lstrip()
+                key, separator, value = candidate.partition("=")
+                if separator and key.strip() == "POLYMARKET_RPC_URL":
+                    value = value.strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                        value = value[1:-1]
+                    return value.strip()
+    except (OSError, UnicodeError) as exc:
+        raise ProbeError("Could not read RPC configuration file") from exc
+    return ""
 
 
 def run_probe(
@@ -317,10 +362,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--chunk-size", type=int, default=500)
     parser.add_argument("--gamma-sample", type=int, default=25)
     parser.add_argument("--exchange-address", default=EXCHANGE_V3_ADDRESS)
+    parser.add_argument("--env-file", help="optional .env file; only POLYMARKET_RPC_URL is read")
     args = parser.parse_args(argv)
-    rpc_url = os.getenv("POLYMARKET_RPC_URL", "").strip()
+    try:
+        rpc_url = _rpc_url_from_config(args.env_file)
+    except ProbeError as exc:
+        print(f"V2 coverage probe failed: {exc}", file=sys.stderr)
+        return 2
     if not rpc_url:
-        print("Missing POLYMARKET_RPC_URL environment variable; RPC endpoint was not contacted.", file=sys.stderr)
+        print("Missing POLYMARKET_RPC_URL configuration; RPC endpoint was not contacted.", file=sys.stderr)
         return 2
     try:
         report = run_probe(
