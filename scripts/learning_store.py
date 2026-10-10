@@ -256,11 +256,19 @@ class LearningStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.path), timeout=30.0)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=FULL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self._initialize()
+        try:
+            self.conn.row_factory = sqlite3.Row
+            # Connection-local safety can be enabled before validation. Persistent
+            # journal-mode mutation is deliberately deferred until the on-disk
+            # schema/version has been accepted.
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.conn.execute("PRAGMA synchronous=FULL")
+            self._initialize()
+            self.conn.execute("PRAGMA journal_mode=WAL")
+        except Exception:
+            self.conn.close()
+            self.conn = None
+            raise
 
     def __enter__(self):
         return self
@@ -274,20 +282,52 @@ class LearningStore:
             self.conn.close()
             self.conn = None
 
+    def _existing_user_tables(self):
+        rows = self.conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        return {str(row["name"]) for row in rows}
+
+    def _validate_existing_schema_marker(self, tables):
+        if not tables:
+            return False
+        if "learning_meta" not in tables:
+            raise LearningStoreError(
+                "existing learning database is unversioned; refusing automatic mutation"
+            )
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM learning_meta WHERE key='schema_version'"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise LearningStoreError(
+                f"learning database schema marker unreadable: {exc}"
+            ) from exc
+        if row is None:
+            raise LearningStoreError("learning database schema version missing")
+        try:
+            version = int(row["value"])
+        except (TypeError, ValueError) as exc:
+            raise LearningStoreError("learning database schema version invalid") from exc
+        if version != LEARNING_SCHEMA_VERSION:
+            raise LearningStoreError("learning database schema mismatch")
+        return True
+
     def _initialize(self):
         try:
+            tables = self._existing_user_tables()
+            has_schema_marker = self._validate_existing_schema_marker(tables)
+
             with self.conn:
                 self.conn.executescript(SCHEMA_SQL)
-                current = self.conn.execute(
-                    "SELECT value FROM learning_meta WHERE key='schema_version'"
-                ).fetchone()
-                if current is None:
+                if not has_schema_marker:
                     self.conn.execute(
                         "INSERT INTO learning_meta(key,value) VALUES('schema_version',?)",
                         (str(LEARNING_SCHEMA_VERSION),),
                     )
-                elif int(current["value"]) != LEARNING_SCHEMA_VERSION:
-                    raise LearningStoreError("learning database schema mismatch")
+        except LearningStoreError:
+            raise
         except sqlite3.Error as exc:
             raise LearningStoreError(f"learning database init failed: {exc}") from exc
 
