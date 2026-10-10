@@ -16,11 +16,12 @@ import sys
 from typing import Any
 
 import requests
-from eth_abi import decode
+from eth_abi import decode, encode
 
 
 POLYGON_CHAIN_ID = 137
 EXCHANGE_V3_ADDRESS = "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa"
+COMBINATORIAL_MODULE_ADDRESS = "0x30000034706C7d8e12009DAB006Be20000c031A8"
 GAMMA_API = "https://gamma-api.polymarket.com"
 EVENT_SIGNATURE = (
     "OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,"
@@ -29,6 +30,7 @@ EVENT_SIGNATURE = (
 # Same topic0 as the Collector V2 decoder; importing the probe needs no hashing
 # backend, and the test suite pins this value to the documented event signature.
 ORDER_FILLED_TOPIC = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
+GET_COMBINATORIAL_LEGS_SELECTOR = "0x9989b1ed"  # getLegs(bytes31)
 POSITION_LAYOUT = {
     "module_id": "bits 248-255",
     "base_hash": "bits 120-247",
@@ -219,6 +221,23 @@ def _gamma_exact_match(position_id: str, session: Any = requests) -> dict[str, A
     return {"status": "NO_POSITION_ID_MATCH_NOT_PROOF_OF_ABSENCE"}
 
 
+def _combinatorial_legs(rpc: JsonRpcReader, position_id: str) -> list[str] | None:
+    """Read a prepared combinatorial condition's canonical underlying positions."""
+    try:
+        condition_id = (int(position_id) >> 8).to_bytes(31, "big")
+        call_data = GET_COMBINATORIAL_LEGS_SELECTOR + encode(["bytes31"], [condition_id]).hex()
+        result = rpc.call("eth_call", [
+            {"to": COMBINATORIAL_MODULE_ADDRESS, "data": call_data},
+            "latest",
+        ])
+        if not isinstance(result, str) or not result.startswith("0x"):
+            return None
+        decoded = decode(["uint256[]"], bytes.fromhex(result[2:]))
+        return [str(value) for value in decoded[0]]
+    except Exception:
+        return None
+
+
 def _rpc_url_from_config(env_file: str | None) -> str:
     """Read only POLYMARKET_RPC_URL; never return file contents or report errors verbatim."""
     configured = os.getenv("POLYMARKET_RPC_URL", "").strip()
@@ -300,11 +319,38 @@ def run_probe(
         unique_ids.setdefault(fill["position_id"], fill)
 
     gamma_results = []
+    combinatorial_results = []
     for position_id in list(unique_ids)[:gamma_sample]:
         gamma_results.append({
             "position_id": position_id,
             **_gamma_exact_match(position_id, session=session),
         })
+        identity = unique_ids[position_id]
+        if identity["module_id"] == 3:
+            legs = _combinatorial_legs(rpc, position_id)
+            if legs is None:
+                combinatorial_results.append({
+                    "position_id": position_id,
+                    "condition_id": f"0x{(int(position_id) >> 8):062x}",
+                    "status": "LEG_LOOKUP_ERROR_OR_UNPREPARED",
+                })
+                continue
+            leg_results = []
+            for leg_position_id in legs:
+                leg_identity = parse_position_id(int(leg_position_id))
+                leg_results.append({
+                    "position_id": leg_position_id,
+                    "module": leg_identity["module"],
+                    "outcome_index": leg_identity["outcome_index"],
+                    **_gamma_exact_match(leg_position_id, session=session),
+                })
+            combinatorial_results.append({
+                "position_id": position_id,
+                "condition_id": f"0x{(int(position_id) >> 8):062x}",
+                "status": "LEGS_RESOLVED",
+                "leg_count": len(legs),
+                "legs": leg_results,
+            })
     gamma_counts = Counter(item["status"] for item in gamma_results)
     legacy_exchanges = {
         "0xe111180000d2663c0091e4f400237545b87b996b",
@@ -343,6 +389,12 @@ def run_probe(
             "result_counts": dict(sorted(gamma_counts.items())),
             "results": gamma_results,
             "interpretation": "No exact Gamma position-ID match is inconclusive; V2 asset identity mapping requires separate validation.",
+        },
+        "combinatorial_identity_probe": {
+            "sampled_combinatorial_positions": len(combinatorial_results),
+            "resolved_conditions": sum(item["status"] == "LEGS_RESOLVED" for item in combinatorial_results),
+            "results": combinatorial_results,
+            "interpretation": "Combinatorial positions resolve through the on-chain CombinatorialModule getLegs(bytes31) read call; Gamma is queried only for underlying leg position IDs.",
         },
         "observed_at_utc": datetime.now(timezone.utc).isoformat(),
         "limitations": [

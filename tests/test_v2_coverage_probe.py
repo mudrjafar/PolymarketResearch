@@ -147,6 +147,27 @@ def test_gamma_ignores_clob_token_id_match_without_position_id_match():
     assert result == {"status": "NO_POSITION_ID_MATCH_NOT_PROOF_OF_ABSENCE"}
 
 
+def test_combinatorial_leg_reader_uses_read_only_get_legs_call():
+    leg_position_id = make_position(2, arity=2, condition_index=1)
+
+    class LegsRpc:
+        def __init__(self):
+            self.params = None
+
+        def call(self, method, params):
+            assert method == "eth_call"
+            self.params = params
+            return "0x" + encode(["uint256[]"], [[leg_position_id]]).hex()
+
+    rpc = LegsRpc()
+    combo_position_id = make_position(3, outcome_index=0)
+    legs = probe._combinatorial_legs(rpc, str(combo_position_id))
+    assert legs == [str(leg_position_id)]
+    assert rpc.params[0]["to"] == probe.COMBINATORIAL_MODULE_ADDRESS
+    assert rpc.params[0]["data"].startswith(probe.GET_COMBINATORIAL_LEGS_SELECTOR)
+    assert rpc.params[1] == "latest"
+
+
 def test_wrong_chain_fails_before_log_scan():
     class WrongChainSession(FakeSession):
         def post(self, _url, json, timeout):
