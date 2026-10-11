@@ -36,7 +36,7 @@ def make_log(position_id, module_id=1, *, data=None, log_index=None, maker_event
         "data": "0x" + data.hex(),
         "transactionHash": "0x" + "ab" * 32,
         "logIndex": hex((position_id >> 248) if log_index is None else log_index),
-        "blockNumber": "0x64",
+        "blockNumber": "0xe6",
         "blockHash": "0x" + "cd" * 32,
         "removed": False,
     }
@@ -240,7 +240,7 @@ def test_reconciliation_evidence_preserves_chain_identity_and_aggressor_role():
     maker = probe.decode_order_filled(maker_log)
     assert taker["evidence_id"] == "0x" + "ab" * 32 + ":17"
     assert taker["log_index"] == 17
-    assert taker["block_number"] == 100
+    assert taker["block_number"] == 230
     assert taker["block_hash"] == "0x" + "cd" * 32
     assert taker["exchange_address"] == probe.EXCHANGE_V3_ADDRESS.lower()
     assert taker["taker_aggressor"] is True
