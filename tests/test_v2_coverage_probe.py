@@ -18,16 +18,27 @@ def make_position(module_id, *, arity=0, condition_index=0, outcome_index=0):
     )
 
 
-def make_log(position_id, module_id=1, *, data=None):
+def make_log(position_id, module_id=1, *, data=None, log_index=None, maker_event=False, side=0):
     data = data or encode(
         ["uint8", "uint256", "uint256", "uint256", "uint256", "bytes32", "bytes32"],
-        [0, position_id, 100, 200, 1, bytes(32), bytes(32)],
+        [side, position_id, 100, 200, 1, bytes(32), bytes(32)],
     )
+    exchange = probe.EXCHANGE_V3_ADDRESS.lower()
+    taker = ("0x" + "bb" * 20) if maker_event else exchange
     return {
-        "topics": [probe.ORDER_FILLED_TOPIC, "0x" + "00" * 32, "0x" + "00" * 32, "0x" + "00" * 32],
+        "address": exchange,
+        "topics": [
+            probe.ORDER_FILLED_TOPIC,
+            "0x" + "00" * 32,
+            "0x" + "00" * 32,
+            "0x" + "00" * 12 + taker[2:],
+        ],
         "data": "0x" + data.hex(),
-        "transactionHash": "0xabc",
+        "transactionHash": "0x" + "ab" * 32,
+        "logIndex": hex((position_id >> 248) if log_index is None else log_index),
         "blockNumber": "0x64",
+        "blockHash": "0x" + "cd" * 32,
+        "removed": False,
     }
 
 
@@ -217,3 +228,173 @@ def test_log_scan_splits_http_413_ranges_until_provider_accepts_them():
     logs = probe._scan_logs(rpc, "0x" + "11" * 20, 10, 17, 8)
     assert [int(log["blockNumber"], 16) for log in logs] == list(range(10, 18))
     assert rpc.ranges == [(10, 17), (10, 13), (10, 11), (12, 13), (14, 17), (14, 15), (16, 17)]
+
+
+# V2-COVERAGE-1A: canonical reconciliation, provider boundaries, fail-closed proof.
+
+def test_reconciliation_evidence_preserves_chain_identity_and_aggressor_role():
+    position = make_position(1, outcome_index=0)
+    taker_log = make_log(position, log_index=17, side=0)
+    maker_log = make_log(position, log_index=18, maker_event=True, side=1)
+    taker = probe.decode_order_filled(taker_log)
+    maker = probe.decode_order_filled(maker_log)
+    assert taker["evidence_id"] == "0x" + "ab" * 32 + ":17"
+    assert taker["log_index"] == 17
+    assert taker["block_number"] == 100
+    assert taker["block_hash"] == "0x" + "cd" * 32
+    assert taker["exchange_address"] == probe.EXCHANGE_V3_ADDRESS.lower()
+    assert taker["taker_aggressor"] is True
+    assert taker["flow_role"] == "TAKER_AGGRESSOR"
+    assert taker["side_label"] == "BUY"
+    assert maker["taker_aggressor"] is False
+    assert maker["flow_role"] == "MAKER_OR_OTHER"
+    assert maker["side_label"] == "SELL"
+    assert taker["position_id"] == maker["position_id"]
+
+
+@pytest.mark.parametrize("missing", [
+    "transactionHash", "logIndex", "blockHash", "address", "blockNumber",
+])
+def test_missing_canonical_provenance_is_malformed(missing):
+    log = make_log(make_position(1))
+    log.pop(missing)
+    with pytest.raises(ValueError):
+        probe.decode_order_filled(log)
+
+
+def test_removed_log_and_unsupported_side_are_malformed():
+    log = make_log(make_position(1))
+    log["removed"] = True
+    with pytest.raises(ValueError, match="removed"):
+        probe.decode_order_filled(log)
+    log = make_log(make_position(1), side=2)
+    with pytest.raises(ValueError, match="side"):
+        probe.decode_order_filled(log)
+
+
+def test_reconciliation_duplicate_dedup_separates_raw_and_unique_counts():
+    same = make_log(make_position(1), log_index=3)
+    session = FakeSession([same, dict(same)])
+    result = probe.run_probe("http://rpc.invalid", lookback_blocks=20, chunk_size=20,
+                             gamma_sample=0, session=session)
+    assert result["activity"]["order_filled_logs"] == 2
+    assert result["activity"]["decoded_fills"] == 2
+    assert result["reconciliation"]["duplicate_events"] == 1
+    assert result["reconciliation"]["conflicting_duplicate_events"] == 0
+    assert result["reconciliation"]["unique_event_count"] == 1
+    assert result["reconciliation"]["taker_aggressor_events"] == 1
+    assert result["reconciliation"]["status"] == "EVIDENCE_KEYS_VALID_ONLY"
+    assert result["reconciliation"]["completeness_claim_allowed"] is False
+
+
+def test_conflicting_duplicate_identity_fails_closed():
+    a = make_log(make_position(1, outcome_index=0), log_index=5)
+    b = make_log(make_position(1, outcome_index=1), log_index=5)
+    result = probe.run_probe("http://rpc.invalid", lookback_blocks=20, chunk_size=20,
+                             gamma_sample=0, session=FakeSession([a, b]))
+    assert result["reconciliation"]["conflicting_duplicate_events"] == 1
+    assert result["reconciliation"]["status"] == "FAIL_CLOSED"
+    assert result["reconciliation"]["completeness_claim_allowed"] is False
+
+
+def test_malformed_event_rejects_completeness_claim_without_dropping_total():
+    valid = make_log(make_position(1))
+    malformed = dict(valid, logIndex=None)
+    report = probe.run_probe("http://rpc.invalid", lookback_blocks=20, chunk_size=20,
+                             gamma_sample=0, session=FakeSession([valid, malformed]))
+    assert report["activity"]["order_filled_logs"] == 2
+    assert report["activity"]["decoded_fills"] == 1
+    assert report["reconciliation"]["malformed_event_count"] == 1
+    assert report["reconciliation"]["status"] == "FAIL_CLOSED"
+    assert report["reconciliation"]["rpc_result_completeness"] == "UNVERIFIED_NO_INDEPENDENT_LOG_COUNT"
+
+
+def test_taker_counts_do_not_conflate_maker_fills():
+    p = make_position(2, arity=2, condition_index=1)
+    one = make_log(p, log_index=10)
+    two = make_log(p, log_index=11, maker_event=True)
+    report = probe.run_probe("http://rpc.invalid", lookback_blocks=20, chunk_size=20,
+                             gamma_sample=0, session=FakeSession([one, two]))
+    assert report["reconciliation"]["unique_event_count"] == 2
+    assert report["reconciliation"]["taker_aggressor_events"] == 1
+    assert report["reconciliation"]["maker_or_other_events"] == 1
+
+
+def test_provider_log_limit_bisects_silently_capped_ranges():
+    class Capped:
+        def __init__(self):
+            self.ranges = []
+
+        def call(self, method, params):
+            assert method == "eth_getLogs"
+            params = params[0]
+            first, last = int(params["fromBlock"], 16), int(params["toBlock"], 16)
+            self.ranges.append((first, last))
+            # Deliberately simulate a provider that returns only 2 logs
+            # when more than 2 are requested, WITHOUT returning an RPC error.
+            return [{"blockNumber": hex(block)} for block in range(first, min(last + 1, first + 2))]
+
+    rpc = Capped()
+    rows = probe._scan_logs(rpc, "0x" + "11" * 20, 10, 13, 4, max_logs_per_response=2)
+    assert [int(item["blockNumber"], 16) for item in rows] == [10, 11, 12, 13]
+    assert (10, 13) in rpc.ranges
+
+
+def test_provider_single_block_at_limit_fails_closed():
+    class Capped:
+        def call(self, method, params):
+            assert method == "eth_getLogs"
+            return [{"blockNumber": "0xa"}, {"blockNumber": "0xa"}]
+
+    with pytest.raises(probe.ProbeError, match="Single-block"):
+        probe._scan_logs(Capped(), "0x" + "11" * 20, 10, 10, 1,
+                         max_logs_per_response=2)
+
+
+def test_provider_wrong_range_and_address_fail_closed():
+    class Bogus:
+        def __init__(self, row):
+            self.row = row
+
+        def call(self, method, params):
+            return [self.row]
+
+    for row in ({"blockNumber": "0x9"}, {
+        "blockNumber": "0xa", "address": "0x" + "bb" * 20,
+    }):
+        with pytest.raises(probe.ProbeError):
+            probe._scan_logs(Bogus(row), "0x" + "aa" * 20, 10, 10, 1)
+
+
+def test_combinatorial_legs_query_at_selected_finalized_evidence_block():
+    class Legs:
+        def __init__(self):
+            self.call_params = None
+
+        def call(self, method, params):
+            self.call_params = params
+            return "0x" + encode(["uint256[]"], [[make_position(1)]]).hex()
+
+    rpc = Legs()
+    legs = probe._combinatorial_legs(rpc, str(make_position(3)), "0x64")
+    assert legs == [str(make_position(1))]
+    assert rpc.call_params[1] == "0x64"
+
+
+def test_rpc_error_minus_32005_bisects_ranges():
+    class RpcLimit:
+        def __init__(self):
+            self.ranges = []
+
+        def call(self, method, params):
+            first = int(params[0]["fromBlock"], 16)
+            last = int(params[0]["toBlock"], 16)
+            self.ranges.append((first, last))
+            if first != last:
+                raise probe.ProbeError("too many", rpc_code=-32005)
+            return [{"blockNumber": hex(first)}]
+
+    rpc = RpcLimit()
+    rows = probe._scan_logs(rpc, "0x" + "11" * 20, 10, 12, 3)
+    assert len(rows) == 3
+    assert rpc.ranges[0] == (10, 12)
