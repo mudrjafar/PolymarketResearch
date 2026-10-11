@@ -16,6 +16,8 @@ from typing import Any
 
 import requests
 
+CLOB_API = "https://clob.polymarket.com"
+
 try:  # Support both `python scripts/...py` and package-based tests.
     from .v2_coverage_probe import (
         GAMMA_API,
@@ -174,6 +176,42 @@ def audit_gamma_position(position_id: str, session: Any = requests) -> dict[str,
     }
 
 
+def audit_clob_asset(position_id: str, session: Any = requests) -> dict[str, Any]:
+    """Read a public CLOB book and verify its returned asset_id exactly.
+
+    The unified official Python SDK accepts V2 position IDs as ``asset_id``
+    for public order-book reads. A book lookup error (including no book) is
+    inconclusive and never establishes that the ID is invalid.
+    """
+    try:
+        response = session.get(
+            f"{CLOB_API}/book",
+            params={"token_id": position_id},
+            timeout=15,
+        )
+        response.raise_for_status()
+        book = response.json()
+    except Exception:
+        return {"position_id": position_id, "status": "CLOB_BOOK_LOOKUP_INCONCLUSIVE"}
+    if not isinstance(book, dict):
+        return {"position_id": position_id, "status": "CLOB_INVALID_RESPONSE"}
+    returned_asset_id = book.get("asset_id")
+    if not isinstance(returned_asset_id, str):
+        return {"position_id": position_id, "status": "CLOB_ASSET_ID_MISSING"}
+    if returned_asset_id != position_id:
+        return {
+            "position_id": position_id,
+            "returned_asset_id": returned_asset_id,
+            "status": "CLOB_ASSET_ID_MISMATCH",
+        }
+    return {
+        "position_id": position_id,
+        "returned_asset_id": returned_asset_id,
+        "market": book.get("market"),
+        "status": "EXACT_CLOB_ASSET_ID_MATCH",
+    }
+
+
 def run_audit(
     source_report: dict[str, Any],
     rpc_url: str,
@@ -216,14 +254,23 @@ def run_audit(
         else {"position_id": None, "status": "INVALID_POSITION_ID_SAMPLE"}
         for item in position_ids
     ]
+    clob_results = [
+        audit_clob_asset(item, session=session) if isinstance(item, str)
+        else {"position_id": None, "status": "INVALID_POSITION_ID_SAMPLE"}
+        for item in position_ids
+    ]
     receipt_counts: dict[str, int] = {}
     gamma_counts: dict[str, int] = {}
+    clob_counts: dict[str, int] = {}
     for result in receipt_results:
         status = str(result["status"])
         receipt_counts[status] = receipt_counts.get(status, 0) + 1
     for result in gamma_results:
         status = str(result["status"])
         gamma_counts[status] = gamma_counts.get(status, 0) + 1
+    for result in clob_results:
+        status = str(result["status"])
+        clob_counts[status] = clob_counts.get(status, 0) + 1
 
     return {
         "audit": "POLYMARKET_V2_COVERAGE_1B_RECEIPT_AND_IDENTITY",
@@ -245,12 +292,19 @@ def run_audit(
             "results": gamma_results,
             "identity_rule": "Exact Gamma positionIds match is required; CTF clobTokenIds are preserved separately and never treated as V3 PositionIds.",
             "clob_order_identifier": "positionID",
+            "clob_public_read": {
+                "sampled_position_ids": len(clob_results),
+                "result_counts": dict(sorted(clob_counts.items())),
+                "results": clob_results,
+                "identity_rule": "Only an exact CLOB book response asset_id match confirms that the public CLOB lookup recognized that ID; lookup errors are inconclusive.",
+            },
         },
         "observed_at_utc": datetime.now(timezone.utc).isoformat(),
         "limitations": [
             "Receipt checks corroborate sampled logs only; they do not prove eth_getLogs completeness.",
             "All RPC evidence came from one configured provider; independent-provider agreement is not established.",
             "Gamma misses are inconclusive and do not prove that a PositionId is absent.",
+            "CLOB book lookup errors are inconclusive and do not prove that a PositionId is absent.",
             "CLOB token IDs are reported separately; no orders, market actions, or production integrations are performed.",
             "The audit does not update Collector, Flow, Paper, or other runtime state.",
         ],

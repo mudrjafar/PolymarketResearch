@@ -71,12 +71,17 @@ class FakeResponse:
 
 
 class FakeGamma:
-    def __init__(self, markets):
+    def __init__(self, markets, clob_book=None):
         self.markets = markets
+        self.clob_book = clob_book
         self.calls = []
 
     def get(self, url, *, params, timeout):
         self.calls.append((url, params, timeout))
+        if url.endswith("/book"):
+            if isinstance(self.clob_book, Exception):
+                raise self.clob_book
+            return FakeResponse(self.clob_book)
         return FakeResponse(self.markets)
 
 
@@ -164,6 +169,27 @@ def test_gamma_duplicate_position_matches_are_ambiguous():
     assert result["match_count"] == 2
 
 
+def test_clob_exact_asset_id_book_response_confirms_public_lookup():
+    position_id = str(make_position())
+    result = audit.audit_clob_asset(position_id, session=FakeGamma([], {
+        "asset_id": position_id,
+        "market": "0xcondition",
+        "bids": [],
+        "asks": [],
+    }))
+    assert result["status"] == "EXACT_CLOB_ASSET_ID_MATCH"
+    assert result["returned_asset_id"] == position_id
+    assert result["market"] == "0xcondition"
+
+
+def test_clob_mismatch_and_lookup_errors_are_not_identity_proof():
+    position_id = str(make_position())
+    mismatch = audit.audit_clob_asset(position_id, session=FakeGamma([], {"asset_id": "other"}))
+    error = audit.audit_clob_asset(position_id, session=FakeGamma([], RuntimeError("offline")))
+    assert mismatch["status"] == "CLOB_ASSET_ID_MISMATCH"
+    assert error["status"] == "CLOB_BOOK_LOOKUP_INCONCLUSIVE"
+
+
 def test_run_audit_reports_sample_only_and_never_claims_completeness():
     event = sample_event()
     report = {
@@ -174,11 +200,12 @@ def test_run_audit_reports_sample_only_and_never_claims_completeness():
     }
     output = audit.run_audit(report, "unused", rpc=FakeRpc(), session=FakeGamma([{
         "positionIds": [event["position_id"]], "outcomes": ["Yes"],
-    }]))
+    }], {"asset_id": event["position_id"], "market": "0xcondition"}))
     assert output["read_only"] is True
     assert output["receipt_provenance"]["result_counts"] == {"RECEIPT_AND_CANONICAL_BLOCK_MATCH": 1}
     assert output["receipt_provenance"]["completeness_claim_allowed"] is False
     assert output["position_identity"]["result_counts"] == {"EXACT_POSITION_ID_MATCH": 1}
+    assert output["position_identity"]["clob_public_read"]["result_counts"] == {"EXACT_CLOB_ASSET_ID_MATCH": 1}
 
 
 def test_run_audit_rejects_wrong_chain():
