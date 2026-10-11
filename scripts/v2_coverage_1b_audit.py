@@ -191,8 +191,29 @@ def audit_clob_asset(position_id: str, session: Any = requests) -> dict[str, Any
         )
         response.raise_for_status()
         book = response.json()
-    except Exception:
-        return {"position_id": position_id, "status": "CLOB_BOOK_LOOKUP_INCONCLUSIVE"}
+    except requests.Timeout:
+        return {"position_id": position_id, "status": "CLOB_TIMEOUT"}
+    except requests.HTTPError as exc:
+        response = getattr(exc, "response", None)
+        return {
+            "position_id": position_id,
+            "status": "CLOB_HTTP_ERROR",
+            "http_status": getattr(response, "status_code", None),
+        }
+    except requests.RequestException as exc:
+        return {
+            "position_id": position_id,
+            "status": "CLOB_REQUEST_ERROR",
+            "error_type": type(exc).__name__,
+        }
+    except (ValueError, TypeError):
+        return {"position_id": position_id, "status": "CLOB_INVALID_JSON"}
+    except Exception as exc:
+        return {
+            "position_id": position_id,
+            "status": "CLOB_CLIENT_ERROR",
+            "error_type": type(exc).__name__,
+        }
     if not isinstance(book, dict):
         return {"position_id": position_id, "status": "CLOB_INVALID_RESPONSE"}
     returned_asset_id = book.get("asset_id")

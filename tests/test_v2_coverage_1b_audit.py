@@ -185,9 +185,19 @@ def test_clob_exact_asset_id_book_response_confirms_public_lookup():
 def test_clob_mismatch_and_lookup_errors_are_not_identity_proof():
     position_id = str(make_position())
     mismatch = audit.audit_clob_asset(position_id, session=FakeGamma([], {"asset_id": "other"}))
-    error = audit.audit_clob_asset(position_id, session=FakeGamma([], RuntimeError("offline")))
+    error = audit.audit_clob_asset(position_id, session=FakeGamma([], audit.requests.ConnectionError("offline")))
     assert mismatch["status"] == "CLOB_ASSET_ID_MISMATCH"
-    assert error["status"] == "CLOB_BOOK_LOOKUP_INCONCLUSIVE"
+    assert error["status"] == "CLOB_REQUEST_ERROR"
+    assert error["error_type"] == "ConnectionError"
+
+
+def test_clob_http_error_exposes_status_without_response_body():
+    position_id = str(make_position())
+    response = type("Response", (), {"status_code": 404})()
+    error = audit.requests.HTTPError(response=response)
+    result = audit.audit_clob_asset(position_id, session=FakeGamma([], error))
+    assert result["status"] == "CLOB_HTTP_ERROR"
+    assert result["http_status"] == 404
 
 
 def test_run_audit_reports_sample_only_and_never_claims_completeness():
