@@ -46,10 +46,18 @@ MODULE_NAMES = {1: "BINARY", 2: "NEG_RISK", 3: "COMBINATORIAL"}
 class ProbeError(RuntimeError):
     """A safe, endpoint-redacted read failure."""
 
-    def __init__(self, message: str, *, http_status: int | None = None, rpc_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        rpc_code: int | None = None,
+        timed_out: bool = False,
+    ):
         super().__init__(message)
         self.http_status = http_status
         self.rpc_code = rpc_code
+        self.timed_out = timed_out
 
 
 def parse_position_id(value: int) -> dict[str, Any]:
@@ -140,7 +148,11 @@ class JsonRpcReader:
                 failed_response = response
             status = getattr(failed_response, "status_code", None)
             detail = f"HTTP {status}" if status is not None else type(exc).__name__
-            raise ProbeError(f"RPC read failed for {method} ({detail})", http_status=status) from exc
+            raise ProbeError(
+                f"RPC read failed for {method} ({detail})",
+                http_status=status,
+                timed_out=isinstance(exc, requests.exceptions.Timeout),
+            ) from exc
         if not isinstance(body, dict) or body.get("id") != self._request_id:
             raise ProbeError(f"RPC response invalid for {method}")
         if body.get("error"):
@@ -173,7 +185,7 @@ def _scan_logs(rpc: JsonRpcReader, address: str, start: int, end: int, chunk_siz
                 "topics": [ORDER_FILLED_TOPIC],
             }])
         except ProbeError as exc:
-            if (exc.http_status == 413 or exc.rpc_code == -32005) and first < last:
+            if (exc.http_status == 413 or exc.rpc_code == -32005 or exc.timed_out) and first < last:
                 midpoint = (first + last) // 2
                 return fetch_range(first, midpoint) + fetch_range(midpoint + 1, last)
             raise

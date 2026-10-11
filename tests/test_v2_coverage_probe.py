@@ -217,3 +217,37 @@ def test_log_scan_splits_http_413_ranges_until_provider_accepts_them():
     logs = probe._scan_logs(rpc, "0x" + "11" * 20, 10, 17, 8)
     assert [int(log["blockNumber"], 16) for log in logs] == list(range(10, 18))
     assert rpc.ranges == [(10, 17), (10, 13), (10, 11), (12, 13), (14, 17), (14, 15), (16, 17)]
+
+
+def test_rpc_reader_marks_read_timeouts_for_range_splitting():
+    class TimeoutSession:
+        def post(self, *_args, **_kwargs):
+            raise probe.requests.exceptions.ReadTimeout("temporary timeout")
+
+    rpc = probe.JsonRpcReader("http://rpc.invalid", session=TimeoutSession())
+    with pytest.raises(probe.ProbeError) as exc_info:
+        rpc.call("eth_getLogs", [])
+
+    assert exc_info.value.timed_out is True
+
+
+def test_log_scan_splits_timed_out_ranges_until_provider_accepts_them():
+    class TimeoutLimitedRpc:
+        def __init__(self):
+            self.ranges = []
+
+        def call(self, method, params):
+            assert method == "eth_getLogs"
+            query = params[0]
+            first = int(query["fromBlock"], 16)
+            last = int(query["toBlock"], 16)
+            self.ranges.append((first, last))
+            if last - first + 1 > 2:
+                raise probe.ProbeError("timeout", timed_out=True)
+            return [{"blockNumber": hex(block)} for block in range(first, last + 1)]
+
+    rpc = TimeoutLimitedRpc()
+    logs = probe._scan_logs(rpc, "0x" + "11" * 20, 10, 17, 8)
+
+    assert [int(log["blockNumber"], 16) for log in logs] == list(range(10, 18))
+    assert rpc.ranges == [(10, 17), (10, 13), (10, 11), (12, 13), (14, 17), (14, 15), (16, 17)]
