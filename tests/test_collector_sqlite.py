@@ -403,12 +403,19 @@ class CollectorIntegrationTests(unittest.TestCase):
         self.assertTrue(all(r['block_timestamp'] and r['collector_version']==4 for r in rows))
 
     def test_second_exchange_rpc_failure_does_not_commit(self):
-        # Exercise the real two-exchange implementation, bypassing setup mock.
-        responses=Mock(side_effect=[[event()],RuntimeError('Second exchange failed')])
+        # Exercise the real all-exchange implementation, bypassing setup mock.
+        def rpc(method, params):
+            self.assertEqual(method, 'eth_getLogs')
+            address = params[0]['address']
+            if address.lower() == collector.EXCHANGES[1].lower():
+                raise RuntimeError('Second exchange failed')
+            return []
+
+        responses=Mock(side_effect=rpc)
         with patch.object(collector,'get_order_filled_logs',side_effect=REAL_GET_LOGS), \
              patch.object(collector,'rpc_call',responses):
             with self.assertRaises(RuntimeError):collector.scan_once(self.store,self.token_map)
-        self.assertEqual(responses.call_count,2)
+        self.assertEqual(responses.call_count,len(collector.MONITORED_EXCHANGES))
         self.assertEqual(self.store.checkpoint()['block_number'],100)
         self.assertEqual(self.rows(),[])
 
@@ -899,6 +906,223 @@ with CollectorStore(sys.argv[1]) as store:
         self.assertEqual(scan.call_count, 2)
         self.assertEqual(self.store.checkpoint()['block_number'], 103)
         self.assertEqual([c.args[0] for c in sleep_mock.call_args_list], [collector.CHECK_INTERVAL])
+
+
+
+# ============================================================
+# COLLECTOR-V3-1 EXCHANGE V3 RUNTIME COVERAGE
+# ============================================================
+
+def v3_position(module_id=1, *, arity=0, condition_index=0, outcome_index=0):
+    return str(
+        (module_id << 248)
+        | (123 << 120)
+        | (arity << 104)
+        | (7 << 40)
+        | (0 << 24)
+        | (condition_index << 8)
+        | outcome_index
+    )
+
+
+def v3_condition(position_id):
+    return '0x' + f'{int(position_id) >> 8:062x}'
+
+
+def v3_market(*, module_id=1, arity=0, condition_index=0):
+    yes = v3_position(
+        module_id,
+        arity=arity,
+        condition_index=condition_index,
+        outcome_index=0,
+    )
+    no = v3_position(
+        module_id,
+        arity=arity,
+        condition_index=condition_index,
+        outcome_index=1,
+    )
+    return {
+        'id': 'v3-market',
+        'conditionId': v3_condition(yes),
+        'question': 'V3 offline fixture',
+        'clobTokenIds': [],
+        'positionIds': [yes, no],
+        'outcomes': ['Yes', 'No'],
+        'outcomePrices': ['0.4', '0.6'],
+        'volume24hr': 2000,
+        'volume': 10000,
+        'active': True,
+        'closed': False,
+        'acceptingOrders': True,
+        'endDate': '2027-01-01T00:00:00Z',
+    }
+
+
+class CollectorV3CoverageTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name)
+        self.store=CollectorStore(self.root/'collector-v3.db')
+        self.store.initialize(100,h(100))
+        self.addCleanup(self.store.close)
+
+    def test_v3_is_monitored_without_mutating_legacy_exchange_constant(self):
+        self.assertEqual(len(collector.EXCHANGES), 2)
+        self.assertEqual(
+            tuple(collector.MONITORED_EXCHANGES),
+            tuple(collector.EXCHANGES) + (collector.EXCHANGE_V3,),
+        )
+
+        seen=[]
+        def rpc(method, params):
+            self.assertEqual(method, 'eth_getLogs')
+            seen.append(params[0]['address'].lower())
+            return []
+
+        with patch.object(collector, 'rpc_call', side_effect=rpc):
+            self.assertEqual(REAL_GET_LOGS(101, 102), [])
+
+        self.assertEqual(
+            set(seen),
+            {address.lower() for address in collector.MONITORED_EXCHANGES},
+        )
+
+    def test_v3_binary_position_map_binds_condition_outcome_and_asset_type(self):
+        raw=v3_market()
+        result=collector.build_position_map([raw])
+        yes,no=raw['positionIds']
+        self.assertEqual(set(result), {yes,no})
+        self.assertEqual(result[yes]['condition_id'], raw['conditionId'])
+        self.assertEqual(result[yes]['outcome'], 'Yes')
+        self.assertEqual(result[no]['outcome'], 'No')
+        self.assertEqual(result[yes]['asset_type'], 'POSITION')
+        self.assertEqual(result[yes]['protocol_version'], 'V2')
+        self.assertEqual(result[yes]['position_module'], 'BINARY')
+        self.assertEqual(result[yes]['position_outcome_index'], 0)
+        self.assertEqual(result[no]['position_outcome_index'], 1)
+
+    def test_v3_negrisk_position_map_is_supported(self):
+        raw=v3_market(module_id=2, arity=3, condition_index=1)
+        result=collector.build_position_map([raw])
+        yes=raw['positionIds'][0]
+        self.assertEqual(result[yes]['position_module'], 'NEG_RISK')
+        self.assertEqual(result[yes]['position_condition_index'], 1)
+        self.assertEqual(result[yes]['position_arity'], 3)
+
+    def test_complete_ctf_pair_wins_over_parallel_position_ids(self):
+        raw=v3_market()
+        raw['conditionId']=h(999)
+        raw['clobTokenIds']=['123','456']
+        self.assertEqual(collector.build_position_map([raw]), {})
+        assets=collector.build_asset_map([raw])
+        self.assertEqual(set(assets), {'123','456'})
+        self.assertNotIn(raw['positionIds'][0], assets)
+
+    def test_v3_condition_or_outcome_mismatch_fails_closed(self):
+        wrong_condition=v3_market()
+        wrong_condition['conditionId']='0x'+'11'*31
+        self.assertEqual(collector.build_position_map([wrong_condition]), {})
+
+        wrong_outcome=v3_market()
+        wrong_outcome['outcomes']=['No','Yes']
+        self.assertEqual(collector.build_position_map([wrong_outcome]), {})
+
+    def test_v3_position_lookup_uses_position_ids_filter(self):
+        raw=v3_market()
+        position_id=raw['positionIds'][0]
+
+        class Response:
+            def raise_for_status(self):
+                pass
+            def json(self):
+                return [raw]
+
+        with patch.object(collector.requests, 'get', return_value=Response()) as get:
+            result=collector.lookup_position_market(position_id)
+
+        self.assertEqual(result['position_id'], position_id)
+        self.assertEqual(result['asset_type'], 'POSITION')
+        params=get.call_args.kwargs['params']
+        self.assertEqual(params['position_ids'], [position_id])
+        self.assertNotIn('clob_token_ids', params)
+
+    def test_v3_binary_trade_enters_existing_runtime_contract_with_explicit_asset_kind(self):
+        raw=v3_market()
+        position_id=raw['positionIds'][0]
+        assets=collector.GammaTokenMap(collector.build_asset_map([raw]))
+        v3log=event(
+            101,
+            int(position_id),
+            collector.EXCHANGE_V3,
+            side=0,
+        )
+
+        with patch.object(collector, 'get_latest_block', return_value=125), \
+             patch.object(collector, 'get_block_header', side_effect=header), \
+             patch.object(collector, 'get_order_filled_logs', return_value=[v3log]), \
+             patch.object(collector, 'publish_snapshot', return_value=1):
+            self.assertEqual(collector.scan_once(self.store, assets), 1)
+
+        row=self.store.recent_trades(0)[-1]
+        self.assertEqual(row['token_id'], position_id)
+        self.assertEqual(row['asset_id'], position_id)
+        self.assertEqual(row['asset_type'], 'POSITION')
+        self.assertEqual(row['position_id'], position_id)
+        self.assertIsNone(row['ctf_token_id'])
+        self.assertEqual(row['protocol_version'], 'V2')
+        self.assertEqual(row['position_module'], 'BINARY')
+        self.assertEqual(row['condition_id'], raw['conditionId'])
+        self.assertEqual(row['outcome'], 'Yes')
+        self.assertEqual(row['transaction_hash'], v3log['transactionHash'])
+        self.assertEqual(row['log_index'], int(v3log['logIndex'], 16))
+        self.assertEqual(row['side_label'], 'BUY')
+        self.assertEqual(row['trade_usd'], 25)
+        self.assertEqual(row['token_amount'], 50)
+
+    def test_v3_supported_position_missing_identity_retries_without_commit(self):
+        raw=v3_market()
+        position_id=raw['positionIds'][0]
+        v3log=event(101, int(position_id), collector.EXCHANGE_V3)
+        before=self.store.checkpoint()['block_number']
+
+        with patch.object(collector, 'get_latest_block', return_value=125), \
+             patch.object(collector, 'get_block_header', side_effect=header), \
+             patch.object(collector, 'get_order_filled_logs', return_value=[v3log]), \
+             patch.object(
+                 collector,
+                 'lookup_position_market',
+                 side_effect=RuntimeError('Gamma unavailable'),
+             ) as lookup, \
+             patch.object(self.store, 'commit_batch', wraps=self.store.commit_batch) as commit, \
+             patch.object(collector, 'publish_snapshot') as publish:
+            with self.assertRaisesRegex(RuntimeError, 'Gamma unavailable'):
+                collector.scan_once(self.store, collector.GammaTokenMap({}))
+
+        lookup.assert_called_once_with(position_id)
+        commit.assert_not_called()
+        publish.assert_not_called()
+        self.assertEqual(self.store.checkpoint()['block_number'], before)
+        self.assertEqual(self.store.recent_trades(0), [])
+
+    def test_v3_combinatorial_is_excluded_not_relabelled_as_ctf(self):
+        position_id=v3_position(3, arity=2, condition_index=1, outcome_index=0)
+        v3log=event(101, int(position_id), collector.EXCHANGE_V3)
+
+        with patch.object(collector, 'get_latest_block', return_value=125), \
+             patch.object(collector, 'get_block_header', side_effect=header), \
+             patch.object(collector, 'get_order_filled_logs', return_value=[v3log]), \
+             patch.object(collector, 'lookup_position_market') as lookup, \
+             patch.object(collector, 'publish_snapshot', return_value=0):
+            self.assertEqual(
+                collector.scan_once(self.store, collector.GammaTokenMap({})),
+                0,
+            )
+
+        lookup.assert_not_called()
+        self.assertEqual(self.store.recent_trades(0), [])
+        self.assertEqual(self.store.checkpoint()['block_number'], 105)
 
 if __name__=='__main__':
     unittest.main(verbosity=2)
