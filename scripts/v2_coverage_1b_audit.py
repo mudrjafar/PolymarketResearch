@@ -2,8 +2,9 @@
 
 Consumes a saved V2-COVERAGE-1A JSON report. It checks sampled event evidence
 against transaction receipts and canonical block headers from the configured
-RPC provider, and independently looks up sampled PositionIds in Gamma. It does
-not submit orders, update Collector state, or claim scan completeness.
+RPC provider, and independently looks up sampled PositionIds in Gamma and the
+public active-combo catalog. It does not submit orders, update Collector
+state, or claim scan completeness.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ from typing import Any
 import requests
 
 CLOB_API = "https://clob.polymarket.com"
+COMBO_API = "https://combos-rfq-api.polymarket.com"
+COMBO_PAGE_SIZE = 100
 
 try:  # Support both `python scripts/...py` and package-based tests.
     from .v2_coverage_probe import (
@@ -61,6 +64,179 @@ def _same_event(expected: dict[str, Any], observed: dict[str, Any]) -> bool:
         "metadata", "position_id", "module_id", "module", "classification",
     )
     return all(expected.get(field) == observed.get(field) for field in fields)
+
+
+def decode_v2_position_id(position_id: str) -> dict[str, Any]:
+    """Decode the V2 module and outcome bytes from a decimal PositionId."""
+    if not isinstance(position_id, str) or not position_id.isascii() or not position_id.isdecimal():
+        return {"position_id": position_id, "status": "INVALID_POSITION_ID_ENCODING"}
+    value = int(position_id)
+    if value < 0 or value >= 1 << 256:
+        return {"position_id": position_id, "status": "INVALID_POSITION_ID_ENCODING"}
+    encoded = f"{value:064x}"
+    module_id = int(encoded[:2], 16)
+    outcome_index = int(encoded[-2:], 16)
+    if module_id not in {1, 2, 3} or outcome_index not in {0, 1}:
+        return {
+            "position_id": position_id,
+            "status": "UNRECOGNIZED_V2_POSITION_ID_LAYOUT",
+            "module_id": module_id,
+            "outcome_index": outcome_index,
+        }
+    return {
+        "position_id": position_id,
+        "status": "V2_POSITION_ID_DECODED",
+        "module_id": module_id,
+        "module": {1: "CTF", 2: "NEG_RISK", 3: "COMBO"}[module_id],
+        "condition_id": "0x" + encoded[:-2],
+        "outcome_index": outcome_index,
+        "outcome": "YES" if outcome_index == 0 else "NO",
+    }
+
+
+def _combo_market_ids(market: dict[str, Any]) -> list[str]:
+    """Read SDK-style outcomes or API position_ids without coercing token IDs."""
+    ids = market.get("position_ids", market.get("positionIds"))
+    if ids is not None:
+        parsed = _json_array(ids)
+        if parsed is not None:
+            return [str(value) for value in parsed]
+    outcomes = market.get("outcomes")
+    if isinstance(outcomes, list):
+        result = []
+        for outcome in outcomes:
+            if isinstance(outcome, dict):
+                value = outcome.get("position_id", outcome.get("positionId"))
+                if value is not None:
+                    result.append(str(value))
+            else:
+                result.append("")
+        return result
+    return []
+
+
+def audit_combo_catalog(
+    position_ids: list[str], *, session: Any = requests, max_pages: int = 100
+) -> dict[str, Any]:
+    """Scan public active-combo catalog pages and exact-match sampled IDs.
+
+    This endpoint lists currently eligible combo legs, so a miss is always
+    inconclusive for historical PositionIds. A page cap also makes catalog
+    coverage explicitly incomplete when pagination has not reached its end.
+    """
+    if max_pages < 1:
+        raise ValueError("combo catalog page limit must be positive")
+    wanted = set(position_ids)
+    matches: dict[str, list[dict[str, Any]]] = {item: [] for item in wanted}
+    cursor = None
+    pages = 0
+    try:
+        while pages < max_pages:
+            params: dict[str, Any] = {"limit": COMBO_PAGE_SIZE}
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = session.get(
+                f"{COMBO_API}/v1/rfq/combo-markets", params=params, timeout=15
+            )
+            response.raise_for_status()
+            body = response.json()
+            if not isinstance(body, dict) or not isinstance(body.get("markets"), list):
+                return {
+                    "status": "COMBO_CATALOG_INVALID_RESPONSE",
+                    "pages_scanned": pages,
+                    "catalog_complete": False,
+                    "results": [],
+                }
+            pages += 1
+            for market in body["markets"]:
+                if not isinstance(market, dict):
+                    continue
+                ids = _combo_market_ids(market)
+                for index, value in enumerate(ids):
+                    if value in wanted:
+                        outcomes = _json_array(market.get("outcomes"))
+                        label = (
+                            outcomes[index]
+                            if outcomes and index < len(outcomes)
+                            else "YES" if index == 0
+                            else "NO" if index == 1
+                            else None
+                        )
+                        matches[value].append({
+                            "condition_id": market.get("condition_id", market.get("conditionId")),
+                            "slug": market.get("slug"),
+                            "title": market.get("title"),
+                            "position_id_index": index,
+                            "outcome": label,
+                        })
+            cursor = body.get("next_cursor")
+            if not cursor:
+                break
+    except requests.Timeout:
+        return {
+            "status": "COMBO_CATALOG_TIMEOUT",
+            "pages_scanned": pages,
+            "catalog_complete": False,
+            "results": [],
+        }
+    except requests.HTTPError as exc:
+        response = getattr(exc, "response", None)
+        return {
+            "status": "COMBO_CATALOG_HTTP_ERROR",
+            "http_status": getattr(response, "status_code", None),
+            "pages_scanned": pages,
+            "catalog_complete": False,
+            "results": [],
+        }
+    except requests.RequestException as exc:
+        return {
+            "status": "COMBO_CATALOG_REQUEST_ERROR",
+            "error_type": type(exc).__name__,
+            "pages_scanned": pages,
+            "catalog_complete": False,
+            "results": [],
+        }
+    except (ValueError, TypeError):
+        return {
+            "status": "COMBO_CATALOG_INVALID_JSON",
+            "pages_scanned": pages,
+            "catalog_complete": False,
+            "results": [],
+        }
+    except Exception as exc:
+        return {
+            "status": "COMBO_CATALOG_CLIENT_ERROR",
+            "error_type": type(exc).__name__,
+            "pages_scanned": pages,
+            "catalog_complete": False,
+            "results": [],
+        }
+
+    complete = not cursor
+    results = []
+    for position_id in position_ids:
+        exact = matches.get(position_id, [])
+        if len(exact) == 1:
+            results.append({
+                "position_id": position_id,
+                "status": "EXACT_COMBO_POSITION_ID_MATCH",
+                **exact[0],
+            })
+        elif exact:
+            results.append({
+                "position_id": position_id,
+                "status": "COMBO_POSITION_ID_MATCH_NOT_UNIQUE",
+                "match_count": len(exact),
+            })
+        else:
+            results.append({"position_id": position_id, "status": "NO_EXACT_ACTIVE_COMBO_MATCH_INCONCLUSIVE"})
+    return {
+        "status": "COMBO_CATALOG_COMPLETE" if complete else "COMBO_CATALOG_PAGE_LIMIT_REACHED",
+        "pages_scanned": pages,
+        "catalog_complete": complete,
+        "page_limit": max_pages,
+        "results": results,
+    }
 
 
 def audit_receipt_event(rpc: JsonRpcReader, expected: dict[str, Any]) -> dict[str, Any]:
@@ -239,11 +415,12 @@ def run_audit(
     *,
     receipt_sample: int = 10,
     gamma_sample: int = 25,
+    combo_max_pages: int = 100,
     session: Any = requests,
     rpc: JsonRpcReader | None = None,
 ) -> dict[str, Any]:
-    if receipt_sample < 0 or gamma_sample < 0:
-        raise ValueError("sample limits must be non-negative")
+    if receipt_sample < 0 or gamma_sample < 0 or combo_max_pages < 1:
+        raise ValueError("receipt/gamma sample limits must be non-negative and combo_max_pages must be positive")
     if not isinstance(source_report, dict) or source_report.get("probe") != "POLYMARKET_V2_EXCHANGE_V3_COVERAGE":
         raise ValueError("input must be a V2 coverage probe JSON report")
     rpc = rpc or JsonRpcReader(rpc_url)
@@ -280,6 +457,23 @@ def run_audit(
         else {"position_id": None, "status": "INVALID_POSITION_ID_SAMPLE"}
         for item in position_ids
     ]
+    decoded_results = [
+        decode_v2_position_id(item) if isinstance(item, str)
+        else {"position_id": None, "status": "INVALID_POSITION_ID_SAMPLE"}
+        for item in position_ids
+    ]
+    combo_position_ids = [
+        item for item, decoded in zip(position_ids, decoded_results)
+        if isinstance(item, str) and decoded.get("module_id") == 3
+    ]
+    combo_catalog = audit_combo_catalog(
+        combo_position_ids, session=session, max_pages=combo_max_pages
+    ) if combo_position_ids else {
+        "status": "NO_COMBO_POSITION_IDS_SAMPLED",
+        "pages_scanned": 0,
+        "catalog_complete": True,
+        "results": [],
+    }
     receipt_counts: dict[str, int] = {}
     gamma_counts: dict[str, int] = {}
     clob_counts: dict[str, int] = {}
@@ -311,7 +505,12 @@ def run_audit(
             "sampled_position_ids": len(gamma_results),
             "result_counts": dict(sorted(gamma_counts.items())),
             "results": gamma_results,
-            "identity_rule": "Exact Gamma positionIds match is required; CTF clobTokenIds are preserved separately and never treated as V3 PositionIds.",
+            "decoded_v2_position_ids": decoded_results,
+            "identity_rule": "Exact position ID matches are required. Module-3 combo IDs are checked against the public active-combo catalog; Gamma misses and CLOB book misses are inconclusive.",
+            "combo_catalog": {
+                **combo_catalog,
+                "identity_rule": "Only exact position_ids/outcome.position_id matches confirm current active-combo catalog membership. Historical absence and capped pagination are inconclusive.",
+            },
             "clob_order_identifier": "positionID",
             "clob_public_read": {
                 "sampled_position_ids": len(clob_results),
@@ -327,6 +526,8 @@ def run_audit(
             "Gamma misses are inconclusive and do not prove that a PositionId is absent.",
             "CLOB book lookup errors are inconclusive and do not prove that a PositionId is absent.",
             "CLOB token IDs are reported separately; no orders, market actions, or production integrations are performed.",
+            "The public combo catalog contains currently eligible legs and may not include historical or inactive combo positions.",
+            "Combo catalog pagination is capped by combo_max_pages; a capped scan does not prove catalog absence.",
             "The audit does not update Collector, Flow, Paper, or other runtime state.",
         ],
     }
@@ -337,6 +538,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report", required=True, help="saved JSON report emitted by v2_coverage_probe.py")
     parser.add_argument("--receipt-sample", type=int, default=10)
     parser.add_argument("--gamma-sample", type=int, default=25)
+    parser.add_argument(
+        "--combo-max-pages",
+        type=int,
+        default=100,
+        help="maximum public combo catalog pages to inspect (100 entries per page)",
+    )
     parser.add_argument("--env-file", help="optional .env file; only POLYMARKET_RPC_URL is read")
     args = parser.parse_args(argv)
     try:
@@ -351,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
             rpc_url,
             receipt_sample=args.receipt_sample,
             gamma_sample=args.gamma_sample,
+            combo_max_pages=args.combo_max_pages,
         )
     except (OSError, UnicodeError, json.JSONDecodeError, ProbeError, ValueError) as exc:
         print(f"V2 coverage 1B audit failed: {exc}", file=sys.stderr)

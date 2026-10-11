@@ -71,9 +71,10 @@ class FakeResponse:
 
 
 class FakeGamma:
-    def __init__(self, markets, clob_book=None):
+    def __init__(self, markets, clob_book=None, combo_pages=None):
         self.markets = markets
         self.clob_book = clob_book
+        self.combo_pages = combo_pages or [{"markets": [], "next_cursor": None}]
         self.calls = []
 
     def get(self, url, *, params, timeout):
@@ -82,7 +83,71 @@ class FakeGamma:
             if isinstance(self.clob_book, Exception):
                 raise self.clob_book
             return FakeResponse(self.clob_book)
+        if url.endswith("/combo-markets"):
+            page = len([call for call in self.calls if call[0].endswith("/combo-markets")]) - 1
+            return FakeResponse(self.combo_pages[page])
         return FakeResponse(self.markets)
+
+
+@pytest.mark.parametrize(("module_id", "module", "outcome_index", "outcome"), [
+    (1, "CTF", 0, "YES"),
+    (2, "NEG_RISK", 1, "NO"),
+    (3, "COMBO", 0, "YES"),
+])
+def test_v2_position_id_decoder(module_id, module, outcome_index, outcome):
+    value = (module_id << 248) | (123 << 120) | outcome_index
+    result = audit.decode_v2_position_id(str(value))
+    assert result["status"] == "V2_POSITION_ID_DECODED"
+    assert result["module_id"] == module_id
+    assert result["module"] == module
+    assert result["outcome_index"] == outcome_index
+    assert result["outcome"] == outcome
+
+
+def test_v2_position_id_decoder_rejects_invalid_layout():
+    assert audit.decode_v2_position_id("-1")["status"] == "INVALID_POSITION_ID_ENCODING"
+    assert audit.decode_v2_position_id("0")["status"] == "UNRECOGNIZED_V2_POSITION_ID_LAYOUT"
+
+
+def test_combo_catalog_requires_exact_position_id_and_reports_market_metadata():
+    position_id = str((3 << 248) | (123 << 120))
+    session = FakeGamma([], combo_pages=[{
+        "markets": [{
+            "condition_id": "0xcondition",
+            "slug": "combo-slug",
+            "title": "Combo title",
+            "position_ids": [position_id, "different-id"],
+            "outcomes": ["YES", "NO"],
+        }],
+        "next_cursor": None,
+    }])
+    result = audit.audit_combo_catalog([position_id], session=session)
+    assert result["status"] == "COMBO_CATALOG_COMPLETE"
+    assert result["catalog_complete"] is True
+    assert result["results"] == [{
+        "position_id": position_id,
+        "status": "EXACT_COMBO_POSITION_ID_MATCH",
+        "condition_id": "0xcondition",
+        "slug": "combo-slug",
+        "title": "Combo title",
+        "position_id_index": 0,
+        "outcome": "YES",
+    }]
+    assert session.calls[0][0] == f"{audit.COMBO_API}/v1/rfq/combo-markets"
+    assert session.calls[0][1] == {"limit": 100}
+
+
+def test_combo_catalog_paginates_and_keeps_misses_inconclusive_at_page_cap():
+    position_id = str((3 << 248) | (123 << 120))
+    session = FakeGamma([], combo_pages=[
+        {"markets": [], "next_cursor": "page-2"},
+        {"markets": [], "next_cursor": "page-3"},
+    ])
+    result = audit.audit_combo_catalog([position_id], session=session, max_pages=2)
+    assert result["status"] == "COMBO_CATALOG_PAGE_LIMIT_REACHED"
+    assert result["catalog_complete"] is False
+    assert result["results"][0]["status"] == "NO_EXACT_ACTIVE_COMBO_MATCH_INCONCLUSIVE"
+    assert session.calls[1][1] == {"limit": 100, "cursor": "page-2"}
 
 
 def test_receipt_event_and_canonical_block_match():
@@ -216,6 +281,8 @@ def test_run_audit_reports_sample_only_and_never_claims_completeness():
     assert output["receipt_provenance"]["completeness_claim_allowed"] is False
     assert output["position_identity"]["result_counts"] == {"EXACT_POSITION_ID_MATCH": 1}
     assert output["position_identity"]["clob_public_read"]["result_counts"] == {"EXACT_CLOB_ASSET_ID_MATCH": 1}
+    assert output["position_identity"]["decoded_v2_position_ids"][0]["module"] == "CTF"
+    assert output["position_identity"]["combo_catalog"]["status"] == "NO_COMBO_POSITION_IDS_SAMPLED"
 
 
 def test_run_audit_rejects_wrong_chain():
