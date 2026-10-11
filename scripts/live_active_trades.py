@@ -18,17 +18,29 @@ from collector_storage_v4.bridge import CollectorLock, publish_snapshot
 import requests
 from eth_abi import decode
 
+from scripts.v3_identity import (
+    V3_EXCHANGE_ADDRESS,
+    V3IdentityError,
+    condition_matches_position,
+    decode_position_id,
+    expected_outcome_label,
+)
+
 RPC_URL = os.getenv("POLYMARKET_RPC_URL", "").strip()
 if not RPC_URL:
     raise SystemExit("Missing POLYMARKET_RPC_URL environment variable.")
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
-# Polymarket CTF Exchange V2 + NegRisk CTF Exchange V2 (Polygon).
+# Legacy Polymarket CTF Exchange V2 + NegRisk CTF Exchange V2 (Polygon).
+# EXCHANGES remains the public legacy pair for compatibility with existing
+# tests/callers. Runtime log coverage additionally includes Exchange V3.
 EXCHANGES = [
     "0xE111180000d2663C0091e4f400237545B87B996B",
     "0xe2222d279d744050d28e00520010520000310F59",
 ]
+EXCHANGE_V3 = V3_EXCHANGE_ADDRESS
+MONITORED_EXCHANGES = tuple(EXCHANGES) + (EXCHANGE_V3,)
 
 # V2: OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)
 ORDER_FILLED_TOPIC = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
@@ -140,8 +152,10 @@ def get_order_filled_logs(from_block, to_block):
             log["_exchange_address"] = exchange
         return result
 
-    with __import__("concurrent.futures").futures.ThreadPoolExecutor(max_workers=2) as pool:
-        batches = list(pool.map(fetch_exchange, EXCHANGES))
+    with __import__("concurrent.futures").futures.ThreadPoolExecutor(
+        max_workers=len(MONITORED_EXCHANGES)
+    ) as pool:
+        batches = list(pool.map(fetch_exchange, MONITORED_EXCHANGES))
     logs = [log for batch in batches for log in batch]
     logs.sort(key=lambda x: (int(x["blockNumber"], 16), int(x["logIndex"], 16)))
     return logs
@@ -273,28 +287,82 @@ class GammaIdentityConflict(StorageError):
 def _gamma_identity(token_id, market):
     token = str(token_id).strip()
     if not token.isascii() or not token.isdecimal() or not isinstance(market, dict):
-        raise StorageError('Gamma token identity is unavailable or invalid')
+        raise StorageError('Gamma asset identity is unavailable or invalid')
+
     condition = market.get('condition_id')
     outcome = market.get('outcome')
     market_id = market.get('market_id')
     if not isinstance(condition, str) or not isinstance(outcome, str) or not outcome.strip():
         raise StorageError('Gamma condition/outcome identity is required')
+
+    asset_type = str(market.get('asset_type') or 'CTF_TOKEN').strip().upper()
+
+    if asset_type == 'POSITION':
+        try:
+            position = decode_position_id(token)
+        except V3IdentityError as exc:
+            raise StorageError('Gamma V3 position identity is invalid') from exc
+
+        if position['classification'] != 'SUPPORTED':
+            raise StorageError('Gamma V3 position module is unsupported')
+
+        stored_position = str(market.get('position_id') or '').strip()
+        if stored_position != position['position_id']:
+            raise StorageError('Gamma V3 position identity does not match asset id')
+
+        if not condition_matches_position(condition, position['condition_id']):
+            raise StorageError('Gamma V3 condition does not match position id')
+
+        label = outcome.strip()
+        if label.casefold() != expected_outcome_label(position['outcome_index']):
+            raise StorageError('Gamma V3 outcome label does not match position index')
+
+        return {
+            'token_id': position['position_id'],
+            'market_id': market_id,
+            'condition_id': position['condition_id'],
+            'outcome': label,
+            'asset_type': 'POSITION',
+            'position_id': position['position_id'],
+            'protocol_version': 'V2',
+            'position_module': position['module'],
+            'position_module_id': position['module_id'],
+            'position_condition_index': position['condition_index'],
+            'position_outcome_index': position['outcome_index'],
+            'position_arity': position['arity'],
+        }
+
+    if asset_type != 'CTF_TOKEN':
+        raise StorageError('Gamma asset type is unsupported')
+
     condition = condition.strip().lower()
     if (len(condition) != 66 or not condition.startswith('0x')
-            or any(c not in '0123456789abcdef' for c in condition[2:])):
+            or any(ch not in '0123456789abcdef' for ch in condition[2:])):
         raise StorageError('Gamma condition identity is invalid')
-    return {'token_id': token, 'market_id': market_id,
-            'condition_id': condition, 'outcome': outcome.strip()}
+
+    return {
+        'token_id': token,
+        'market_id': market_id,
+        'condition_id': condition,
+        'outcome': outcome.strip(),
+    }
 
 
 def _check_gamma_identity(known, identity):
-    if known is not None and (
+    if known is None:
+        return
+
+    known_type = str(known.get('asset_type') or 'CTF_TOKEN').upper()
+    identity_type = str(identity.get('asset_type') or 'CTF_TOKEN').upper()
+    if (
         known['token_id'] != identity['token_id']
         or known['condition_id'] != identity['condition_id']
         or known['outcome'].casefold() != identity['outcome'].casefold()
+        or known_type != identity_type
+        or str(known.get('position_id') or '') != str(identity.get('position_id') or '')
     ):
         # market_id is provenance, not a canonical contradiction by itself.
-        raise GammaIdentityConflict('Gamma token condition/outcome identity conflict')
+        raise GammaIdentityConflict('Gamma asset condition/outcome identity conflict')
 
 
 def _fresh_gamma_entry(identity, market):
@@ -303,6 +371,18 @@ def _fresh_gamma_entry(identity, market):
     entry.setdefault('market_id', None)
     entry['condition_id'] = identity['condition_id']
     entry['outcome'] = identity['outcome']
+    if identity.get('asset_type') == 'POSITION':
+        for field in (
+            'asset_type',
+            'position_id',
+            'protocol_version',
+            'position_module',
+            'position_module_id',
+            'position_condition_index',
+            'position_outcome_index',
+            'position_arity',
+        ):
+            entry[field] = identity[field]
     return entry
 
 
@@ -390,18 +470,131 @@ def build_token_map(markets):
     return token_map
 
 
+def _complete_legacy_token_pair(token_ids, outcomes):
+    if len(token_ids) != 2 or len(outcomes) != 2:
+        return False
+    labels = [str(value or "").strip().casefold() for value in outcomes]
+    if labels != ["yes", "no"]:
+        return False
+    return all(
+        str(value or "").strip().isascii()
+        and str(value or "").strip().isdecimal()
+        for value in token_ids
+    )
+
+
+def _position_market_entries(market):
+    """Return eligible V3 binary/NegRisk outcome entries, otherwise none.
+
+    Markets with a complete legacy YES/NO CTF token pair are intentionally
+    treated as legacy CTF even if Gamma also exposes positionIds (e.g. combo
+    metadata). That prevents position IDs from silently replacing CTF assets.
+    """
+    if not isinstance(market, dict):
+        return []
+
+    token_ids=parse_json_field(market.get("clobTokenIds"), [])
+    position_ids=parse_json_field(market.get("positionIds"), [])
+    outcomes=parse_json_field(market.get("outcomes"), [])
+    prices=parse_json_field(market.get("outcomePrices"), [])
+
+    if _complete_legacy_token_pair(token_ids, outcomes):
+        return []
+    if len(position_ids) != 2 or len(outcomes) != 2:
+        return []
+
+    labels=[str(value or "").strip() for value in outcomes]
+    if [value.casefold() for value in labels] != ["yes", "no"]:
+        return []
+
+    entries=[]
+    for i, raw_position in enumerate(position_ids):
+        try:
+            position=decode_position_id(raw_position)
+        except V3IdentityError:
+            return []
+
+        if position["classification"] != "SUPPORTED":
+            return []
+        if position["outcome_index"] != i:
+            return []
+        if labels[i].casefold() != expected_outcome_label(position["outcome_index"]):
+            return []
+        if not condition_matches_position(
+            market.get("conditionId"),
+            position["condition_id"],
+        ):
+            return []
+
+        entries.append((
+            position["position_id"],
+            {
+                "market_id": market.get("id"),
+                "condition_id": position["condition_id"],
+                "question": market.get("question"),
+                "outcome": labels[i],
+                "price": prices[i] if i < len(prices) else None,
+                "volume24hr": market.get("volume24hr"),
+                "volume": market.get("volume"),
+                "end_date": market.get("endDate"),
+                "start_date": market.get("startDate"),
+                "closed": market.get("closed"),
+                "active": market.get("active"),
+                "accepting_orders": market.get("acceptingOrders"),
+                "asset_type": "POSITION",
+                "position_id": position["position_id"],
+                "protocol_version": "V2",
+                "position_module": position["module"],
+                "position_module_id": position["module_id"],
+                "position_condition_index": position["condition_index"],
+                "position_outcome_index": position["outcome_index"],
+                "position_arity": position["arity"],
+            },
+        ))
+
+    return entries
+
+
+def build_position_map(markets):
+    position_map={}
+    for market in markets:
+        for position_id, entry in _position_market_entries(market):
+            if position_id in position_map:
+                _check_gamma_identity(
+                    _gamma_identity(position_id, position_map[position_id]),
+                    _gamma_identity(position_id, entry),
+                )
+            position_map[position_id]=entry
+    return position_map
+
+
+def build_asset_map(markets):
+    result=build_token_map(markets)
+    for position_id, entry in build_position_map(markets).items():
+        if position_id in result:
+            raise GammaIdentityConflict(
+                "Gamma asset id is ambiguous between CTF token and V3 position"
+            )
+        result[position_id]=entry
+    return result
+
+
 def decode_order_filled(log):
     data=bytes.fromhex(log["data"][2:])
     decoded=decode(["uint256","uint256","uint256","uint256","uint256","bytes32","bytes32"], data)
     topics=log["topics"]
     if len(topics) != 4 or topics[0].lower() != ORDER_FILLED_TOPIC:
         raise RuntimeError('Unexpected OrderFilled event topics')
+    asset_id = str(decoded[1])
     return {
         "order_hash": topics[1],
         "maker": "0x" + topics[2][-40:],
         "taker": "0x" + topics[3][-40:],
         "side": int(decoded[0]),
-        "token_id": str(decoded[1]),
+        "asset_id": asset_id,
+        # Compatibility alias used throughout the existing runtime. For
+        # Exchange V3 this value is a position_id, not a legacy CTF token id.
+        "token_id": asset_id,
         "maker_amount": int(decoded[2]),
         "taker_amount": int(decoded[3]),
         "fee": int(decoded[4]),
@@ -713,11 +906,60 @@ def lookup_market(token_id):
         _live1f_safe(_live1f_observe, diagnostic, token_id)
 
 
+def lookup_position_market(position_id):
+    """Resolve a supported V3 position through Gamma, fail-closed on ambiguity."""
+    position_id = str(position_id).strip()
+    try:
+        position = decode_position_id(position_id)
+    except V3IdentityError as exc:
+        raise StorageError("V3 position identity is invalid") from exc
+
+    if position["classification"] != "SUPPORTED":
+        raise StorageError("V3 position module is unsupported")
+
+    for closed in (False, True):
+        response = requests.get(
+            f"{GAMMA_API}/markets",
+            params={
+                "position_ids": [position_id],
+                "closed": closed,
+                "limit": 100,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        markets = response.json()
+        if not isinstance(markets, list):
+            raise RuntimeError("Gamma position lookup returned an invalid response")
+        if not markets:
+            continue
+
+        position_map = build_position_map(markets)
+        market = position_map.get(position_id)
+        if market is not None:
+            return market
+
+        raise GammaIdentityConflict(
+            "Gamma position metadata is not an eligible V2 binary/NegRisk identity"
+        )
+
+    raise RuntimeError(
+        "Aggressor position metadata unavailable; batch will be retried"
+    )
+
+
 def load_market_map():
     markets=get_active_markets()
-    token_map=build_token_map(markets)
-    print(f"[COLLECTOR] Active markets: {len(markets)} | token mappings: {len(token_map)}")
-    return token_map
+    asset_map=build_asset_map(markets)
+    positions=sum(
+        1 for market in asset_map.values()
+        if isinstance(market,dict) and market.get("asset_type")=="POSITION"
+    )
+    print(
+        f"[COLLECTOR] Active markets: {len(markets)} | "
+        f"asset mappings: {len(asset_map)} | V3 positions: {positions}"
+    )
+    return asset_map
 
 
 def normalize_trade(log, trade, market, header):
@@ -748,7 +990,35 @@ def normalize_trade(log, trade, market, header):
         "price": market.get("price"),
         "volume24hr": volume24hr,
         "volume": market.get("volume"),
+        # token_id stays the compatibility key consumed by Flow/Focus/Book.
+        # For V3 it contains the position_id; asset_type makes this explicit.
         "token_id": trade["token_id"],
+        "asset_id": trade["asset_id"],
+        "asset_type": (
+            "POSITION"
+            if exchange.lower() == EXCHANGE_V3.lower()
+            else "CTF_TOKEN"
+        ),
+        "position_id": (
+            trade["asset_id"]
+            if exchange.lower() == EXCHANGE_V3.lower()
+            else None
+        ),
+        "ctf_token_id": (
+            trade["asset_id"]
+            if exchange.lower() != EXCHANGE_V3.lower()
+            else None
+        ),
+        "protocol_version": (
+            "V2"
+            if exchange.lower() == EXCHANGE_V3.lower()
+            else "LEGACY_CTF"
+        ),
+        "position_module": market.get("position_module"),
+        "position_module_id": market.get("position_module_id"),
+        "position_condition_index": market.get("position_condition_index"),
+        "position_outcome_index": market.get("position_outcome_index"),
+        "position_arity": market.get("position_arity"),
         "order_hash": trade["order_hash"],
         "maker": trade["maker"],
         "taker": trade["taker"],
@@ -802,7 +1072,7 @@ def scan_once(store, token_map):
     with __import__("concurrent.futures").futures.ThreadPoolExecutor(max_workers=5) as pool:
         headers = list(pool.map(get_block_header, range(from_block, to_block + 1)))
     by_number = {header['block_number']: header for header in headers}
-    # get_order_filled_logs returns only after BOTH exchanges succeed.
+    # get_order_filled_logs returns only after ALL monitored exchanges succeed.
     logs = get_order_filled_logs(from_block, to_block)
     rows = []
     for log in logs:
@@ -814,16 +1084,54 @@ def scan_once(store, token_map):
         exchange = log['_exchange_address']
         if trade['taker'].lower() != exchange.lower():
             continue
-        market = token_map.get(trade['token_id'])
+
+        asset_id = trade['asset_id']
+        is_v3 = exchange.lower() == EXCHANGE_V3.lower()
+
+        if is_v3:
+            try:
+                position = decode_position_id(asset_id)
+            except V3IdentityError:
+                position = {"classification": "FAIL_CLOSED", "module": "INVALID"}
+
+            if position["classification"] != "SUPPORTED":
+                # Combinatorial/unknown V3 assets are intentionally excluded
+                # from the binary decision pipeline. They are never relabeled
+                # as CTF tokens and never emitted as trades.
+                record = globals().get("_LIVE1C_CURRENT")
+                if isinstance(record, dict):
+                    record["v3_unsupported_events"] = (
+                        int(record.get("v3_unsupported_events", 0)) + 1
+                    )
+                continue
+
+        market = token_map.get(asset_id)
         if market is None:
-            market = lookup_market(trade['token_id'])
+            market = (
+                lookup_position_market(asset_id)
+                if is_v3
+                else lookup_market(asset_id)
+            )
             if isinstance(token_map, GammaTokenMap):
-                market = token_map.remember_fallback(trade['token_id'], market)
+                market = token_map.remember_fallback(asset_id, market)
             else:
                 # Preserve the dict API for callers while never caching failures.
-                identity = _gamma_identity(trade['token_id'], market)
+                identity = _gamma_identity(asset_id, market)
                 market = _fresh_gamma_entry(identity, market)
-                token_map[trade['token_id']] = market
+                token_map[asset_id] = market
+        else:
+            # A cached asset can never silently change between CTF and V3.
+            _gamma_identity(asset_id, market)
+
+        if is_v3 and market.get("asset_type") != "POSITION":
+            raise GammaIdentityConflict(
+                "Exchange V3 asset resolved to a non-position Gamma identity"
+            )
+        if not is_v3 and market.get("asset_type") == "POSITION":
+            raise GammaIdentityConflict(
+                "Legacy exchange asset resolved to a V3 position identity"
+            )
+
         rows.append(normalize_trade(log, trade, market, header))
     # Recheck the final header after RPC/metadata calls to detect a changed range.
     if get_block_header(to_block)['block_hash'].lower() != headers[-1]['block_hash'].lower():
