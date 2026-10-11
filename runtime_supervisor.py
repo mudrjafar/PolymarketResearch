@@ -103,7 +103,6 @@ class RuntimeSupervisor:
         state.process = process
         state.status = "RUNNING"
         state.last_started_at = now
-        state.last_exit_code = None
         state.next_restart_at = None
         self._set_dirty()
 
