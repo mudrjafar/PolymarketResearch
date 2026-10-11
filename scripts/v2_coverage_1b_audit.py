@@ -1,0 +1,288 @@
+"""Read-only receipt provenance and position-identity audit for V2 coverage.
+
+Consumes a saved V2-COVERAGE-1A JSON report. It checks sampled event evidence
+against transaction receipts and canonical block headers from the configured
+RPC provider, and independently looks up sampled PositionIds in Gamma. It does
+not submit orders, update Collector state, or claim scan completeness.
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import sys
+from typing import Any
+
+import requests
+
+try:  # Support both `python scripts/...py` and package-based tests.
+    from .v2_coverage_probe import (
+        GAMMA_API,
+        JsonRpcReader,
+        POLYGON_CHAIN_ID,
+        ProbeError,
+        _hex_block,
+        _rpc_url_from_config,
+        decode_order_filled,
+    )
+except ImportError:  # pragma: no cover - used by direct script execution
+    from v2_coverage_probe import (
+        GAMMA_API,
+        JsonRpcReader,
+        POLYGON_CHAIN_ID,
+        ProbeError,
+        _hex_block,
+        _rpc_url_from_config,
+        decode_order_filled,
+    )
+
+
+def _json_array(value: Any) -> list[Any] | None:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        return decoded if isinstance(decoded, list) else None
+    return None
+
+
+def _same_event(expected: dict[str, Any], observed: dict[str, Any]) -> bool:
+    fields = (
+        "evidence_id", "transaction_hash", "log_index", "block_number",
+        "block_hash", "exchange_address", "order_hash", "maker", "taker",
+        "taker_aggressor", "flow_role", "side", "side_label",
+        "maker_amount_raw", "taker_amount_raw", "fee_raw", "builder",
+        "metadata", "position_id", "module_id", "module", "classification",
+    )
+    return all(expected.get(field) == observed.get(field) for field in fields)
+
+
+def audit_receipt_event(rpc: JsonRpcReader, expected: dict[str, Any]) -> dict[str, Any]:
+    """Match one decoded 1A event to its receipt log and canonical block header."""
+    tx_hash = expected.get("transaction_hash")
+    try:
+        if not isinstance(tx_hash, str) or len(tx_hash) != 66 or not tx_hash.startswith("0x"):
+            return {"evidence_id": expected.get("evidence_id"), "status": "INVALID_SAMPLE"}
+        receipt = rpc.call("eth_getTransactionReceipt", [tx_hash])
+        if not isinstance(receipt, dict):
+            return {"evidence_id": expected.get("evidence_id"), "status": "RECEIPT_NOT_FOUND"}
+        if str(receipt.get("transactionHash", "")).lower() != tx_hash.lower():
+            return {"evidence_id": expected.get("evidence_id"), "status": "RECEIPT_TX_HASH_MISMATCH"}
+        status_value = receipt.get("status")
+        if status_value is None:
+            return {"evidence_id": expected.get("evidence_id"), "status": "RECEIPT_STATUS_UNVERIFIED"}
+        if _hex_block(status_value, "receipt status") != 1:
+            return {"evidence_id": expected.get("evidence_id"), "status": "TRANSACTION_NOT_SUCCESSFUL"}
+        expected_index = expected.get("log_index")
+        logs = receipt.get("logs")
+        if not isinstance(logs, list):
+            return {"evidence_id": expected.get("evidence_id"), "status": "INVALID_RECEIPT_LOGS"}
+        matching = [
+            item for item in logs
+            if isinstance(item, dict)
+            and _hex_block(item.get("logIndex"), "receipt log index") == expected_index
+        ]
+        if len(matching) != 1:
+            return {"evidence_id": expected.get("evidence_id"), "status": "RECEIPT_LOG_MISSING_OR_AMBIGUOUS"}
+        observed = decode_order_filled(matching[0])
+        if not _same_event(expected, observed):
+            return {"evidence_id": expected.get("evidence_id"), "status": "RECEIPT_EVENT_MISMATCH"}
+        if _hex_block(receipt.get("blockNumber"), "receipt block number") != expected.get("block_number"):
+            return {"evidence_id": expected.get("evidence_id"), "status": "RECEIPT_BLOCK_NUMBER_MISMATCH"}
+        if str(receipt.get("blockHash", "")).lower() != str(expected.get("block_hash", "")).lower():
+            return {"evidence_id": expected.get("evidence_id"), "status": "RECEIPT_BLOCK_HASH_MISMATCH"}
+
+        block = rpc.call("eth_getBlockByNumber", [hex(expected["block_number"]), False])
+        if not isinstance(block, dict) or str(block.get("hash", "")).lower() != str(expected.get("block_hash", "")).lower():
+            return {"evidence_id": expected.get("evidence_id"), "status": "CANONICAL_BLOCK_HASH_MISMATCH"}
+        if _hex_block(block.get("number"), "canonical block number") != expected.get("block_number"):
+            return {"evidence_id": expected.get("evidence_id"), "status": "CANONICAL_BLOCK_NUMBER_MISMATCH"}
+        return {
+            "evidence_id": expected.get("evidence_id"),
+            "transaction_hash": tx_hash.lower(),
+            "log_index": expected_index,
+            "block_number": expected.get("block_number"),
+            "block_hash": str(expected.get("block_hash", "")).lower(),
+            "status": "RECEIPT_AND_CANONICAL_BLOCK_MATCH",
+        }
+    except ProbeError as exc:
+        return {
+            "evidence_id": expected.get("evidence_id"),
+            "status": "RPC_ERROR",
+            "rpc_code": exc.rpc_code,
+            "http_status": exc.http_status,
+            "timed_out": exc.timed_out,
+        }
+    except (KeyError, TypeError, ValueError):
+        return {"evidence_id": expected.get("evidence_id"), "status": "MALFORMED_EVIDENCE_OR_RECEIPT"}
+
+
+def audit_gamma_position(position_id: str, session: Any = requests) -> dict[str, Any]:
+    """Require one exact Gamma PositionId match; keep CTF token IDs separate."""
+    try:
+        response = session.get(
+            f"{GAMMA_API}/markets",
+            params={"position_ids": position_id, "limit": 100},
+            timeout=15,
+        )
+        response.raise_for_status()
+        markets = response.json()
+    except Exception:
+        return {"position_id": position_id, "status": "GAMMA_LOOKUP_ERROR"}
+    if not isinstance(markets, list):
+        return {"position_id": position_id, "status": "GAMMA_INVALID_RESPONSE"}
+
+    exact: list[tuple[dict[str, Any], int]] = []
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        position_ids = _json_array(market.get("positionIds"))
+        if position_ids is None:
+            continue
+        for index, value in enumerate(position_ids):
+            if str(value) == position_id:
+                exact.append((market, index))
+    if not exact:
+        return {
+            "position_id": position_id,
+            "status": "NO_EXACT_POSITION_ID_MATCH_INCONCLUSIVE",
+            "clob_token_ids_treated_as_position_ids": False,
+        }
+    if len(exact) != 1:
+        return {"position_id": position_id, "status": "POSITION_ID_MATCH_NOT_UNIQUE", "match_count": len(exact)}
+
+    market, index = exact[0]
+    outcomes = _json_array(market.get("outcomes"))
+    clob_token_ids = _json_array(market.get("clobTokenIds"))
+    outcome = outcomes[index] if outcomes is not None and len(outcomes) == len(_json_array(market.get("positionIds")) or []) else None
+    return {
+        "position_id": position_id,
+        "status": "EXACT_POSITION_ID_MATCH",
+        "condition_id": market.get("conditionId"),
+        "slug": market.get("slug"),
+        "question": market.get("question"),
+        "position_id_index": index,
+        "outcome_at_index": outcome,
+        "outcome_alignment_status": "ALIGNED" if outcome is not None else "UNVERIFIED",
+        "clob_token_ids": [str(value) for value in clob_token_ids] if clob_token_ids is not None else None,
+        "clob_token_ids_treated_as_position_ids": False,
+        "clob_protocol_identity": "positionID",
+    }
+
+
+def run_audit(
+    source_report: dict[str, Any],
+    rpc_url: str,
+    *,
+    receipt_sample: int = 10,
+    gamma_sample: int = 25,
+    session: Any = requests,
+    rpc: JsonRpcReader | None = None,
+) -> dict[str, Any]:
+    if receipt_sample < 0 or gamma_sample < 0:
+        raise ValueError("sample limits must be non-negative")
+    if not isinstance(source_report, dict) or source_report.get("probe") != "POLYMARKET_V2_EXCHANGE_V3_COVERAGE":
+        raise ValueError("input must be a V2 coverage probe JSON report")
+    rpc = rpc or JsonRpcReader(rpc_url)
+    chain_id = _hex_block(rpc.call("eth_chainId", []), "chain id")
+    if chain_id != POLYGON_CHAIN_ID:
+        raise ProbeError(f"Wrong chain: expected Polygon ({POLYGON_CHAIN_ID}), received {chain_id}")
+
+    reconciliation = source_report.get("reconciliation")
+    activity = source_report.get("activity")
+    if not isinstance(reconciliation, dict) or not isinstance(activity, dict):
+        raise ValueError("input report has no reconciliation/activity evidence")
+    events = reconciliation.get("unique_event_samples", [])
+    positions = activity.get("unique_position_id_samples", [])
+    if not isinstance(events, list) or not isinstance(positions, list):
+        raise ValueError("input report samples are malformed")
+    receipt_results = [
+        audit_receipt_event(rpc, item) if isinstance(item, dict)
+        else {"status": "INVALID_SAMPLE"}
+        for item in events[:receipt_sample]
+    ]
+    position_ids = []
+    for item in positions[:gamma_sample]:
+        if isinstance(item, dict) and isinstance(item.get("position_id"), str):
+            position_ids.append(item["position_id"])
+        else:
+            position_ids.append(None)
+    gamma_results = [
+        audit_gamma_position(item, session=session) if isinstance(item, str)
+        else {"position_id": None, "status": "INVALID_POSITION_ID_SAMPLE"}
+        for item in position_ids
+    ]
+    receipt_counts: dict[str, int] = {}
+    gamma_counts: dict[str, int] = {}
+    for result in receipt_results:
+        status = str(result["status"])
+        receipt_counts[status] = receipt_counts.get(status, 0) + 1
+    for result in gamma_results:
+        status = str(result["status"])
+        gamma_counts[status] = gamma_counts.get(status, 0) + 1
+
+    return {
+        "audit": "POLYMARKET_V2_COVERAGE_1B_RECEIPT_AND_IDENTITY",
+        "read_only": True,
+        "runtime_authority_changed": False,
+        "source_probe": source_report.get("probe"),
+        "source_range": source_report.get("range"),
+        "chain_id": chain_id,
+        "receipt_provenance": {
+            "sampled_events": len(receipt_results),
+            "result_counts": dict(sorted(receipt_counts.items())),
+            "results": receipt_results,
+            "provider_independence": "NOT_ESTABLISHED_SINGLE_CONFIGURED_RPC",
+            "completeness_claim_allowed": False,
+        },
+        "position_identity": {
+            "sampled_position_ids": len(gamma_results),
+            "result_counts": dict(sorted(gamma_counts.items())),
+            "results": gamma_results,
+            "identity_rule": "Exact Gamma positionIds match is required; CTF clobTokenIds are preserved separately and never treated as V3 PositionIds.",
+            "clob_order_identifier": "positionID",
+        },
+        "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "limitations": [
+            "Receipt checks corroborate sampled logs only; they do not prove eth_getLogs completeness.",
+            "All RPC evidence came from one configured provider; independent-provider agreement is not established.",
+            "Gamma misses are inconclusive and do not prove that a PositionId is absent.",
+            "CLOB token IDs are reported separately; no orders, market actions, or production integrations are performed.",
+            "The audit does not update Collector, Flow, Paper, or other runtime state.",
+        ],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Read-only receipt provenance and V2 identity audit")
+    parser.add_argument("--report", required=True, help="saved JSON report emitted by v2_coverage_probe.py")
+    parser.add_argument("--receipt-sample", type=int, default=10)
+    parser.add_argument("--gamma-sample", type=int, default=25)
+    parser.add_argument("--env-file", help="optional .env file; only POLYMARKET_RPC_URL is read")
+    args = parser.parse_args(argv)
+    try:
+        with open(args.report, "r", encoding="utf-8") as handle:
+            source_report = json.load(handle)
+        rpc_url = _rpc_url_from_config(args.env_file)
+        if not rpc_url:
+            print("Missing POLYMARKET_RPC_URL configuration; RPC endpoint was not contacted.", file=sys.stderr)
+            return 2
+        report = run_audit(
+            source_report,
+            rpc_url,
+            receipt_sample=args.receipt_sample,
+            gamma_sample=args.gamma_sample,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ProbeError, ValueError) as exc:
+        print(f"V2 coverage 1B audit failed: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
