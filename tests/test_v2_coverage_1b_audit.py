@@ -135,15 +135,29 @@ def test_active_candidate_discovery_requires_exact_gamma_and_clob_identity():
         "active": True,
         "closed": False,
         "conditionId": condition,
-        "positionIds": [position_id, other_id, combo_id, bad_chain_id],
-        "outcomes": ["YES", "NO", "YES", "YES"],
+        "positionIds": [position_id, other_id],
+        "outcomes": ["YES", "NO"],
+    }, {
+        "id": "combo-pair",
+        "active": True,
+        "closed": False,
+        "conditionId": condition,
+        "positionIds": [combo_id, str((3 << 248) | (123 << 120) | 1)],
+        "outcomes": ["YES", "NO"],
+    }, {
+        "id": "wrong-chain-pair",
+        "active": True,
+        "closed": False,
+        "conditionId": condition,
+        "positionIds": [bad_chain_id, str((1 << 248) | (123 << 120) | (1 << 24) | 1)],
+        "outcomes": ["YES", "NO"],
     }, {
         "id": "wrong-outcome",
         "active": True,
         "closed": False,
         "conditionId": condition,
-        "positionIds": [position_id],
-        "outcomes": ["NO"],
+        "positionIds": [position_id, other_id],
+        "outcomes": ["NO", "YES"],
     }]
     session = FakeGamma(
         {"markets": markets, "next_cursor": None},
@@ -175,7 +189,9 @@ def test_active_candidate_becomes_confirmed_only_after_receipt_and_block_match()
     session = FakeGamma(
         {"markets": [{
             "id": "active-market", "active": True, "closed": False,
-            "conditionId": condition, "positionIds": [position_id], "outcomes": ["YES"],
+            "conditionId": condition,
+            "positionIds": [position_id, str((1 << 248) | (123 << 120) | 1)],
+            "outcomes": ["YES", "NO"],
         }], "next_cursor": None},
         clob_book={"asset_id": position_id, "market": condition},
     )
@@ -220,7 +236,9 @@ def test_active_discovery_preserves_candidates_when_later_gamma_page_fails(monke
             return FakeResponse({
                 "markets": [{
                     "id": "market-1", "active": True, "closed": False,
-                    "conditionId": condition, "positionIds": [position_id], "outcomes": ["YES"],
+                    "conditionId": condition,
+                    "positionIds": [position_id, str((1 << 248) | (123 << 120) | 1)],
+                    "outcomes": ["YES", "NO"],
                 }],
                 "next_cursor": "page-2",
             })
@@ -230,10 +248,21 @@ def test_active_discovery_preserves_candidates_when_later_gamma_page_fails(monke
     assert result["status"] == "GAMMA_LOOKUP_ERROR_INCONCLUSIVE"
     assert result["gamma_scan_complete"] is False
     assert result["gamma_pages_scanned"] == 1
-    assert result["gamma_candidates"] == 1
+    assert result["gamma_candidates"] == 2
     assert result["gamma_error"]["failed_page"] == 2
     assert result["gamma_error"]["retries_on_failed_page"] == audit.GAMMA_MAX_RETRIES
     assert [item["position_id"] for item in result["clob_verified_candidates"]] == [position_id]
+
+
+def test_active_scan_is_capped_to_collector_gamma_page_limit():
+    session = FakeGamma({"markets": [], "next_cursor": None})
+    result = audit.discover_active_v3_candidates(
+        FakeRpc(), session=session, max_pages=1000, lookback_blocks=1
+    )
+    assert result["gamma_page_limit"] == audit.ACTIVE_GAMMA_PAGE_CAP
+    assert result["gamma_pages_requested"] == 1000
+    assert result["gamma_scan_complete"] is True
+    assert len([call for call in session.calls if call[0].endswith("/markets/keyset")]) == 1
 
 
 def test_combo_catalog_requires_exact_position_id_and_reports_market_metadata():

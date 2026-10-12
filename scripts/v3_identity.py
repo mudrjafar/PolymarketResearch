@@ -5,6 +5,8 @@ position-ID bit layout and deliberately distinguishes supported binary/NegRisk
 positions from research-only combinatorial positions.
 """
 
+import json
+
 V3_EXCHANGE_ADDRESS = "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa"
 
 MODULE_BINARY = 1
@@ -18,6 +20,7 @@ MODULE_NAMES = {
 }
 
 SUPPORTED_MODULES = frozenset({MODULE_BINARY, MODULE_NEGRISK})
+ACTIVE_GAMMA_PAGE_CAP = 100
 
 
 class V3IdentityError(ValueError):
@@ -111,3 +114,90 @@ def expected_outcome_label(outcome_index):
     if outcome_index == 1:
         return "no"
     raise V3IdentityError("V3 outcome index is unsupported")
+
+
+def runtime_position_market_entries(market):
+    """Return V3 asset entries accepted by the Collector's runtime rules.
+
+    Keep the full binary/NegRisk pair and legacy CTF precedence checks shared
+    between Collector normalization and read-only candidate audits.
+    """
+    if not isinstance(market, dict):
+        return []
+
+    def values(field):
+        value = market.get(field)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return []
+            return parsed if isinstance(parsed, list) else []
+        return []
+
+    token_ids = values("clobTokenIds")
+    position_ids = values("positionIds")
+    outcomes = values("outcomes")
+    prices = values("outcomePrices")
+
+    if (
+        len(token_ids) == 2
+        and len(outcomes) == 2
+        and [str(value or "").strip().casefold() for value in outcomes] == ["yes", "no"]
+        and all(
+            str(value or "").strip().isascii()
+            and str(value or "").strip().isdecimal()
+            for value in token_ids
+        )
+    ):
+        return []
+    if len(position_ids) != 2 or len(outcomes) != 2:
+        return []
+
+    labels = [str(value or "").strip() for value in outcomes]
+    if [value.casefold() for value in labels] != ["yes", "no"]:
+        return []
+
+    entries = []
+    for index, raw_position in enumerate(position_ids):
+        try:
+            position = decode_position_id(raw_position)
+        except (V3IdentityError, TypeError, ValueError):
+            return []
+        if position["classification"] != "SUPPORTED":
+            return []
+        if position["outcome_index"] != index:
+            return []
+        if labels[index].casefold() != expected_outcome_label(position["outcome_index"]):
+            return []
+        if not condition_matches_position(market.get("conditionId"), position["condition_id"]):
+            return []
+
+        entries.append((
+            position["position_id"],
+            {
+                "market_id": market.get("id"),
+                "condition_id": position["condition_id"],
+                "question": market.get("question"),
+                "outcome": labels[index],
+                "price": prices[index] if index < len(prices) else None,
+                "volume24hr": market.get("volume24hr"),
+                "volume": market.get("volume"),
+                "end_date": market.get("endDate"),
+                "start_date": market.get("startDate"),
+                "closed": market.get("closed"),
+                "active": market.get("active"),
+                "accepting_orders": market.get("acceptingOrders"),
+                "asset_type": "POSITION",
+                "position_id": position["position_id"],
+                "protocol_version": "V2",
+                "position_module": position["module"],
+                "position_module_id": position["module_id"],
+                "position_condition_index": position["condition_index"],
+                "position_outcome_index": position["outcome_index"],
+                "position_arity": position["arity"],
+            },
+        ))
+    return entries

@@ -74,7 +74,12 @@ try:  # Support both `python scripts/...py` and package-based tests.
         _scan_logs,
         decode_order_filled,
     )
-    from .v3_identity import V3IdentityError, condition_matches_position, decode_position_id
+    from .v3_identity import (
+        ACTIVE_GAMMA_PAGE_CAP,
+        V3IdentityError,
+        decode_position_id,
+        runtime_position_market_entries,
+    )
 except ImportError:  # pragma: no cover - used by direct script execution
     from v2_coverage_probe import (
         GAMMA_API,
@@ -87,7 +92,12 @@ except ImportError:  # pragma: no cover - used by direct script execution
         _scan_logs,
         decode_order_filled,
     )
-    from v3_identity import V3IdentityError, condition_matches_position, decode_position_id
+    from v3_identity import (
+        ACTIVE_GAMMA_PAGE_CAP,
+        V3IdentityError,
+        decode_position_id,
+        runtime_position_market_entries,
+    )
 
 
 def _json_array(value: Any) -> list[Any] | None:
@@ -461,6 +471,16 @@ def discover_active_v3_candidates(
     Any pagination cap, API miss, or log-range miss is explicitly inconclusive.
     Only the Runtime decoder decides whether a PositionId is eligible.
     """
+    requested_max_pages = max_pages
+    max_pages = min(max_pages, ACTIVE_GAMMA_PAGE_CAP)
+    if requested_max_pages > ACTIVE_GAMMA_PAGE_CAP:
+        print(
+            f"[V2 audit] Capping Gamma scan at the Collector limit "
+            f"({ACTIVE_GAMMA_PAGE_CAP} pages; requested {requested_max_pages})",
+            file=sys.stderr,
+            flush=True,
+        )
+
     candidates: dict[str, dict[str, Any]] = {}
     cursor = None
     seen_cursors = set()
@@ -497,35 +517,20 @@ def discover_active_v3_candidates(
                     continue
                 if market.get("active") is not True or market.get("closed") is not False:
                     continue
-                position_ids = _json_array(market.get("positionIds"))
-                outcomes = _json_array(market.get("outcomes"))
-                if position_ids is None or outcomes is None or len(position_ids) != len(outcomes):
-                    continue
-                condition_id = market.get("conditionId", market.get("condition_id"))
-                for index, raw_id in enumerate(position_ids):
-                    try:
-                        identity = decode_position_id(str(raw_id))
-                    except (V3IdentityError, TypeError, ValueError):
-                        continue
-                    if identity["classification"] != "SUPPORTED":
-                        continue
-                    if not condition_matches_position(condition_id, identity["condition_id"]):
-                        continue
-                    expected_outcome = "YES" if identity["outcome_index"] == 0 else "NO"
-                    if str(outcomes[index]).strip().upper() != expected_outcome:
-                        continue
-                    candidates.setdefault(identity["position_id"], {
-                        "position_id": identity["position_id"],
-                        "module": identity["module"],
-                        "condition_id": identity["condition_id"],
-                        "outcome_index": identity["outcome_index"],
-                        "outcome": expected_outcome,
-                        "gamma_condition_id": condition_id,
+                for position_id, runtime_entry in runtime_position_market_entries(market):
+                    candidates.setdefault(position_id, {
+                        "position_id": position_id,
+                        "module": runtime_entry["position_module"],
+                        "condition_id": runtime_entry["condition_id"],
+                        "outcome_index": runtime_entry["position_outcome_index"],
+                        "outcome": runtime_entry["outcome"].upper(),
+                        "gamma_condition_id": market.get("conditionId", market.get("condition_id")),
                         "market_id": market.get("id"),
                         "slug": market.get("slug"),
                         "active": market.get("active"),
                         "closed": market.get("closed"),
-                        "gamma_identity_status": "EXACT_CONDITION_AND_OUTCOME_MATCH",
+                        "collector_runtime_eligible": True,
+                        "gamma_identity_status": "EXACT_RUNTIME_PAIR_CONDITION_AND_OUTCOME_MATCH",
                     })
             if pages % 25 == 0:
                 print(
@@ -616,6 +621,9 @@ def discover_active_v3_candidates(
         ),
         "read_only": True,
         "gamma_pages_scanned": pages,
+        "gamma_page_limit": max_pages,
+        "gamma_pages_requested": requested_max_pages,
+        "collector_runtime_eligible_candidates": len(candidates),
         "gamma_scan_complete": complete,
         "gamma_candidates": len(candidates),
         "gamma_error": gamma_error,
@@ -759,7 +767,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report", help="saved JSON report emitted by v2_coverage_probe.py")
     parser.add_argument("--discover-active", action="store_true", help="search active Gamma markets for exact V3 candidates, then verify CLOB and finalized fills")
     parser.add_argument("--lookback-blocks", type=int, default=10_000)
-    parser.add_argument("--gamma-max-pages", type=int, default=100)
+    parser.add_argument(
+        "--gamma-max-pages", type=int, default=ACTIVE_GAMMA_PAGE_CAP,
+        help=f"maximum Gamma pages (capped at Collector limit: {ACTIVE_GAMMA_PAGE_CAP})",
+    )
     parser.add_argument("--receipt-sample", type=int, default=10)
     parser.add_argument("--gamma-sample", type=int, default=25)
     parser.add_argument(
