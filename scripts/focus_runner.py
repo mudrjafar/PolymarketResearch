@@ -256,9 +256,18 @@ def run_once(now=None):
     state = load_engine_state()
     input_status, payload = read_risk_snapshot(now=now)
 
-    # Input failure is not equivalent to a valid empty Risk generation.
-    # Preserve Focus authority unchanged until a valid current snapshot exists.
+    # Input failure is not a valid empty Risk generation. Preserve
+    # a healthy Legacy focus, but immediately release old V3/ambiguous locks
+    # even if Risk is missing: an unusable position must not monopolize Focus.
     if input_status != "OK":
+        active = state.get("focus") if isinstance(state, dict) else None
+        if isinstance(active, dict) and not focus_engine.execution_protocol_eligible(active):
+            state, events = focus_engine.step(state, [], now=now)
+            if events:
+                save_json_atomic(STATE_FILE, _state_wrapper(state, None, now))
+                _append_events(events, None)
+            save_json_atomic(FOCUS_FILE, _view(state, input_status, payload, now))
+            return state, events, input_status
         save_json_atomic(FOCUS_FILE, _view(state, input_status, payload, now))
         return state, [], input_status
 
@@ -314,6 +323,12 @@ def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
 def _self_test_candidate(token_id, tx_byte):
     now = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
     return {
+        "asset_type": "CTF_TOKEN",
+        "protocol_version": "LEGACY_CTF",
+        "asset_id": token_id,
+        "ctf_token_id": token_id,
+        "position_id": None,
+        "execution_protocol_eligible": True,
         "token_id": token_id,
         "condition_id": f"condition-{token_id}",
         "outcome": "Yes",
