@@ -30,6 +30,12 @@ def configure_paths(monkeypatch, tmp_path):
 
 def candidate(token_id, block, log_index, at, *, tx_byte="a", risk_ok=True, codes=None):
     return {
+        "asset_type": "CTF_TOKEN",
+        "protocol_version": "LEGACY_CTF",
+        "asset_id": token_id,
+        "ctf_token_id": token_id,
+        "position_id": None,
+        "execution_protocol_eligible": True,
         "token_id": token_id,
         "condition_id": f"condition-{token_id}",
         "outcome": "Yes",
@@ -183,3 +189,53 @@ def test_main_runtime_keeps_risk_and_focus_as_separate_ordered_workers():
     commands = dict(run_machine.SERVICES)
     assert any("risk_worker.py" in str(part) for part in commands["risk"])
     assert any("focus_runner.py" in str(part) for part in commands["focus"])
+
+
+
+def test_runner_v3_only_never_locks(monkeypatch, tmp_path):
+    paths = configure_paths(monkeypatch, tmp_path)
+    row = candidate("v3-position", 100, 1, NOW)
+    row.update(asset_type="POSITION", protocol_version="V2",
+               ctf_token_id=None, position_id="v3-position",
+               execution_protocol_eligible=False)
+    save_json_atomic(paths["risk"], risk_payload("V3", [row]))
+    state, events, status = runner.run_once(now=NOW)
+    assert status == "OK"
+    assert state["focus"] is None
+    assert events == []
+
+
+def test_runner_v3_ranked_before_legacy_locks_legacy(monkeypatch, tmp_path):
+    paths = configure_paths(monkeypatch, tmp_path)
+    row = candidate("v3-position", 100, 1, NOW)
+    row.update(asset_type="POSITION", protocol_version="V2",
+               ctf_token_id=None, position_id="v3-position",
+               execution_protocol_eligible=False)
+    save_json_atomic(paths["risk"], risk_payload("RANKED", [
+        row, candidate("legacy", 101, 1, NOW)
+    ]))
+    state, events, status = runner.run_once(now=NOW)
+    assert status == "OK"
+    assert state["focus"]["token_id"] == "legacy"
+    assert events[-1]["type"] == "LOCKED"
+
+
+def test_runner_releases_old_ambiguous_lock_even_without_risk(monkeypatch, tmp_path):
+    paths = configure_paths(monkeypatch, tmp_path)
+    save_json_atomic(paths["risk"], risk_payload(
+        "X", [candidate("old", 100, 1, NOW)]
+    ))
+    runner.run_once(now=NOW)
+    snapshot = read_json(paths["state"])
+    active = snapshot["engine_state"]["focus"]
+    for field in ("asset_type", "protocol_version", "ctf_token_id",
+                  "position_id", "execution_protocol_eligible"):
+        active.pop(field, None)
+    save_json_atomic(paths["state"], snapshot)
+    paths["risk"].unlink()
+
+    state, events, status = runner.run_once(now=NOW + timedelta(seconds=30))
+    assert status == "MISSING"
+    assert state["focus"] is None
+    assert [e["type"] for e in events] == ["INVALIDATED"]
+    assert read_json(paths["view"])["input_status"] == "MISSING"
