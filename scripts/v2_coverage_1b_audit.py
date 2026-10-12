@@ -42,6 +42,11 @@ def _gamma_get_with_retry(session: Any, url: str, *, params: dict[str, Any]) -> 
                     exc.gamma_retries = retries
                     raise
                 retries += 1
+                print(
+                    f"[V2 audit] Gamma HTTP {status}; retry {retries}/{GAMMA_MAX_RETRIES}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 time.sleep(min(2 ** (retries - 1), 8))
                 continue
             return response, retries
@@ -50,6 +55,11 @@ def _gamma_get_with_retry(session: Any, url: str, *, params: dict[str, Any]) -> 
                 exc.gamma_retries = retries
                 raise
             retries += 1
+            print(
+                f"[V2 audit] Gamma {type(exc).__name__}; retry {retries}/{GAMMA_MAX_RETRIES}",
+                file=sys.stderr,
+                flush=True,
+            )
             time.sleep(min(2 ** (retries - 1), 8))
 
 try:  # Support both `python scripts/...py` and package-based tests.
@@ -463,6 +473,12 @@ def discover_active_v3_candidates(
             params = {"limit": 100, "active": True, "closed": False}
             if cursor:
                 params["after_cursor"] = cursor
+            if pages == 0 or pages % 10 == 0:
+                print(
+                    f"[V2 audit] Requesting Gamma page {pages + 1}/{max_pages}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             response, retries = _gamma_get_with_retry(session, f"{GAMMA_API}/markets/keyset", params=params)
             retries_total += retries
             payload = response.json()
@@ -779,6 +795,9 @@ def main(argv: list[str] | None = None) -> int:
             gamma_sample=args.gamma_sample,
             combo_max_pages=args.combo_max_pages,
         )
+    except KeyboardInterrupt:
+        print("V2 coverage 1B audit cancelled; no complete report was produced.", file=sys.stderr)
+        return 130
     except (OSError, UnicodeError, json.JSONDecodeError, ProbeError, ValueError) as exc:
         print(f"V2 coverage 1B audit failed: {exc}", file=sys.stderr)
         return 2
