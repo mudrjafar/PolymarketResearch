@@ -511,6 +511,13 @@ def discover_active_v3_candidates(
                         "closed": market.get("closed"),
                         "gamma_identity_status": "EXACT_CONDITION_AND_OUTCOME_MATCH",
                     })
+            if pages % 25 == 0:
+                print(
+                    f"[V2 audit] Gamma pages scanned: {pages}/{max_pages}; "
+                    f"exact identity candidates: {len(candidates)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if not next_cursor:
                 cursor = None
                 break
