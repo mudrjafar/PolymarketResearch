@@ -913,13 +913,14 @@ with CollectorStore(sys.argv[1]) as store:
 # COLLECTOR-V3-1 EXCHANGE V3 RUNTIME COVERAGE
 # ============================================================
 
-def v3_position(module_id=1, *, arity=0, condition_index=0, outcome_index=0):
+def v3_position(module_id=1, *, arity=0, condition_index=0, outcome_index=0,
+                resolution_chain=0):
     return str(
         (module_id << 248)
         | (123 << 120)
         | (arity << 104)
         | (7 << 40)
-        | (0 << 24)
+        | (resolution_chain << 24)
         | (condition_index << 8)
         | outcome_index
     )
@@ -929,18 +930,21 @@ def v3_condition(position_id):
     return '0x' + f'{int(position_id) >> 8:062x}'
 
 
-def v3_market(*, module_id=1, arity=0, condition_index=0):
+def v3_market(*, module_id=1, arity=0, condition_index=0,
+              resolution_chain=0):
     yes = v3_position(
         module_id,
         arity=arity,
         condition_index=condition_index,
         outcome_index=0,
+        resolution_chain=resolution_chain,
     )
     no = v3_position(
         module_id,
         arity=arity,
         condition_index=condition_index,
         outcome_index=1,
+        resolution_chain=resolution_chain,
     )
     return {
         'id': 'v3-market',
@@ -1010,6 +1014,34 @@ class CollectorV3CoverageTests(unittest.TestCase):
         self.assertEqual(result[yes]['position_module'], 'NEG_RISK')
         self.assertEqual(result[yes]['position_condition_index'], 1)
         self.assertEqual(result[yes]['position_arity'], 3)
+
+    def test_v3_negrisk_requires_at_least_two_real_conditions_but_allows_other(self):
+        invalid=v3_market(module_id=2, arity=1, condition_index=0)
+        self.assertEqual(collector.build_position_map([invalid]), {})
+
+        synthetic_other=v3_market(module_id=2, arity=2, condition_index=2)
+        result=collector.build_position_map([synthetic_other])
+        yes=synthetic_other['positionIds'][0]
+        self.assertEqual(result[yes]['position_module'], 'NEG_RISK')
+        self.assertEqual(result[yes]['position_condition_index'], 2)
+        self.assertEqual(result[yes]['position_arity'], 2)
+
+    def test_v3_condition_id_accepts_bytes31_and_canonical_right_padded_bytes32(self):
+        raw=v3_market()
+        condition=raw['conditionId']
+        raw['conditionId']=condition + '00'
+        result=collector.build_position_map([raw])
+        self.assertEqual(set(result), set(raw['positionIds']))
+
+        raw['conditionId']='0x00' + condition[2:]
+        self.assertEqual(collector.build_position_map([raw]), {})
+
+    def test_v3_binary_and_negrisk_reject_non_polygon_resolution_chain(self):
+        binary=v3_market(module_id=1, resolution_chain=1)
+        negrisk=v3_market(module_id=2, arity=2, condition_index=1,
+                         resolution_chain=1)
+        self.assertEqual(collector.build_position_map([binary]), {})
+        self.assertEqual(collector.build_position_map([negrisk]), {})
 
     def test_complete_ctf_pair_wins_over_parallel_position_ids(self):
         raw=v3_market()

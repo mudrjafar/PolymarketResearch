@@ -53,13 +53,15 @@ def decode_position_id(value):
             arity == 0
             and condition_index == 0
             and outcome_index in (0, 1)
+            and resolution_chain == 0
         )
         classification = "SUPPORTED" if valid else "FAIL_CLOSED"
     elif module_id == MODULE_NEGRISK:
         valid = (
-            arity > 0
+            arity >= 2
             and condition_index <= arity
             and outcome_index in (0, 1)
+            and resolution_chain == 0
         )
         classification = "SUPPORTED" if valid else "FAIL_CLOSED"
     elif module_id == MODULE_COMBINATORIAL:
@@ -83,7 +85,7 @@ def decode_position_id(value):
 
 
 def condition_matches_position(value, expected):
-    """Accept canonical bytes31 or a bytes32 value left-padded by one zero byte."""
+    """Match canonical bytes31 or its bytes32 right-padded representation."""
     raw = str(value or "").strip().lower()
     expected = str(expected or "").strip().lower()
 
@@ -97,11 +99,7 @@ def condition_matches_position(value, expected):
     if raw == expected:
         return True
 
-    if (
-        len(raw) == 66
-        and raw.startswith("0x00")
-        and "0x" + raw[4:] == expected
-    ):
+    if len(raw) == 66 and raw.startswith("0x") and raw[2:64] == expected[2:] and raw[64:] == "00":
         return True
 
     return False
