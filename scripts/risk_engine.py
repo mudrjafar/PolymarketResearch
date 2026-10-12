@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from machine_common import fresh, finite_number, save_json_atomic
+from scripts.protocol_identity import legacy_ctf_identity
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
@@ -348,13 +349,7 @@ def focus_candidate_result(row, flow_state, risk_result):
     # Strict source agreement; never silently reinterpret a V3 PositionId
     # as a legacy CTF TokenId or infer identity from its numeric shape.
     result["execution_protocol_eligible"] = (
-        isinstance(token, str)
-        and bool(token.strip())
-        and row.get("asset_type") == "CTF_TOKEN"
-        and row.get("protocol_version") == "LEGACY_CTF"
-        and row.get("asset_id") == token
-        and row.get("ctf_token_id") == token
-        and row.get("position_id") is None
+        legacy_ctf_identity(row)
         and isinstance(flow_market, dict)
         and all(
             row.get(field) == flow.get(field) == flow_market.get(field)
