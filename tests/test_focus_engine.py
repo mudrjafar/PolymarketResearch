@@ -35,6 +35,12 @@ def candidate(
     codes=None,
 ):
     return {
+        "asset_type": "CTF_TOKEN",
+        "protocol_version": "LEGACY_CTF",
+        "asset_id": token,
+        "ctf_token_id": token,
+        "position_id": None,
+        "execution_protocol_eligible": True,
         "token_id": token,
         "condition_id": f"condition-{token}",
         "outcome": "Yes",
@@ -643,3 +649,71 @@ def test_old_state_version_resets_fail_closed():
         "old_version": 1,
         "new_version": STATE_VERSION,
     }]
+
+
+def test_v3_only_cannot_lock_exclusive_execution_focus():
+    v3 = candidate("v3-position", 101, 1, T0)
+    v3.update(
+        asset_type="POSITION",
+        protocol_version="V2",
+        asset_id="v3-position",
+        ctf_token_id=None,
+        position_id="v3-position",
+        execution_protocol_eligible=False,
+    )
+    state, events = step(new_state(), [v3], T0)
+    assert state["focus"] is None
+    assert events == []
+
+
+def test_upstream_v3_rank_does_not_preempt_executable_legacy():
+    v3 = candidate("v3-position", 101, 1, T0)
+    v3.update(asset_type="POSITION", protocol_version="V2",
+              ctf_token_id=None, position_id="v3-position",
+              execution_protocol_eligible=False)
+    legacy = candidate("legacy", 100, 1, T0)
+    state, events = step(new_state(), [v3, legacy], T0)
+    assert state["focus"]["token_id"] == "legacy"
+    assert events[-1]["type"] == "LOCKED"
+
+
+def test_previously_persisted_v3_focus_invalidates_without_challenger_takeover():
+    state = new_state()
+    state, _ = step(state, [candidate("old", 100, 1, T0)], T0)
+    state["focus"].update(asset_type="POSITION", protocol_version="V2",
+                          ctf_token_id=None, position_id="old",
+                          execution_protocol_eligible=False)
+    future = T0 + timedelta(seconds=60)
+    state, events = step(state, [candidate("legacy", 101, 1, future)], future)
+    assert state["focus"] is None
+    assert [e["type"] for e in events] == ["INVALIDATED"]
+    assert state["last_invalidated"]["invalidation_reasons"] == ["EXECUTION_IDENTITY_UNVERIFIED"]
+    state, events = step(state, [candidate("legacy", 101, 1, future)], future)
+    assert state["focus"]["token_id"] == "legacy"
+    assert events[-1]["type"] == "LOCKED"
+
+
+def test_missing_protocol_and_inconsistent_ctf_token_fail_closed():
+    for changes in (
+        {"asset_type": None},
+        {"protocol_version": None},
+        {"execution_protocol_eligible": None},
+        {"ctf_token_id": "other"},
+        {"asset_id": 7},
+        {"position_id": "unexpected-position"},
+    ):
+        row = candidate("legacy", 100, 1, T0)
+        row.update(changes)
+        state, events = step(new_state(), [row], T0)
+        assert state["focus"] is None
+        assert events == []
+
+
+def test_active_legacy_invalidates_when_fresh_protocol_identity_changes():
+    state, _ = step(new_state(), [candidate("legacy", 100, 1, T0)], T0)
+    future = T0 + timedelta(seconds=60)
+    changed = candidate("legacy", 101, 1, future)
+    changed["execution_protocol_eligible"] = False
+    state, events = step(state, [changed], future)
+    assert state["focus"] is None
+    assert events[-1]["type"] == "INVALIDATED"
