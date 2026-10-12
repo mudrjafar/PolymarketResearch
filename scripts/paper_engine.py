@@ -47,20 +47,26 @@ def validate_book_identity(book, token_id, condition_id):
     if not isinstance(book, dict):
         return False, "BOOK_PAYLOAD_INVALID"
 
-    token_id = str(token_id or "").strip()
-    condition_id = str(condition_id or "").strip()
-    asset_id = str(book.get("asset_id") or "").strip()
-    market = str(book.get("market") or "").strip()
+    token_id = token_id.strip() if isinstance(token_id, str) else ""
+    condition_id = condition_id.strip() if isinstance(condition_id, str) else ""
+    raw_asset_id = book.get("asset_id")
+    raw_market = book.get("market")
+    asset_id = raw_asset_id.strip() if isinstance(raw_asset_id, str) else ""
+    market = raw_market.strip() if isinstance(raw_market, str) else ""
 
     if not token_id:
         return False, "TOKEN_ID_MISSING"
     if not condition_id:
         return False, "CONDITION_ID_MISSING"
-    # A quote without BOTH exchange-provided identity fields is unbound.
+    # CLOB JSON identity must be a string, never a coerced number or boolean.
+    if raw_asset_id is not None and not isinstance(raw_asset_id, str):
+        return False, "BOOK_ASSET_ID_INVALID_TYPE"
     if not asset_id:
         return False, "BOOK_ASSET_ID_MISSING"
     if asset_id != token_id:
         return False, "TOKEN_ID_MISMATCH"
+    if raw_market is not None and not isinstance(raw_market, str):
+        return False, "BOOK_MARKET_ID_INVALID_TYPE"
     if not market:
         return False, "BOOK_MARKET_ID_MISSING"
     if market.lower() != condition_id.lower():
