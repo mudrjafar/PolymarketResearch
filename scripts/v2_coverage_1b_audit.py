@@ -563,8 +563,37 @@ def discover_active_v3_candidates(
             "retries_on_failed_page": failed_page_retries,
         }
 
+    if not candidates:
+        return {
+            "status": "GAMMA_LOOKUP_ERROR_INCONCLUSIVE" if gamma_error else "NO_CANDIDATE_PROVEN_INCONCLUSIVE",
+            "read_only": True,
+            "gamma_pages_scanned": pages,
+            "gamma_page_limit": max_pages,
+            "gamma_pages_requested": requested_max_pages,
+            "gamma_scan_complete": complete,
+            "gamma_candidates": 0,
+            "collector_runtime_eligible_candidates": 0,
+            "gamma_error": gamma_error,
+            "gamma_retries": retries_total,
+            "clob_candidate_checks": [],
+            "clob_verified_candidates": [],
+            "onchain_scan_skipped": True,
+            "onchain_scan_skip_reason": "No runtime-eligible Gamma PositionIds were found to corroborate.",
+            "event_matches": [],
+            "confirmed_candidates": [],
+            "interpretation": (
+                "No candidate passed the Collector's Gamma identity rules in the scanned pages. "
+                "No CLOB or on-chain request was needed; missing candidates do not prove none exist."
+            ),
+        }
+
     clob_verified = []
     clob_checks = []
+    print(
+        f"[V2 audit] Gamma scan done; checking {len(candidates)} runtime-eligible candidate(s) in CLOB",
+        file=sys.stderr,
+        flush=True,
+    )
     for candidate in candidates.values():
         clob = audit_clob_asset(candidate["position_id"], session=session)
         clob_checks.append({**candidate, "clob_status": clob.get("status")})
@@ -577,6 +606,11 @@ def discover_active_v3_candidates(
         if end_block is None:
             raise ProbeError("no finalized block")
         start_block = max(0, end_block - lookback_blocks + 1)
+        print(
+            f"[V2 audit] Scanning finalized Polygon blocks {start_block}-{end_block} for candidate fills",
+            file=sys.stderr,
+            flush=True,
+        )
         logs = _scan_logs(rpc, EXCHANGE_V3_ADDRESS, start_block, end_block, 500)
     except Exception as exc:
         return {

@@ -265,6 +265,21 @@ def test_active_scan_is_capped_to_collector_gamma_page_limit():
     assert len([call for call in session.calls if call[0].endswith("/markets/keyset")]) == 1
 
 
+def test_active_scan_skips_clob_and_rpc_when_no_runtime_candidate_exists():
+    class NoRpcAllowed:
+        def call(self, method, params):
+            raise AssertionError(f"RPC should be skipped, got {method}")
+
+    session = FakeGamma({"markets": [], "next_cursor": None})
+    result = audit.discover_active_v3_candidates(
+        NoRpcAllowed(), session=session, lookback_blocks=500
+    )
+    assert result["status"] == "NO_CANDIDATE_PROVEN_INCONCLUSIVE"
+    assert result["onchain_scan_skipped"] is True
+    assert result["clob_candidate_checks"] == []
+    assert not [call for call in session.calls if call[0].endswith("/book")]
+
+
 def test_combo_catalog_requires_exact_position_id_and_reports_market_metadata():
     position_id = str((3 << 248) | (123 << 120))
     session = FakeGamma([], combo_pages=[{
