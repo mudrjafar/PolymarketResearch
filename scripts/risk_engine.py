@@ -328,7 +328,7 @@ def assess(row, flow_state, now=None):
 
 
 def focus_candidate_result(row, flow_state, risk_result):
-    """Attach frozen RF-4A Focus contract data without changing Risk semantics."""
+    """Bind frozen protocol provenance without altering Diamond/Risk scoring."""
     result = dict(risk_result)
 
     flow = flow_for(row, flow_state)
@@ -336,6 +336,31 @@ def focus_candidate_result(row, flow_state, risk_result):
         for field in ("evidence_id", "evidence_cursor", "evidence_at"):
             if field in flow:
                 result[field] = flow[field]
+
+    fields = (
+        "asset_type", "protocol_version", "asset_id",
+        "ctf_token_id", "position_id", "exchange_address",
+    )
+    for field in fields:
+        result[field] = row.get(field)
+    flow_market = flow.get("market") if isinstance(flow, dict) else None
+    token = row.get("token_id")
+    # Strict source agreement; never silently reinterpret a V3 PositionId
+    # as a legacy CTF TokenId or infer identity from its numeric shape.
+    result["execution_protocol_eligible"] = (
+        isinstance(token, str)
+        and bool(token.strip())
+        and row.get("asset_type") == "CTF_TOKEN"
+        and row.get("protocol_version") == "LEGACY_CTF"
+        and row.get("asset_id") == token
+        and row.get("ctf_token_id") == token
+        and row.get("position_id") is None
+        and isinstance(flow_market, dict)
+        and all(
+            row.get(field) == flow.get(field) == flow_market.get(field)
+            for field in fields
+        )
+    )
 
     cashflow = row.get("cashflow_alert")
     if not isinstance(cashflow, dict):
