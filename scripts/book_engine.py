@@ -111,9 +111,16 @@ def analyze_book(book, focus, target_notionals=TARGET_NOTIONALS_USD):
 
     if not token_id:
         reasons.append("TOKEN_ID_MISSING")
-    if asset_id and token_id and asset_id != token_id:
+    if not condition_id:
+        reasons.append("CONDITION_ID_MISSING")
+    # Missing CLOB identifiers must never be treated as matching Focus.
+    if not asset_id:
+        reasons.append("BOOK_ASSET_ID_MISSING")
+    elif token_id and asset_id != token_id:
         reasons.append("TOKEN_ID_MISMATCH")
-    if market and condition_id and market.lower() != condition_id.lower():
+    if not market:
+        reasons.append("BOOK_MARKET_ID_MISSING")
+    elif condition_id and market.lower() != condition_id.lower():
         reasons.append("CONDITION_ID_MISMATCH")
 
     bids, bid_error = _parse_levels(book.get("bids"), reverse=True)
