@@ -490,3 +490,50 @@ def test_noncanonical_evidence_fails_closed_through_entire_probe(field, bad):
     assert report["reconciliation"]["malformed_event_count"] == 1
     assert report["reconciliation"]["unique_event_count"] == 0
     assert report["reconciliation"]["completeness_claim_allowed"] is False
+
+
+
+@pytest.mark.parametrize(("field", "bad"), [
+    ("logIndex", "0x00"),
+    ("logIndex", "0x01"),
+    ("logIndex", "0x0001"),
+    ("blockNumber", "0x00"),
+    ("blockNumber", "0x01"),
+    ("blockNumber", "0x0e6"),
+])
+def test_rpc_quantity_leading_zero_rejected_by_decoder(field, bad):
+    log = make_log(make_position(1), log_index=1)
+    log[field] = bad
+    with pytest.raises(ValueError, match="invalid"):
+        probe.decode_order_filled(log)
+
+
+@pytest.mark.parametrize(("field", "bad"), [
+    ("logIndex", "0x00"),
+    ("logIndex", "0x01"),
+    ("blockNumber", "0x0e6"),
+])
+def test_rpc_quantity_leading_zero_fails_entire_probe(field, bad):
+    log = make_log(make_position(1), log_index=1)
+    log[field] = bad
+    report = probe.run_probe(
+        "http://rpc.invalid",
+        lookback_blocks=20,
+        chunk_size=20,
+        gamma_sample=0,
+        session=FakeSession([log]),
+    )
+    assert report["reconciliation"]["status"] == "FAIL_CLOSED"
+    assert report["reconciliation"]["malformed_event_count"] == 1
+    assert report["reconciliation"]["unique_event_count"] == 0
+    assert report["reconciliation"]["completeness_claim_allowed"] is False
+
+
+def test_rpc_quantity_minimal_zero_and_one_are_valid():
+    assert probe._hex_log_integer("0x0", "log index") == 0
+    assert probe._hex_log_integer("0x1", "log index") == 1
+    log = make_log(make_position(1), log_index=0)
+    log["blockNumber"] = "0x1"
+    decoded = probe.decode_order_filled(log)
+    assert decoded["log_index"] == 0
+    assert decoded["block_number"] == 1
