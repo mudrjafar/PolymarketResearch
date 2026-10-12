@@ -841,3 +841,70 @@ def test_v3_position_paper_open_blocks_before_network_or_legacy_ctf_identity(
     assert len(events) == 1
     assert events[0]["type"] == "REJECTED"
     assert events[0]["reason_code"] == "UNSUPPORTED_PROTOCOL_V2"
+
+
+
+@pytest.mark.parametrize(("field", "malformed", "reason"), [
+    ("asset_id", 123, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", True, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", ["token-a"], "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("market", 123, "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", False, "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", {"id": "condition-a"}, "BOOK_MARKET_ID_INVALID_TYPE"),
+])
+def test_open_rejects_nonstring_latest_clob_identity_before_fees(
+    monkeypatch, tmp_path, field, malformed, reason
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    untrusted = raw_book()
+    untrusted[field] = malformed
+
+    def forbidden(*_args):
+        raise AssertionError("Invalid identity must reject before fee lookup")
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: untrusted,
+        market_info_loader=forbidden,
+    )
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == "BOOK_" + reason
+
+
+@pytest.mark.parametrize(("field", "malformed", "reason"), [
+    ("asset_id", 123, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", True, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("market", 123, "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", ["condition-a"], "BOOK_MARKET_ID_INVALID_TYPE"),
+])
+def test_close_and_mark_reject_nonstring_clob_identity_and_keep_open(
+    monkeypatch, tmp_path, field, malformed, reason
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    opened, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    assert [e["type"] for e in events] == ["OPENED"]
+    paper_id = opened["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+    untrusted = raw_book()
+    untrusted[field] = malformed
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: untrusted,
+        market_info_loader=lambda _: market_info(),
+    )
+    rejected = [e for e in events if e["type"] == "REJECTED"]
+    assert len(rejected) == 1
+    assert rejected[0]["reason_code"] == reason
+    assert state["positions"][0]["status"] == "OPEN"
+    assert state["positions"][0]["mark_status"] == reason
+    assert state["positions"][0]["mark"] is None or state["positions"][0]["mark_status"] != "OK"
