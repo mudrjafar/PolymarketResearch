@@ -54,9 +54,16 @@ def validate_book_identity(book, token_id, condition_id):
 
     if not token_id:
         return False, "TOKEN_ID_MISSING"
-    if asset_id and asset_id != token_id:
+    if not condition_id:
+        return False, "CONDITION_ID_MISSING"
+    # A quote without BOTH exchange-provided identity fields is unbound.
+    if not asset_id:
+        return False, "BOOK_ASSET_ID_MISSING"
+    if asset_id != token_id:
         return False, "TOKEN_ID_MISMATCH"
-    if market and condition_id and market.lower() != condition_id.lower():
+    if not market:
+        return False, "BOOK_MARKET_ID_MISSING"
+    if market.lower() != condition_id.lower():
         return False, "CONDITION_ID_MISMATCH"
 
     return True, "OK"
