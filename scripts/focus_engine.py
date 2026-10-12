@@ -9,7 +9,11 @@ step(state, candidates, now) -> (new_state, events)
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
-from scripts.protocol_identity import legacy_ctf_identity
+if __package__:
+    from .protocol_identity import legacy_ctf_identity
+else:
+    # Direct script self-test: python scripts/focus_engine.py
+    from protocol_identity import legacy_ctf_identity
 
 
 STATE_VERSION = 3
