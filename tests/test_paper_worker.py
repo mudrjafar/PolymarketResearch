@@ -141,7 +141,7 @@ def loaders():
     )
 
 
-def fake_identity(condition_id, token_id):
+def fake_identity(condition_id, token_id, **kwargs):
     return {
         "settlement_protocol": paper_settlement.PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,

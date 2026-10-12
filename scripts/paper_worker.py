@@ -307,6 +307,8 @@ def _ensure_settlement_identity(position, identity_loader):
         identity = identity_loader(
             position.get("condition_id"),
             position.get("token_id"),
+            asset_type=position.get("asset_type", "CTF_TOKEN"),
+            protocol_version=position.get("protocol_version", "LEGACY_CTF"),
         )
         paper_settlement.validate_outcome_identity(
             position.get("outcome"),
@@ -626,7 +628,14 @@ def _process_open(
             return _reject(request_id, now, "POSITION_ALREADY_OPEN")
 
     try:
-        settlement_identity = identity_loader(condition_id, token_id)
+        asset_type = focus.get("asset_type", "CTF_TOKEN")
+        protocol_version = focus.get("protocol_version", "LEGACY_CTF")
+        settlement_identity = identity_loader(
+            condition_id,
+            token_id,
+            asset_type=asset_type,
+            protocol_version=protocol_version,
+        )
         paper_settlement.validate_outcome_identity(
             focus.get("outcome"),
             settlement_identity.get("outcome_index"),
@@ -634,6 +643,8 @@ def _process_open(
         identity_probe = {
             "condition_id": condition_id,
             "token_id": token_id,
+            "asset_type": asset_type,
+            "protocol_version": protocol_version,
             "outcome": focus.get("outcome"),
         }
         _apply_settlement_identity(identity_probe, settlement_identity)
@@ -737,6 +748,8 @@ def _process_open(
         "chat_id": str(request.get("chat_id") or ""),
         "token_id": token_id,
         "condition_id": condition_id,
+        "asset_type": asset_type,
+        "protocol_version": protocol_version,
         "outcome": focus.get("outcome"),
         "question": focus.get("question"),
         "direction": "BUY",

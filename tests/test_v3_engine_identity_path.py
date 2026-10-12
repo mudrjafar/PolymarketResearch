@@ -86,6 +86,7 @@ def test_v3_binary_and_negrisk_identity_survives_offline_engine_path():
         assert normalized["position_id"] == token
         assert normalized["ctf_token_id"] is None
         assert normalized["asset_type"] == "POSITION"
+        assert normalized["protocol_version"] == "V2"
         assert flow_tracker.is_flow_eligible_trade(normalized)
         flow = flow_tracker.analyze_flow([normalized], NOW, "5m")
         assert flow["trade_count"] == 1
@@ -96,7 +97,12 @@ def test_v3_binary_and_negrisk_identity_survives_offline_engine_path():
             "condition_id": market["conditionId"],
             "token_id": token,
             "outcome": "Yes",
-            "market": {"condition_id": market["conditionId"], "token_id": token},
+            "market": {
+                "condition_id": market["conditionId"],
+                "token_id": token,
+                "asset_type": normalized["asset_type"],
+                "protocol_version": normalized["protocol_version"],
+            },
             "source_updated_at": NOW.isoformat(),
             "state": "VERIFIED",
             "verified": True,
@@ -109,6 +115,8 @@ def test_v3_binary_and_negrisk_identity_survives_offline_engine_path():
         }
         diamond_market = diamond_filter_v3.normalize(diamond_item, [normalized])
         assert diamond_market["token_id"] == token
+        assert diamond_market["asset_type"] == "POSITION"
+        assert diamond_market["protocol_version"] == "V2"
         assert diamond_filter_v3.same_market(diamond_item, normalized)
 
         evidence_at = NOW.isoformat()
@@ -121,6 +129,8 @@ def test_v3_binary_and_negrisk_identity_survives_offline_engine_path():
             "question": market["question"],
             "condition_id": market["conditionId"],
             "token_id": token,
+            "asset_type": "POSITION",
+            "protocol_version": "V2",
             "outcome": "Yes",
             "direction": "BUY",
             "price": 0.5,
@@ -145,7 +155,13 @@ def test_v3_binary_and_negrisk_identity_survives_offline_engine_path():
             "evidence_id": evidence_id,
             "evidence_cursor": [100, 2],
             "evidence_at": evidence_at,
-            "market": {"active": True, "closed": False, "accepting_orders": True},
+            "market": {
+                "active": True,
+                "closed": False,
+                "accepting_orders": True,
+                "asset_type": "POSITION",
+                "protocol_version": "V2",
+            },
         }}
         assessed = risk_engine.assess(row, flow_state, now=NOW)
         assert assessed["decision"] == "PASS"
@@ -154,6 +170,8 @@ def test_v3_binary_and_negrisk_identity_survives_offline_engine_path():
         assert events[0]["type"] == "LOCKED"
         focus = focus_state["focus"]
         assert focus["token_id"] == token
+        assert focus["asset_type"] == "POSITION"
+        assert focus["protocol_version"] == "V2"
         order_book = {
             "asset_id": token,
             "market": market["conditionId"],
@@ -164,19 +182,28 @@ def test_v3_binary_and_negrisk_identity_survives_offline_engine_path():
         assert book["book_ok"] is True
         assert book_engine.analyze_book({**order_book, "asset_id": "12345"}, focus)["book_ok"] is False
         assert paper_settlement.resolve_position_identity(
-            market["conditionId"], token, validate_chain=False,
+            market["conditionId"], token,
+            asset_type="POSITION", protocol_version="V2", validate_chain=False,
         )["position_module_id"] == module_id
         paper_identity = paper_settlement.resolve_position_identity(
-            market["conditionId"], token, validate_chain=False,
+            market["conditionId"], token,
+            asset_type="POSITION", protocol_version="V2", validate_chain=False,
         )
         paper_position = {
             "condition_id": market["conditionId"],
             "token_id": token,
             "outcome": "Yes",
+            "asset_type": "POSITION",
+            "protocol_version": "V2",
         }
-        paper_worker._apply_settlement_identity(paper_position, paper_identity)
+        def identity_loader(condition_id, token_id, **identity_type):
+            assert condition_id == market["conditionId"]
+            assert token_id == token
+            assert identity_type == {"asset_type": "POSITION", "protocol_version": "V2"}
+            return paper_identity
+
         assert paper_worker._ensure_settlement_identity(
-            paper_position, lambda *_: pytest.fail("frozen V2 identity should be reused"),
+            paper_position, identity_loader,
         ) == (True, None, None)
         assert "ctf_contract" not in paper_position
 

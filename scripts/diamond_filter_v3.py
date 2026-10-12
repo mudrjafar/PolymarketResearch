@@ -131,6 +131,8 @@ def normalize(item, live):
         "last_trade_at": latest.get("block_timestamp") or latest.get("detected_at") or item.get("last_trade_at") or m.get("last_trade_at"),
         "schema_version": item.get("schema_version"),
         "question": question(item), "outcome": outcome(item), "condition_id": condition(item), "token_id": token(item) or text(latest.get("token_id")),
+        "asset_type": m.get("asset_type", latest.get("asset_type", "CTF_TOKEN")),
+        "protocol_version": m.get("protocol_version", latest.get("protocol_version", "LEGACY_CTF")),
         "price": p, "state": text(item.get("state") or "UNKNOWN").upper(), "verified": bool(item.get("verified",False)),
         "confirmations": int(first_num(item,"confirmations",default=0) or 0), "data_confidence": conf(item.get("data_confidence")),
         "resolution_state": text(item.get("resolution_state") or "UNKNOWN").upper(), "remaining_seconds": remaining,

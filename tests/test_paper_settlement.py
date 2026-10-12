@@ -42,6 +42,50 @@ def test_identity_matches_exactly_one_supported_family(monkeypatch):
     }
 
 
+def test_legacy_ctf_token_with_v3_like_prefix_uses_legacy_identity_path(monkeypatch):
+    token = str((1 << 248) | 123456789)
+    calls = []
+    monkeypatch.setattr(paper_settlement, "_assert_polygon_chain", lambda *a, **k: 137)
+    monkeypatch.setattr(paper_settlement, "_ctf_uint", lambda *a, **k: 2)
+    monkeypatch.setattr(
+        paper_settlement,
+        "_collection_id",
+        lambda condition, index_set, **kwargs: bytes([index_set]) * 32,
+    )
+
+    def fake_position(collateral, collection_id, **kwargs):
+        calls.append((collateral, collection_id))
+        if collateral == paper_settlement.STANDARD_USDCE and collection_id == b"\x01" * 32:
+            return int(token)
+        return 999
+
+    monkeypatch.setattr(paper_settlement, "_position_id", fake_position)
+    identity = paper_settlement.resolve_position_identity(
+        CONDITION,
+        token,
+        asset_type="CTF_TOKEN",
+        protocol_version="LEGACY_CTF",
+        rpc_url="http://rpc",
+    )
+
+    assert identity["settlement_protocol"] == paper_settlement.PROTOCOL_LEGACY_CTF
+    assert identity["outcome_index"] == 0
+    assert calls
+
+
+def test_v3_settlement_identity_requires_explicit_position_protocol():
+    position = v2_position(1)
+    with pytest.raises(paper_settlement.SettlementIdentityError, match="UNSUPPORTED_PROTOCOL_V2"):
+        paper_settlement.resolve_position_identity(
+            position["condition_id"], position["token_id"], validate_chain=False,
+        )
+    identity = paper_settlement.resolve_position_identity(
+        position["condition_id"], position["token_id"],
+        asset_type="POSITION", protocol_version="V2", validate_chain=False,
+    )
+    assert identity["settlement_protocol"] == paper_settlement.PROTOCOL_V2_POSITION
+
+
 def test_unmatched_bytes31_condition_does_not_enter_legacy_ctf_path():
     v2_condition = "0x01" + "00" * 30
     with pytest.raises(
@@ -222,7 +266,8 @@ def v2_identity(position, module_id):
 def test_v2_position_identity_is_derived_without_ctf_token_mapping(module_id):
     candidate = v2_position(module_id)
     identity = paper_settlement.resolve_position_identity(
-        candidate["condition_id"], candidate["token_id"], validate_chain=False,
+        candidate["condition_id"], candidate["token_id"],
+        asset_type="POSITION", protocol_version="V2", validate_chain=False,
     )
     assert identity["settlement_protocol"] == paper_settlement.PROTOCOL_V2_POSITION
     assert identity["position_module_id"] == module_id
@@ -234,10 +279,16 @@ def test_v2_position_identity_is_derived_without_ctf_token_mapping(module_id):
 def test_v2_combo_and_invalid_position_ids_fail_closed():
     combo = v2_position(3)
     with pytest.raises(paper_settlement.SettlementIdentityError, match="V2_POSITION_MODULE_UNSUPPORTED"):
-        paper_settlement.resolve_position_identity(combo["condition_id"], combo["token_id"], validate_chain=False)
+        paper_settlement.resolve_position_identity(
+            combo["condition_id"], combo["token_id"],
+            asset_type="POSITION", protocol_version="V2", validate_chain=False,
+        )
     invalid = v2_position(2, arity=1)
     with pytest.raises(paper_settlement.SettlementIdentityError, match="V2_POSITION_ID_UNSUPPORTED"):
-        paper_settlement.resolve_position_identity(invalid["condition_id"], invalid["token_id"], validate_chain=False)
+        paper_settlement.resolve_position_identity(
+            invalid["condition_id"], invalid["token_id"],
+            asset_type="POSITION", protocol_version="V2", validate_chain=False,
+        )
 
 
 @pytest.mark.parametrize("module_id", [1, 2])

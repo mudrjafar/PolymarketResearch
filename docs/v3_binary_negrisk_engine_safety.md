@@ -40,6 +40,11 @@ identities, condition/outcome mismatches, unknown contracts, unexpected
 collateral, or malformed payouts fail closed. The V3 branch never calls the
 legacy CTF settlement contract.
 
+Settlement protocol selection is explicit: Collector `asset_type` and
+`protocol_version` metadata is carried through Flow, Diamond, Risk, and Focus
+to Paper. Numeric token-ID prefixes are never used to distinguish V3
+PositionIds from legacy CTF token IDs.
+
 The protocol basis is the official
 [Polymarket V2 contract repository](https://github.com/Polymarket/polymarket-v2-external):
 its [PositionId layout and Polygon deployments](https://github.com/Polymarket/polymarket-v2-external),

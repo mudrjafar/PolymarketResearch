@@ -387,6 +387,8 @@ def resolve_position_identity(
     condition_id,
     token_id,
     *,
+    asset_type="CTF_TOKEN",
+    protocol_version=None,
     rpc_url=None,
     block_tag="latest",
     timeout=DEFAULT_TIMEOUT_SECONDS,
@@ -396,11 +398,11 @@ def resolve_position_identity(
     if validate_chain:
         _assert_polygon_chain(rpc_url, timeout=timeout)
     raw_token = str(token_id or "").strip()
-    try:
-        leading_byte = int(raw_token, 10) >> 248
-    except (TypeError, ValueError):
-        leading_byte = None
-    if leading_byte in (1, 2, 3):
+    asset_type = str(asset_type or "CTF_TOKEN").strip().upper()
+    protocol_version = str(protocol_version or "").strip().upper()
+    if asset_type == "POSITION":
+        if protocol_version != "V2":
+            raise SettlementIdentityError("POSITION_PROTOCOL_UNSUPPORTED")
         identity, _ = _v2_identity(condition_id, raw_token)
         return {
             "settlement_protocol": PROTOCOL_V2_POSITION,
@@ -410,6 +412,10 @@ def resolve_position_identity(
             "outcome_index": identity["outcome_index"],
             "position_module_id": identity["module_id"],
         }
+    if asset_type != "CTF_TOKEN":
+        raise SettlementIdentityError("ASSET_TYPE_UNSUPPORTED")
+    if protocol_version not in {"", "LEGACY_CTF"}:
+        raise SettlementIdentityError("ASSET_PROTOCOL_MISMATCH")
     condition = _condition_bytes(condition_id)
     token = _token_int(token_id)
 
