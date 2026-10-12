@@ -126,7 +126,18 @@ def normalize(item, live):
     end_age = age_seconds(m.get("end_date"))
     if end_age is not None:
         remaining = min(remaining, -end_age) if remaining is not None else -end_age
+    # Mirror Flow's frozen protocol identity, never infer from price/Gamma.
+    # Disagreement between Flow top-level and nested market is UNKNOWN.
+    identity_fields = (
+        "asset_type", "protocol_version", "asset_id",
+        "ctf_token_id", "position_id", "exchange_address",
+    )
+    protocol_identity = {
+        field: item.get(field) if item.get(field) == m.get(field) else None
+        for field in identity_fields
+    }
     return {
+        **protocol_identity,
         "source_updated_at": item.get("source_updated_at") or item.get("updated_at"),
         "last_trade_at": latest.get("block_timestamp") or latest.get("detected_at") or item.get("last_trade_at") or m.get("last_trade_at"),
         "schema_version": item.get("schema_version"),
