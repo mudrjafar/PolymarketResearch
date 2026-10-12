@@ -314,6 +314,19 @@ def _gamma_exact_match(position_id: str, session: Any = requests) -> dict[str, A
     return {"status": "NO_POSITION_ID_MATCH_NOT_PROOF_OF_ABSENCE"}
 
 
+def _prioritize_gamma_position_ids(unique_ids: dict[str, dict[str, Any]]) -> list[str]:
+    """Sample runtime-supported positions before research-only IDs."""
+    supported = [
+        position_id for position_id, item in unique_ids.items()
+        if item.get("classification") == "SUPPORTED"
+    ]
+    other = [
+        position_id for position_id, item in unique_ids.items()
+        if item.get("classification") != "SUPPORTED"
+    ]
+    return supported + other
+
+
 def _combinatorial_legs(rpc: JsonRpcReader, position_id: str, block_tag: str = "latest") -> list[str] | None:
     """Read a prepared combinatorial condition's canonical underlying positions."""
     try:
@@ -435,9 +448,12 @@ def run_probe(
 
     gamma_results = []
     combinatorial_results = []
-    for position_id in list(unique_ids)[:gamma_sample]:
+    gamma_sample_ids = _prioritize_gamma_position_ids(unique_ids)
+    for position_id in gamma_sample_ids[:gamma_sample]:
         gamma_results.append({
             "position_id": position_id,
+            "module": unique_ids[position_id]["module"],
+            "classification": unique_ids[position_id]["classification"],
             **_gamma_exact_match(position_id, session=session),
         })
         identity = unique_ids[position_id]
@@ -518,10 +534,16 @@ def run_probe(
             "unique_position_ids": len(unique_ids),
             "fills_by_module_or_fail_closed": dict(sorted(by_module.items())),
             "fail_closed_position_ids": malformed_positions,
-            "unique_position_id_samples": list(unique_ids.values())[:10],
+            "unique_position_id_samples": [unique_ids[position_id] for position_id in gamma_sample_ids[:10]],
         },
         "gamma_identity_probe": {
             "sampled_position_ids": len(gamma_results),
+            "sampled_supported_position_ids": sum(
+                item["classification"] == "SUPPORTED" for item in gamma_results
+            ),
+            "sampled_research_only_position_ids": sum(
+                item["classification"] == "RESEARCH_ONLY" for item in gamma_results
+            ),
             "result_counts": dict(sorted(gamma_counts.items())),
             "results": gamma_results,
             "interpretation": "No exact Gamma position-ID match is inconclusive; V2 asset identity mapping requires separate validation.",

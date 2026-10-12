@@ -61,6 +61,19 @@ def test_position_module_classification(module_id, expected):
     assert identity["classification"] == expected_classification
 
 
+def test_gamma_samples_prioritize_runtime_supported_positions():
+    unique_ids = {
+        "combo-a": {"classification": "RESEARCH_ONLY"},
+        "combo-b": {"classification": "RESEARCH_ONLY"},
+        "binary": {"classification": "SUPPORTED"},
+        "negrisk": {"classification": "SUPPORTED"},
+        "invalid": {"classification": "FAIL_CLOSED"},
+    }
+    assert probe._prioritize_gamma_position_ids(unique_ids) == [
+        "binary", "negrisk", "combo-a", "combo-b", "invalid",
+    ]
+
+
 def test_invalid_module_shape_fails_closed():
     identity = probe.parse_position_id(make_position(1, outcome_index=2))
     assert identity["classification"] == "FAIL_CLOSED"
