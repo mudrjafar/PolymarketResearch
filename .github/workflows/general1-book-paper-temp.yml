@@ -1,0 +1,58 @@
+name: Temporary General1 Book Paper Dashboard gate
+on:
+  push:
+    branches:
+      - fix/general1-book-paper-dashboard-gates-20261012
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      POLYMARKET_RPC_URL: http://127.0.0.1:1
+      TELEGRAM_BOT_TOKEN: ""
+      TELEGRAM_CHAT_ID: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Targeted Book Paper Dashboard boundaries
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_book_engine.py tests/test_book_worker.py tests/test_paper_engine.py tests/test_paper_worker.py tests/test_paper_settlement.py tests/test_paper_dashboard.py tests/test_telegram_focus_book.py 2>&1 | tee targeted.log
+      - name: Full project tests
+        if: always()
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee full.log
+      - name: Runtime offline self-test
+        if: always()
+        shell: bash
+        run: |
+          set -o pipefail
+          python run_machine.py --self-test 2>&1 | tee selftest.log
+      - name: Package immutable evidence
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p handoff
+          for file in targeted.log full.log selftest.log; do
+            if test -f "$file"; then cp "$file" handoff/; fi
+          done
+          git rev-parse HEAD > handoff/COMMIT_SHA.txt
+          (cd handoff && sha256sum ./* > SHA256SUMS.txt)
+          zip -qr GENERAL1_OFFLINE_EVIDENCE.zip handoff
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: general1-book-paper-dashboard-offline
+          path: GENERAL1_OFFLINE_EVIDENCE.zip
+          retention-days: 14
+          if-no-files-found: error
