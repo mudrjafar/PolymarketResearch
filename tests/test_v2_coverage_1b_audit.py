@@ -184,6 +184,58 @@ def test_active_candidate_becomes_confirmed_only_after_receipt_and_block_match()
     assert result["confirmed_candidates"][0]["receipt_status"] == "RECEIPT_AND_CANONICAL_BLOCK_MATCH"
 
 
+def test_active_discovery_retries_gamma_connection_error(monkeypatch):
+    class FlakyGamma(FakeGamma):
+        def __init__(self):
+            super().__init__({"markets": [], "next_cursor": None})
+            self.failed_once = False
+
+        def get(self, url, *, params, timeout):
+            if url.endswith("/markets/keyset") and not self.failed_once:
+                self.failed_once = True
+                raise audit.requests.exceptions.ConnectionError("temporary")
+            return super().get(url, params=params, timeout=timeout)
+
+    monkeypatch.setattr(audit.time, "sleep", lambda _seconds: None)
+    result = audit.discover_active_v3_candidates(FakeRpc(), session=FlakyGamma(), lookback_blocks=1)
+    assert result["status"] == "NO_CANDIDATE_PROVEN_INCONCLUSIVE"
+    assert result["gamma_scan_complete"] is True
+    assert result["gamma_retries"] == 1
+
+
+def test_active_discovery_preserves_candidates_when_later_gamma_page_fails(monkeypatch):
+    position_id = str((1 << 248) | (123 << 120))
+    condition = f"0x{(int(position_id) >> 8):062x}"
+
+    class FailingSecondPage(FakeGamma):
+        def __init__(self):
+            super().__init__({"markets": [], "next_cursor": None}, clob_book={"asset_id": position_id})
+
+        def get(self, url, *, params, timeout):
+            self.calls.append((url, params, timeout))
+            if url.endswith("/book"):
+                return FakeResponse(self.clob_book)
+            if params.get("after_cursor"):
+                raise audit.requests.exceptions.ConnectionError("offline after first page")
+            return FakeResponse({
+                "markets": [{
+                    "id": "market-1", "active": True, "closed": False,
+                    "conditionId": condition, "positionIds": [position_id], "outcomes": ["YES"],
+                }],
+                "next_cursor": "page-2",
+            })
+
+    monkeypatch.setattr(audit.time, "sleep", lambda _seconds: None)
+    result = audit.discover_active_v3_candidates(FakeRpc(), session=FailingSecondPage(), lookback_blocks=1)
+    assert result["status"] == "GAMMA_LOOKUP_ERROR_INCONCLUSIVE"
+    assert result["gamma_scan_complete"] is False
+    assert result["gamma_pages_scanned"] == 1
+    assert result["gamma_candidates"] == 1
+    assert result["gamma_error"]["failed_page"] == 2
+    assert result["gamma_error"]["retries_on_failed_page"] == audit.GAMMA_MAX_RETRIES
+    assert [item["position_id"] for item in result["clob_verified_candidates"]] == [position_id]
+
+
 def test_combo_catalog_requires_exact_position_id_and_reports_market_metadata():
     position_id = str((3 << 248) | (123 << 120))
     session = FakeGamma([], combo_pages=[{

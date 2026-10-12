@@ -17,7 +17,16 @@ not print or serialize the RPC URL.
 
 Run it with `python scripts/v2_coverage_1b_audit.py --discover-active --env-file .env --lookback-blocks 500 --gamma-max-pages 100`. The page and
 block limits are recorded in the JSON result so a capped scan remains visibly
-inconclusive.
+inconclusive. Gamma requests use a 20-second timeout and retry connection,
+timeout, rate-limit, and server errors up to three times with backoff. If a
+later page still fails, the audit retains and independently checks candidates
+from earlier pages while recording the failed page and keeping the overall
+Gamma scan incomplete.
+
+After adding retries, a 250-page read-only run completed without a Gamma
+request error and found no exact candidate in those pages. Gamma returned a
+continuation cursor at the page cap, so the market search remains incomplete;
+this result does not establish that no eligible market exists.
 
 Paper settlement now supports only V3 Binary and NegRisk identities derived
 from the PositionId. It reads the module's `getResult(bytes31)` at the

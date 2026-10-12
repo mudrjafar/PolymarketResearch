@@ -13,6 +13,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import sys
+import time
 from typing import Any
 
 import requests
@@ -20,6 +21,36 @@ import requests
 CLOB_API = "https://clob.polymarket.com"
 COMBO_API = "https://combos-rfq-api.polymarket.com"
 COMBO_PAGE_SIZE = 100
+GAMMA_TIMEOUT_SECONDS = 20
+GAMMA_MAX_RETRIES = 3
+
+
+def _gamma_get_with_retry(session: Any, url: str, *, params: dict[str, Any]) -> tuple[Any, int]:
+    """Retry transient Gamma transport and server errors without hiding hard failures."""
+    retries = 0
+    while True:
+        try:
+            response = session.get(url, params=params, timeout=GAMMA_TIMEOUT_SECONDS)
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status not in (408, 425, 429) and not (isinstance(status, int) and status >= 500):
+                    exc.gamma_retries = retries
+                    raise
+                if retries >= GAMMA_MAX_RETRIES:
+                    exc.gamma_retries = retries
+                    raise
+                retries += 1
+                time.sleep(min(2 ** (retries - 1), 8))
+                continue
+            return response, retries
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            if retries >= GAMMA_MAX_RETRIES:
+                exc.gamma_retries = retries
+                raise
+            retries += 1
+            time.sleep(min(2 ** (retries - 1), 8))
 
 try:  # Support both `python scripts/...py` and package-based tests.
     from .v2_coverage_probe import (
@@ -425,13 +456,15 @@ def discover_active_v3_candidates(
     seen_cursors = set()
     pages = 0
     complete = True
+    gamma_error = None
+    retries_total = 0
     try:
         for _ in range(max_pages):
             params = {"limit": 100, "active": True, "closed": False}
             if cursor:
                 params["after_cursor"] = cursor
-            response = session.get(f"{GAMMA_API}/markets/keyset", params=params, timeout=10)
-            response.raise_for_status()
+            response, retries = _gamma_get_with_retry(session, f"{GAMMA_API}/markets/keyset", params=params)
+            retries_total += retries
             payload = response.json()
             if isinstance(payload, dict):
                 markets = payload.get("markets", [])
@@ -490,11 +523,16 @@ def discover_active_v3_candidates(
             if cursor:
                 complete = False
     except Exception as exc:
-        return {
-            "status": "GAMMA_LOOKUP_ERROR_INCONCLUSIVE",
-            "pages_scanned": pages,
+        complete = False
+        response = getattr(exc, "response", None)
+        failed_page_retries = getattr(exc, "gamma_retries", 0)
+        retries_total += failed_page_retries
+        gamma_error = {
+            "phase": "gamma_page_fetch",
+            "failed_page": pages + 1,
             "error_type": type(exc).__name__,
-            "candidates": [],
+            "http_status": getattr(response, "status_code", None),
+            "retries_on_failed_page": failed_page_retries,
         }
 
     clob_verified = []
@@ -518,6 +556,8 @@ def discover_active_v3_candidates(
             "gamma_pages_scanned": pages,
             "gamma_scan_complete": complete,
             "gamma_candidates": len(candidates),
+            "gamma_error": gamma_error,
+            "gamma_retries": retries_total,
             "clob_candidate_checks": clob_checks,
             "clob_verified_candidates": clob_verified,
             "error_type": type(exc).__name__,
@@ -546,11 +586,17 @@ def discover_active_v3_candidates(
         })
     confirmed = [item for item in event_matches if item["receipt_status"] == "RECEIPT_AND_CANONICAL_BLOCK_MATCH"]
     return {
-        "status": "CONFIRMED_CANDIDATE_FOUND" if confirmed else "NO_CANDIDATE_PROVEN_INCONCLUSIVE",
+        "status": (
+            "CONFIRMED_CANDIDATE_FOUND" if confirmed else
+            "GAMMA_LOOKUP_ERROR_INCONCLUSIVE" if gamma_error else
+            "NO_CANDIDATE_PROVEN_INCONCLUSIVE"
+        ),
         "read_only": True,
         "gamma_pages_scanned": pages,
         "gamma_scan_complete": complete,
         "gamma_candidates": len(candidates),
+        "gamma_error": gamma_error,
+        "gamma_retries": retries_total,
         "clob_candidate_checks": clob_checks,
         "clob_verified_candidates": clob_verified,
         "finalized_block": end_block,
