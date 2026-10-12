@@ -435,3 +435,58 @@ def test_rpc_error_minus_32005_bisects_ranges():
     rows = probe._scan_logs(rpc, "0x" + "11" * 20, 10, 12, 3)
     assert len(rows) == 3
     assert rpc.ranges[0] == (10, 12)
+
+
+# 1A-CORR-1: strict canonical evidence identity. No live RPC or credentials.
+@pytest.mark.parametrize(("field", "bad"), [
+    ("transactionHash", "0x" + "a" * 63 + "+"),
+    ("transactionHash", "0x" + "a" * 63 + " "),
+    ("transactionHash", "0x" + "a" * 63 + "\n"),
+    ("blockHash", "0x" + "b" * 63 + "+"),
+    ("blockHash", "0x" + "b" * 63 + " "),
+    ("topics[1]", "0x" + "c" * 63 + "+"),
+    ("topics[2]", "0x" + "0" * 63 + " "),
+    ("topics[3]", "0x" + "0" * 63 + "+"),
+    ("logIndex", "0x+1"),
+    ("logIndex", "0x 1"),
+    ("logIndex", "0x1 "),
+    ("logIndex", "0x-1"),
+    ("blockNumber", "0x+e6"),
+    ("blockNumber", "0xe6 "),
+])
+def test_noncanonical_evidence_identity_rejected_by_decoder(field, bad):
+    log = make_log(make_position(1))
+    if field.startswith("topics["):
+        log["topics"][int(field[7])] = bad
+    else:
+        log[field] = bad
+    with pytest.raises(ValueError):
+        probe.decode_order_filled(log)
+
+
+@pytest.mark.parametrize(("field", "bad"), [
+    ("transactionHash", "0x" + "a" * 63 + "+"),
+    ("transactionHash", "0x" + "a" * 63 + " "),
+    ("blockHash", "0x" + "b" * 63 + "+"),
+    ("topics[1]", "0x" + "c" * 63 + " "),
+    ("logIndex", "0x+1"),
+    ("logIndex", "0x 1"),
+    ("logIndex", "0x1 "),
+])
+def test_noncanonical_evidence_fails_closed_through_entire_probe(field, bad):
+    log = make_log(make_position(1), log_index=7)
+    if field.startswith("topics["):
+        log["topics"][int(field[7])] = bad
+    else:
+        log[field] = bad
+    report = probe.run_probe(
+        "http://rpc.invalid",
+        lookback_blocks=20,
+        chunk_size=20,
+        gamma_sample=0,
+        session=FakeSession([log]),
+    )
+    assert report["reconciliation"]["status"] == "FAIL_CLOSED"
+    assert report["reconciliation"]["malformed_event_count"] == 1
+    assert report["reconciliation"]["unique_event_count"] == 0
+    assert report["reconciliation"]["completeness_claim_allowed"] is False
