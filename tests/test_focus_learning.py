@@ -37,6 +37,7 @@ def focus_candidate(token, block, log_index, at, *, tx="a", price=0.42):
         "token_id": token,
         "asset_type": "CTF_TOKEN",
         "protocol_version": "LEGACY_CTF",
+        "exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
         "asset_id": token,
         "ctf_token_id": token,
         "position_id": None,
