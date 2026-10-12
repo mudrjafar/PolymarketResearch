@@ -745,3 +745,99 @@ def test_learning_queue_failure_never_rejects_successful_paper_open(
 
     stored = json.loads(paths["state"].read_text(encoding="utf-8"))
     assert stored["positions"][0]["status"] == "OPEN"
+
+
+@pytest.mark.parametrize(("missing_field", "expected"), [
+    ("asset_id", "BOOK_BOOK_ASSET_ID_MISSING"),
+    ("market", "BOOK_BOOK_MARKET_ID_MISSING"),
+])
+def test_open_rejects_latest_clob_book_without_bound_identity(
+    monkeypatch, tmp_path, missing_field, expected
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    bad_book = raw_book()
+    bad_book.pop(missing_field)
+
+    def forbidden(_):
+        raise AssertionError("Rejected Paper must not request fees")
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: bad_book,
+        market_info_loader=forbidden,
+    )
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == expected
+
+
+@pytest.mark.parametrize(("missing_field", "expected"), [
+    ("asset_id", "BOOK_ASSET_ID_MISSING"),
+    ("market", "BOOK_MARKET_ID_MISSING"),
+])
+def test_close_and_mark_reject_latest_clob_book_without_identity(
+    monkeypatch, tmp_path, missing_field, expected
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    paper_id = state["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+    bad_book = raw_book()
+    bad_book.pop(missing_field)
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: bad_book,
+        market_info_loader=lambda _: market_info(),
+    )
+    rejected = [event for event in events if event["type"] == "REJECTED"]
+    assert len(rejected) == 1
+    assert rejected[0]["reason_code"] == expected
+    assert state["positions"][0]["status"] == "OPEN"
+    assert state["positions"][0]["mark_status"] == expected
+
+
+def test_v3_position_paper_open_blocks_before_network_or_legacy_ctf_identity(
+    monkeypatch, tmp_path
+):
+    from scripts.v3_identity import decode_position_id
+
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    identity = decode_position_id((1 << 248) | (123 << 120))
+    assert identity["classification"] == "SUPPORTED"
+    assert len(identity["condition_id"]) == 64
+
+    for path in (paths["focus"], paths["book"], paths["requests"] / "REQ-open.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if path == paths["focus"]:
+            payload["focus"]["token_id"] = identity["position_id"]
+            payload["focus"]["condition_id"] = identity["condition_id"]
+        else:
+            payload["token_id"] = identity["position_id"]
+            payload["condition_id"] = identity["condition_id"]
+        save_json_atomic(path, payload)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("V3 position must not make CLOB/CTF/network calls")
+
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=forbidden,
+        market_info_loader=forbidden,
+        identity_loader=forbidden,
+        settlement_checker=forbidden,
+    )
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == "UNSUPPORTED_PROTOCOL_V2"
