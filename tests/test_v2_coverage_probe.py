@@ -169,26 +169,70 @@ def test_run_probe_is_read_only_and_counts_unknown_positions_fail_closed():
 
 
 def test_gamma_only_accepts_exact_position_id_match():
+    position_id = str(make_position(1))
+    condition = f"0x{(int(position_id) >> 8):062x}"
     class GammaSession:
         def get(self, _url, params, timeout):
-            assert timeout == 15
-            assert params == {"position_ids": "123", "limit": 100}
-            return FakeResponse([{"positionIds": json.dumps([params["position_ids"]]),
-                                 "conditionId": "0xcondition", "question": "Q"}])
+            assert timeout == 30
+            assert params == {"position_ids": [position_id], "closed": False, "limit": 100}
+            return FakeResponse([{
+                "positionIds": json.dumps([position_id, str(make_position(1, outcome_index=1))]),
+                "outcomes": json.dumps(["YES", "NO"]),
+                "conditionId": condition,
+                "question": "Q",
+            }])
 
-    match = probe._gamma_exact_match("123", session=GammaSession())
-    assert match == {"status": "EXACT_MATCH", "condition_id": "0xcondition", "question": "Q"}
+    match = probe._gamma_exact_match(position_id, session=GammaSession())
+    assert match == {
+        "status": "EXACT_MATCH",
+        "condition_id": condition,
+        "question": "Q",
+        "outcome": "YES",
+        "module": "BINARY",
+        "closed_filter": False,
+        "collector_runtime_eligible": True,
+    }
 
 
 def test_gamma_ignores_clob_token_id_match_without_position_id_match():
+    position_id = str(make_position(1))
     class GammaSession:
         def get(self, _url, params, timeout):
-            assert "position_ids" in params
-            return FakeResponse([{"clobTokenIds": json.dumps([params["position_ids"]]),
+            assert params["position_ids"] == [position_id]
+            assert params["closed"] is False
+            return FakeResponse([{"clobTokenIds": json.dumps([position_id]),
                                   "positionIds": json.dumps(["456"])}])
 
-    result = probe._gamma_exact_match("123", session=GammaSession())
-    assert result == {"status": "NO_POSITION_ID_MATCH_NOT_PROOF_OF_ABSENCE"}
+    result = probe._gamma_exact_match(position_id, session=GammaSession())
+    assert result == {"status": "POSITION_ID_QUERY_RETURNED_NO_EXACT_MATCH", "closed_filter": False}
+
+
+def test_gamma_lookup_tries_closed_markets_after_active_lookup_misses():
+    position_id = str(make_position(1))
+    condition = f"0x{(int(position_id) >> 8):062x}"
+
+    class GammaSession:
+        def __init__(self):
+            self.closed_filters = []
+
+        def get(self, _url, params, timeout):
+            assert timeout == 30
+            self.closed_filters.append(params["closed"])
+            if params["closed"] is False:
+                return FakeResponse([])
+            return FakeResponse([{
+                "positionIds": [position_id, str(make_position(1, outcome_index=1))],
+                "outcomes": ["YES", "NO"],
+                "conditionId": condition,
+                "question": "Resolved Q",
+            }])
+
+    session = GammaSession()
+    result = probe._gamma_exact_match(position_id, session=session)
+    assert session.closed_filters == [False, True]
+    assert result["status"] == "EXACT_MATCH"
+    assert result["closed_filter"] is True
+    assert result["collector_runtime_eligible"] is True
 
 
 def test_combinatorial_leg_reader_uses_read_only_get_legs_call():

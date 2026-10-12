@@ -350,55 +350,76 @@ def audit_receipt_event(rpc: JsonRpcReader, expected: dict[str, Any]) -> dict[st
 
 
 def audit_gamma_position(position_id: str, session: Any = requests) -> dict[str, Any]:
-    """Require one exact Gamma PositionId match; keep CTF token IDs separate."""
-    try:
-        response = session.get(
-            f"{GAMMA_API}/markets",
-            params={"position_ids": position_id, "limit": 100},
-            timeout=15,
-        )
-        response.raise_for_status()
-        markets = response.json()
-    except Exception:
-        return {"position_id": position_id, "status": "GAMMA_LOOKUP_ERROR"}
-    if not isinstance(markets, list):
-        return {"position_id": position_id, "status": "GAMMA_INVALID_RESPONSE"}
+    """Use Collector's exact PositionId query and report its runtime gate."""
+    for closed in (False, True):
+        try:
+            response = session.get(
+                f"{GAMMA_API}/markets",
+                params={"position_ids": [position_id], "closed": closed, "limit": 100},
+                timeout=30,
+            )
+            response.raise_for_status()
+            markets = response.json()
+        except Exception:
+            return {"position_id": position_id, "status": "GAMMA_LOOKUP_ERROR", "closed_filter": closed}
+        if not isinstance(markets, list):
+            return {"position_id": position_id, "status": "GAMMA_INVALID_RESPONSE", "closed_filter": closed}
+        if not markets:
+            continue
 
-    exact: list[tuple[dict[str, Any], int]] = []
-    for market in markets:
-        if not isinstance(market, dict):
-            continue
-        position_ids = _json_array(market.get("positionIds"))
-        if position_ids is None:
-            continue
-        for index, value in enumerate(position_ids):
-            if str(value) == position_id:
-                exact.append((market, index))
-    if not exact:
+        exact: list[tuple[dict[str, Any], int]] = []
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            position_ids = _json_array(market.get("positionIds"))
+            if position_ids is None:
+                continue
+            for index, value in enumerate(position_ids):
+                if str(value) == position_id:
+                    exact.append((market, index))
+        if not exact:
+            return {
+                "position_id": position_id,
+                "status": "NO_EXACT_POSITION_ID_MATCH_INCONCLUSIVE",
+                "closed_filter": closed,
+                "clob_token_ids_treated_as_position_ids": False,
+            }
+        if len(exact) != 1:
+            return {
+                "position_id": position_id,
+                "status": "POSITION_ID_MATCH_NOT_UNIQUE",
+                "match_count": len(exact),
+                "closed_filter": closed,
+            }
+
+        market, index = exact[0]
+        outcomes = _json_array(market.get("outcomes"))
+        clob_token_ids = _json_array(market.get("clobTokenIds"))
+        outcome = outcomes[index] if outcomes is not None and len(outcomes) == len(_json_array(market.get("positionIds")) or []) else None
+        runtime_entry = next((
+            entry for candidate_id, entry in runtime_position_market_entries(market)
+            if candidate_id == position_id
+        ), None)
         return {
             "position_id": position_id,
-            "status": "NO_EXACT_POSITION_ID_MATCH_INCONCLUSIVE",
+            "status": "EXACT_POSITION_ID_MATCH",
+            "condition_id": market.get("conditionId"),
+            "slug": market.get("slug"),
+            "question": market.get("question"),
+            "position_id_index": index,
+            "outcome_at_index": runtime_entry["outcome"] if runtime_entry else outcome,
+            "outcome_alignment_status": "ALIGNED" if runtime_entry else ("UNVERIFIED" if outcome is None else "RUNTIME_REJECTED"),
+            "collector_runtime_eligible": runtime_entry is not None,
+            "collector_runtime_module": runtime_entry["position_module"] if runtime_entry else None,
+            "closed_filter": closed,
+            "clob_token_ids": [str(value) for value in clob_token_ids] if clob_token_ids is not None else None,
             "clob_token_ids_treated_as_position_ids": False,
+            "clob_protocol_identity": "positionID",
         }
-    if len(exact) != 1:
-        return {"position_id": position_id, "status": "POSITION_ID_MATCH_NOT_UNIQUE", "match_count": len(exact)}
-
-    market, index = exact[0]
-    outcomes = _json_array(market.get("outcomes"))
-    clob_token_ids = _json_array(market.get("clobTokenIds"))
-    outcome = outcomes[index] if outcomes is not None and len(outcomes) == len(_json_array(market.get("positionIds")) or []) else None
     return {
         "position_id": position_id,
-        "status": "EXACT_POSITION_ID_MATCH",
-        "condition_id": market.get("conditionId"),
-        "slug": market.get("slug"),
-        "question": market.get("question"),
-        "position_id_index": index,
-        "outcome_at_index": outcome,
-        "outcome_alignment_status": "ALIGNED" if outcome is not None else "UNVERIFIED",
-        "clob_token_ids": [str(value) for value in clob_token_ids] if clob_token_ids is not None else None,
+        "status": "NO_EXACT_POSITION_ID_MATCH_INCONCLUSIVE",
         "clob_token_ids_treated_as_position_ids": False,
-        "clob_protocol_identity": "positionID",
     }
 
 

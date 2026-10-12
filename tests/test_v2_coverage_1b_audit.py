@@ -368,21 +368,24 @@ def test_receipt_without_status_is_not_accepted_as_provenance():
 
 def test_gamma_exact_position_match_preserves_ctf_ids_separately():
     position_id = str(make_position())
+    condition = f"0x{(int(position_id) >> 8):062x}"
     gamma = FakeGamma([{
-        "conditionId": "condition-1",
+        "conditionId": condition,
         "slug": "market-1",
         "question": "Question?",
-        "positionIds": json.dumps([position_id]),
+        "positionIds": json.dumps([position_id, str(int(position_id) | 1)]),
         "clobTokenIds": json.dumps(["999"]),
-        "outcomes": json.dumps(["Yes"]),
+        "outcomes": json.dumps(["Yes", "No"]),
     }])
     result = audit.audit_gamma_position(position_id, session=gamma)
     assert result["status"] == "EXACT_POSITION_ID_MATCH"
     assert result["outcome_at_index"] == "Yes"
+    assert result["collector_runtime_eligible"] is True
+    assert result["collector_runtime_module"] == "BINARY"
     assert result["clob_token_ids"] == ["999"]
     assert result["clob_token_ids_treated_as_position_ids"] is False
     assert result["clob_protocol_identity"] == "positionID"
-    assert gamma.calls[0][1] == {"position_ids": position_id, "limit": 100}
+    assert gamma.calls[0][1] == {"position_ids": [position_id], "closed": False, "limit": 100}
 
 
 def test_gamma_clob_token_match_is_not_position_identity_proof():
@@ -451,6 +454,7 @@ def test_run_audit_reports_sample_only_and_never_claims_completeness():
     assert output["receipt_provenance"]["result_counts"] == {"RECEIPT_AND_CANONICAL_BLOCK_MATCH": 1}
     assert output["receipt_provenance"]["completeness_claim_allowed"] is False
     assert output["position_identity"]["result_counts"] == {"EXACT_POSITION_ID_MATCH": 1}
+    assert output["position_identity"]["results"][0]["collector_runtime_eligible"] is False
     assert output["position_identity"]["clob_public_read"]["result_counts"] == {"EXACT_CLOB_ASSET_ID_MATCH": 1}
     assert output["position_identity"]["decoded_v2_position_ids"][0]["module"] == "CTF"
     assert output["position_identity"]["combo_catalog"]["status"] == "NO_COMBO_POSITION_IDS_SAMPLED"

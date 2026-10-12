@@ -1,7 +1,7 @@
 """Read-only coverage probe for Polymarket's V2 Exchange V3 deployment.
 
 This utility reads finalized Polygon logs and, optionally, asks the public Gamma
-API whether sampled position IDs have an exact CLOB token identity match. It
+API whether sampled position IDs resolve through the Collector's market rules. It
 does not write runtime data, update Collector state, or feed any decision worker.
 """
 
@@ -20,9 +20,19 @@ import requests
 from eth_abi import decode, encode
 
 try:  # Support both `python scripts/...py` and package-based tests.
-    from .v3_identity import MODULE_NAMES as RUNTIME_MODULE_NAMES, V3IdentityError, decode_position_id
+    from .v3_identity import (
+        MODULE_NAMES as RUNTIME_MODULE_NAMES,
+        V3IdentityError,
+        decode_position_id,
+        runtime_position_market_entries,
+    )
 except ImportError:  # pragma: no cover - used by direct script execution
-    from v3_identity import MODULE_NAMES as RUNTIME_MODULE_NAMES, V3IdentityError, decode_position_id
+    from v3_identity import (
+        MODULE_NAMES as RUNTIME_MODULE_NAMES,
+        V3IdentityError,
+        decode_position_id,
+        runtime_position_market_entries,
+    )
 
 
 POLYGON_CHAIN_ID = 137
@@ -283,34 +293,61 @@ def _scan_logs(
 
 
 def _gamma_exact_match(position_id: str, session: Any = requests) -> dict[str, Any]:
-    """Check Gamma's position-ID identity field; a miss is not proof of absence."""
-    try:
-        response = session.get(
-            f"{GAMMA_API}/markets",
-            params={"position_ids": position_id, "limit": 100},
-            timeout=15,
-        )
-        response.raise_for_status()
-        markets = response.json()
-    except Exception:
-        return {"status": "LOOKUP_ERROR"}
-    if not isinstance(markets, list):
-        return {"status": "INVALID_RESPONSE"}
-    for market in markets:
-        if not isinstance(market, dict):
+    """Use the same targeted Gamma lookup and eligibility checks as Collector."""
+    for closed in (False, True):
+        try:
+            response = session.get(
+                f"{GAMMA_API}/markets",
+                params={"position_ids": [position_id], "closed": closed, "limit": 100},
+                timeout=30,
+            )
+            response.raise_for_status()
+            markets = response.json()
+        except Exception:
+            return {"status": "LOOKUP_ERROR", "closed_filter": closed}
+        if not isinstance(markets, list):
+            return {"status": "INVALID_RESPONSE", "closed_filter": closed}
+        if not markets:
             continue
-        position_ids = market.get("positionIds", [])
-        if isinstance(position_ids, str):
-            try:
-                position_ids = json.loads(position_ids)
-            except (TypeError, ValueError):
-                position_ids = []
-        if isinstance(position_ids, list) and position_id in {str(item) for item in position_ids}:
+
+        exact_market = None
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            position_ids = market.get("positionIds", [])
+            if isinstance(position_ids, str):
+                try:
+                    position_ids = json.loads(position_ids)
+                except (TypeError, ValueError):
+                    position_ids = []
+            if isinstance(position_ids, list) and position_id in {str(item) for item in position_ids}:
+                exact_market = market
+                break
+
+        if exact_market is None:
+            return {"status": "POSITION_ID_QUERY_RETURNED_NO_EXACT_MATCH", "closed_filter": closed}
+
+        runtime_entry = next((
+            entry for candidate_id, entry in runtime_position_market_entries(exact_market)
+            if candidate_id == position_id
+        ), None)
+        if runtime_entry is None:
             return {
-                "status": "EXACT_MATCH",
-                "condition_id": market.get("conditionId"),
-                "question": market.get("question"),
+                "status": "EXACT_POSITION_ID_MATCH_RUNTIME_REJECTED",
+                "condition_id": exact_market.get("conditionId"),
+                "question": exact_market.get("question"),
+                "closed_filter": closed,
+                "collector_runtime_eligible": False,
             }
+        return {
+            "status": "EXACT_MATCH",
+            "condition_id": runtime_entry["condition_id"],
+            "question": runtime_entry["question"],
+            "outcome": runtime_entry["outcome"],
+            "module": runtime_entry["position_module"],
+            "closed_filter": closed,
+            "collector_runtime_eligible": True,
+        }
     return {"status": "NO_POSITION_ID_MATCH_NOT_PROOF_OF_ABSENCE"}
 
 
