@@ -1,0 +1,50 @@
+name: GENERAL1-C PR36 Offline Evidence
+on:
+  push:
+    branches: [fix/v2-probe-canonical-evidence-20261012]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install offline dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Targeted canonical-evidence regressions
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_v2_coverage_probe.py tests/test_collector_sqlite.py tests/test_flow_evidence_interface.py tests/test_flow_unit2.py 2>&1 | tee targeted.log
+      - name: Full offline suite
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee full.log
+      - name: Runtime self-test (no workers launched)
+        shell: bash
+        run: |
+          set -o pipefail
+          python run_machine.py --self-test 2>&1 | tee self_test.log
+      - name: Handoff source, diff and checksums
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p handoff/source/scripts handoff/source/tests
+          cp scripts/v2_coverage_probe.py handoff/source/scripts/
+          cp tests/test_v2_coverage_probe.py handoff/source/tests/
+          git rev-parse HEAD > handoff/commit.txt
+          git diff origin/main...HEAD > handoff/changes.diff || git show --format=fuller HEAD > handoff/changes.diff
+          cp -f targeted.log full.log self_test.log handoff/ 2>/dev/null || true
+          (cd handoff && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: general1c-pr36-handoff
+          path: handoff/
+          if-no-files-found: error
