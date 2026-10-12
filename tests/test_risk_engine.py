@@ -263,7 +263,7 @@ def test_risk_attaches_only_source_consistent_legacy_execution_protocol():
         "asset_id": token,
         "ctf_token_id": token,
         "position_id": None,
-        "exchange_address": "0x" + "e1" * 20,
+        "exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
     }
     row = make_row(**identity)
     source_flow = make_flow(**identity)
