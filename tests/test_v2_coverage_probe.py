@@ -552,3 +552,77 @@ def test_rpc_scan_rejects_noncanonical_block_quantity_before_reconciliation():
             gamma_sample=0,
             session=FakeSession([log]),
         )
+
+
+
+@pytest.mark.parametrize("bad", [
+    "0x00", "0x01", "0x089", "0x+89", "0x 89", "0x89 ",
+    "0x-89", "0X89", "", None, 137, True, "-0x89",
+])
+def test_hex_block_requires_canonical_rpc_quantity(bad):
+    with pytest.raises(probe.ProbeError, match="invalid"):
+        probe._hex_block(bad, "chain id")
+
+
+@pytest.mark.parametrize(("method", "bad"), [
+    ("eth_chainId", "0x089"),
+    ("eth_chainId", "0x+89"),
+    ("eth_blockNumber", "0x0100"),
+    ("eth_blockNumber", "0x100 "),
+    ("eth_getBlockByNumber", "0x0f0"),
+    ("eth_getBlockByNumber", "0x+f0"),
+])
+def test_probe_rejects_noncanonical_chain_head_and_finalized_response(method, bad):
+    class NonCanonicalSession(FakeSession):
+        def post(self, url, json, timeout):
+            response = super().post(url, json, timeout)
+            if json["method"] == method:
+                if method == "eth_getBlockByNumber":
+                    response.body["result"]["number"] = bad
+                else:
+                    response.body["result"] = bad
+            return response
+
+    session = NonCanonicalSession([])
+    with pytest.raises(probe.ProbeError, match="invalid"):
+        probe.run_probe("http://rpc.invalid", gamma_sample=0, session=session)
+    assert not any(call["method"] == "eth_getLogs" for call in session.calls)
+
+
+@pytest.mark.parametrize("bad", [
+    "0x+" + "a" * 39,
+    "0x " + "a" * 39,
+    "0x-" + "a" * 39,
+    "0x" + "a" * 39 + " ",
+    "0X" + "a" * 40,
+    "0x" + "g" * 40,
+    123,
+    None,
+])
+def test_decoder_rejects_noncanonical_exchange_addresses(bad):
+    log = make_log(make_position(1))
+    log["address"] = bad
+    with pytest.raises(ValueError, match="exchange address"):
+        probe.decode_order_filled(log)
+
+
+@pytest.mark.parametrize("bad", [
+    "0x+" + "a" * 39,
+    "0x " + "a" * 39,
+    "0x" + "a" * 39 + " ",
+    "0X" + "a" * 40,
+    "0x" + "g" * 40,
+    123,
+    None,
+])
+def test_probe_rejects_noncanonical_configured_exchange_before_rpc(bad):
+    session = FakeSession([])
+    with pytest.raises(ValueError, match="exchange address"):
+        probe.run_probe("http://rpc.invalid", exchange_address=bad, session=session)
+    assert session.calls == []
+
+
+def test_hex_block_minimal_quantities_work():
+    assert probe._hex_block("0x0", "quantity") == 0
+    assert probe._hex_block("0x1", "quantity") == 1
+    assert probe._hex_block("0x89", "chain id") == 137
