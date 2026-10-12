@@ -139,12 +139,8 @@ def decode_order_filled(log: dict[str, Any]) -> dict[str, Any]:
     log_index = _hex_log_integer(log.get("logIndex"), "log index")
     block_number = _hex_log_integer(log.get("blockNumber"), "block number")
     address = log.get("address")
-    if not isinstance(address, str) or len(address) != 42 or not address.startswith("0x"):
+    if not isinstance(address, str) or re.fullmatch(r"0x[0-9a-fA-F]{40}", address) is None:
         raise ValueError("invalid exchange address")
-    try:
-        int(address[2:], 16)
-    except ValueError as exc:
-        raise ValueError("invalid exchange address") from exc
     address = address.lower()
     data = log.get("data")
     if (
@@ -225,13 +221,11 @@ class JsonRpcReader:
 
 
 def _hex_block(value: Any, label: str) -> int:
+    # Ethereum JSON-RPC quantities must have no leading zero, sign or whitespace.
     try:
-        block = int(value, 16)
-    except (TypeError, ValueError) as exc:
+        return _hex_log_integer(value, label)
+    except ValueError as exc:
         raise ProbeError(f"RPC returned an invalid {label}") from exc
-    if block < 0:
-        raise ProbeError(f"RPC returned an invalid {label}")
-    return block
 
 
 def _scan_logs(
@@ -383,7 +377,7 @@ def run_probe(
         raise ValueError("start_block and end_block must be supplied together")
     if lookback_blocks < 1 or chunk_size < 1 or gamma_sample < 0 or max_logs_per_response < 1:
         raise ValueError("probe limits must be non-negative and block limits positive")
-    if not exchange_address.startswith("0x") or len(exchange_address) != 42:
+    if not isinstance(exchange_address, str) or re.fullmatch(r"0x[0-9a-fA-F]{40}", exchange_address) is None:
         raise ValueError("exchange address must be a 20-byte hex address")
     rpc = JsonRpcReader(rpc_url, session=session)
     chain_id = _hex_block(rpc.call("eth_chainId", []), "chain id")
