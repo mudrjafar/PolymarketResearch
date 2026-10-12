@@ -1,0 +1,51 @@
+name: GENERAL1-C PR35 Offline Safety
+on:
+  push:
+    branches: [fix/general1-book-paper-dashboard-gates-20261012]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install offline dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Targeted fail-closed and dashboard regression tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_book_engine.py tests/test_book_worker.py tests/test_paper_engine.py tests/test_paper_worker.py tests/test_paper_dashboard.py tests/test_dashboard_streamlit.py 2>&1 | tee targeted.log
+      - name: Full offline suite
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee full.log
+      - name: Runtime self-test (no workers launched)
+        shell: bash
+        run: |
+          set -o pipefail
+          python run_machine.py --self-test 2>&1 | tee self_test.log
+      - name: Handoff source, diff and checksums
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p handoff/source/scripts handoff/source/tests
+          for x in scripts/book_engine.py scripts/paper_engine.py scripts/paper_worker.py scripts/paper_dashboard.py; do cp "$x" handoff/source/scripts/; done
+          for x in tests/test_book_engine.py tests/test_book_worker.py tests/test_paper_engine.py tests/test_paper_worker.py tests/test_paper_dashboard.py tests/test_dashboard_streamlit.py; do cp "$x" handoff/source/tests/; done
+          cp dashboard.py handoff/source/
+          git rev-parse HEAD > handoff/commit.txt
+          git diff ${{ github.event.before }} HEAD > handoff/changes.diff || git show --format=fuller HEAD > handoff/changes.diff
+          cp -f targeted.log full.log self_test.log handoff/ 2>/dev/null || true
+          (cd handoff && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: general1c-pr35-handoff
+          path: handoff/
+          if-no-files-found: error
