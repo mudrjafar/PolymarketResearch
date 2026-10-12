@@ -24,7 +24,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          python -m pytest -q tests/test_focus_engine.py tests/test_focus_runner.py tests/test_risk_engine.py tests/test_flow_unit2.py tests/test_v3_execution_protocol_gate.py tests/test_paper_worker.py tests/test_focus_learning.py tests/test_flow_evidence_interface.py 2>&1 | tee targeted.log
+          python -m pytest -q tests/test_focus_engine.py tests/test_focus_runner.py tests/test_risk_engine.py tests/test_flow_unit2.py tests/test_v3_execution_protocol_gate.py tests/test_paper_worker.py tests/test_focus_learning.py tests/test_flow_evidence_interface.py tests/test_protocol_identity.py 2>&1 | tee targeted.log
       - name: Full offline suite
         shell: bash
         run: |
@@ -40,8 +40,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p handoff/source/scripts handoff/source/tests
-          for x in scripts/flow_tracker.py scripts/diamond_filter_v3.py scripts/risk_engine.py scripts/focus_engine.py scripts/focus_runner.py; do cp "$x" handoff/source/scripts/; done
-          for x in tests/test_focus_engine.py tests/test_focus_runner.py tests/test_risk_engine.py tests/test_v3_execution_protocol_gate.py tests/test_focus_learning.py tests/test_flow_evidence_interface.py; do cp "$x" handoff/source/tests/; done
+          for x in scripts/flow_tracker.py scripts/diamond_filter_v3.py scripts/risk_engine.py scripts/focus_engine.py scripts/focus_runner.py scripts/protocol_identity.py; do cp "$x" handoff/source/scripts/; done
+          for x in tests/test_focus_engine.py tests/test_focus_runner.py tests/test_risk_engine.py tests/test_v3_execution_protocol_gate.py tests/test_focus_learning.py tests/test_flow_evidence_interface.py tests/test_protocol_identity.py; do cp "$x" handoff/source/tests/; done
           git rev-parse HEAD > handoff/commit.txt
           git diff origin/main...HEAD > handoff/changes.diff
           cp -f targeted.log full.log self_test.log handoff/ 2>/dev/null || true
