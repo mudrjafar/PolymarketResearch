@@ -159,3 +159,29 @@ def test_ready_evidence_must_match_paper_lineage():
     value["focus"]["ready_evidence_cursor"] = [101, 1]
     with pytest.raises(LearningContractError, match="READY evidence cursor"):
         validate_paper_trade_record(value)
+
+
+def test_empty_canonical_identity_is_rejected():
+    value = record()
+    value["paper_id"] = ""
+    with pytest.raises(LearningContractError, match="root.paper_id"):
+        validate_paper_trade_record(value)
+
+    value = record()
+    value["lineage"]["token_id"] = "   "
+    with pytest.raises(LearningContractError, match="lineage.token_id"):
+        validate_paper_trade_record(value)
+
+
+def test_signal_direction_must_match_lineage_direction():
+    value = record()
+    value["signal"]["direction"] = "SELL"
+    with pytest.raises(LearningContractError, match="signal.direction"):
+        validate_paper_trade_record(value)
+
+
+def test_book_identity_fields_must_be_nonempty():
+    value = record()
+    value["entry_execution"]["book_hash"] = ""
+    with pytest.raises(LearningContractError, match="entry_execution.book_hash"):
+        validate_paper_trade_record(value)

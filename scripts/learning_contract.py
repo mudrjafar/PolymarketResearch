@@ -255,6 +255,12 @@ def _require_fields(section_name: str, section: Mapping[str, Any]) -> None:
             raise LearningContractError(f"{section_name}.{field} is required")
 
 
+def _require_nonempty_text(section_name: str, section: Mapping[str, Any], fields) -> None:
+    for field in fields:
+        if not _nonempty(section.get(field)):
+            raise LearningContractError(f"{section_name}.{field} must be non-empty")
+
+
 def _validate_cursor(value: Any, label: str) -> None:
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         raise LearningContractError(f"{label} must be [block, log_index]")
@@ -292,7 +298,21 @@ def validate_paper_trade_record(record: Mapping[str, Any]) -> None:
 
     validate_strategy_versions(record["versions"])
 
+    _require_nonempty_text("root", record, ("paper_id", "open_request_id", "ready_id"))
+
     lineage = record["lineage"]
+    _require_nonempty_text(
+        "lineage",
+        lineage,
+        (
+            "condition_id",
+            "token_id",
+            "outcome",
+            "direction",
+            "source_generation_id",
+            "source_evidence_id",
+        ),
+    )
     _validate_cursor(lineage.get("source_evidence_cursor"), "lineage.source_evidence_cursor")
     for field in (
         "source_evidence_at",
@@ -314,11 +334,28 @@ def validate_paper_trade_record(record: Mapping[str, Any]) -> None:
     if list(lineage.get("source_evidence_cursor")) != list(focus.get("ready_evidence_cursor")):
         raise LearningContractError("READY evidence cursor must match Paper lineage evidence cursor")
 
+    signal = record["signal"]
+    _require_nonempty_text("signal", signal, ("classification", "direction"))
+
+    if str(lineage.get("direction")).upper() != str(signal.get("direction")).upper():
+        raise LearningContractError("signal.direction must match lineage.direction")
+
     risk = record["risk"]
+    _require_nonempty_text("risk", risk, ("risk_decision",))
     if not isinstance(risk.get("risk_ok"), bool):
         raise LearningContractError("risk.risk_ok must be boolean")
     if not isinstance(risk.get("risk_reason_codes"), list):
         raise LearningContractError("risk.risk_reason_codes must be a list")
+
+    focus = record["focus"]
+    _require_nonempty_text("focus", focus, ("ready_evidence_id",))
+
+    entry_execution = record["entry_execution"]
+    _require_nonempty_text(
+        "entry_execution",
+        entry_execution,
+        ("book_hash", "book_timestamp"),
+    )
 
     signal = record["signal"]
     probability = signal.get("forecast_probability")
