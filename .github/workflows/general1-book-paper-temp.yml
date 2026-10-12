@@ -15,6 +15,8 @@ jobs:
       TELEGRAM_CHAT_ID: ""
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -35,7 +37,7 @@ jobs:
         shell: bash
         run: |
           python -m py_compile dashboard.py scripts/paper_dashboard.py scripts/book_engine.py scripts/paper_engine.py scripts/paper_worker.py
-          git diff --check HEAD~1 HEAD
+          git diff --check origin/main...HEAD
       - name: Runtime offline self-test
         if: always()
         shell: bash
