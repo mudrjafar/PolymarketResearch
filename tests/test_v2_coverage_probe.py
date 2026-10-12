@@ -57,7 +57,7 @@ def test_event_topic_matches_official_v2_signature():
 def test_position_module_classification(module_id, expected):
     identity = probe.parse_position_id(make_position(module_id, arity=2 if module_id == 2 else 0))
     assert identity["module"] == expected
-    expected_classification = {1: "RECOGNIZED", 2: "RECOGNIZED", 3: "RESEARCH_ONLY"}.get(module_id, "FAIL_CLOSED")
+    expected_classification = {1: "SUPPORTED", 2: "SUPPORTED", 3: "RESEARCH_ONLY"}.get(module_id, "FAIL_CLOSED")
     assert identity["classification"] == expected_classification
 
 
@@ -73,7 +73,19 @@ def test_decoder_extracts_position_id_and_raw_amounts():
     assert fill["condition_index"] == 1
     assert fill["outcome_index"] == 1
     assert fill["maker_amount_raw"] == "100"
-    assert fill["classification"] == "RECOGNIZED"
+    assert fill["classification"] == "SUPPORTED"
+
+
+def test_runtime_decoder_rejects_non_polygon_chain_and_invalid_negrisk_arity():
+    bad_chain = make_position(1) | (1 << 24)
+    bad_arity = make_position(2, arity=1)
+    assert probe.parse_position_id(bad_chain)["classification"] == "FAIL_CLOSED"
+    assert probe.parse_position_id(bad_arity)["classification"] == "FAIL_CLOSED"
+
+
+def test_combinatorial_position_ids_are_research_only():
+    identity = probe.parse_position_id(make_position(3))
+    assert identity["classification"] == "RESEARCH_ONLY"
 
 
 def test_decoder_rejects_wrong_topic_and_malformed_data():

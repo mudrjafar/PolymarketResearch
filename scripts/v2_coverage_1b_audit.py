@@ -24,23 +24,29 @@ COMBO_PAGE_SIZE = 100
 try:  # Support both `python scripts/...py` and package-based tests.
     from .v2_coverage_probe import (
         GAMMA_API,
+        EXCHANGE_V3_ADDRESS,
         JsonRpcReader,
         POLYGON_CHAIN_ID,
         ProbeError,
         _hex_block,
         _rpc_url_from_config,
+        _scan_logs,
         decode_order_filled,
     )
+    from .v3_identity import V3IdentityError, condition_matches_position, decode_position_id
 except ImportError:  # pragma: no cover - used by direct script execution
     from v2_coverage_probe import (
         GAMMA_API,
+        EXCHANGE_V3_ADDRESS,
         JsonRpcReader,
         POLYGON_CHAIN_ID,
         ProbeError,
         _hex_block,
         _rpc_url_from_config,
+        _scan_logs,
         decode_order_filled,
     )
+    from v3_identity import V3IdentityError, condition_matches_position, decode_position_id
 
 
 def _json_array(value: Any) -> list[Any] | None:
@@ -67,30 +73,23 @@ def _same_event(expected: dict[str, Any], observed: dict[str, Any]) -> bool:
 
 
 def decode_v2_position_id(position_id: str) -> dict[str, Any]:
-    """Decode the V2 module and outcome bytes from a decimal PositionId."""
-    if not isinstance(position_id, str) or not position_id.isascii() or not position_id.isdecimal():
+    """Present the Runtime decoder's decision in the audit's legacy schema."""
+    try:
+        identity = decode_position_id(position_id)
+    except (V3IdentityError, TypeError, ValueError):
         return {"position_id": position_id, "status": "INVALID_POSITION_ID_ENCODING"}
-    value = int(position_id)
-    if value < 0 or value >= 1 << 256:
-        return {"position_id": position_id, "status": "INVALID_POSITION_ID_ENCODING"}
-    encoded = f"{value:064x}"
-    module_id = int(encoded[:2], 16)
-    outcome_index = int(encoded[-2:], 16)
-    if module_id not in {1, 2, 3} or outcome_index not in {0, 1}:
+    if identity["classification"] == "FAIL_CLOSED":
         return {
-            "position_id": position_id,
+            "position_id": identity["position_id"],
             "status": "UNRECOGNIZED_V2_POSITION_ID_LAYOUT",
-            "module_id": module_id,
-            "outcome_index": outcome_index,
+            **identity,
         }
+    module = {"BINARY": "CTF", "NEG_RISK": "NEG_RISK", "COMBINATORIAL": "COMBO"}.get(identity["module"])
     return {
-        "position_id": position_id,
+        **identity,
         "status": "V2_POSITION_ID_DECODED",
-        "module_id": module_id,
-        "module": {1: "CTF", 2: "NEG_RISK", 3: "COMBO"}[module_id],
-        "condition_id": "0x" + encoded[:-2],
-        "outcome_index": outcome_index,
-        "outcome": "YES" if outcome_index == 0 else "NO",
+        "module": module,
+        "outcome": "YES" if identity["outcome_index"] == 0 else "NO",
     }
 
 
@@ -409,6 +408,159 @@ def audit_clob_asset(position_id: str, session: Any = requests) -> dict[str, Any
     }
 
 
+def discover_active_v3_candidates(
+    rpc: JsonRpcReader,
+    *,
+    session: Any = requests,
+    max_pages: int = 100,
+    lookback_blocks: int = 10_000,
+) -> dict[str, Any]:
+    """Find active Gamma V3 IDs, verify CLOB identity, then corroborate fills.
+
+    Any pagination cap, API miss, or log-range miss is explicitly inconclusive.
+    Only the Runtime decoder decides whether a PositionId is eligible.
+    """
+    candidates: dict[str, dict[str, Any]] = {}
+    cursor = None
+    seen_cursors = set()
+    pages = 0
+    complete = True
+    try:
+        for _ in range(max_pages):
+            params = {"limit": 100, "active": True, "closed": False}
+            if cursor:
+                params["after_cursor"] = cursor
+            response = session.get(f"{GAMMA_API}/markets/keyset", params=params, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict):
+                markets = payload.get("markets", [])
+                next_cursor = payload.get("next_cursor") or payload.get("nextCursor")
+            elif isinstance(payload, list):
+                markets, next_cursor = payload, None
+            else:
+                return {"status": "GAMMA_INVALID_RESPONSE_INCONCLUSIVE", "pages_scanned": pages, "candidates": []}
+            pages += 1
+            if not isinstance(markets, list):
+                return {"status": "GAMMA_INVALID_RESPONSE_INCONCLUSIVE", "pages_scanned": pages, "candidates": []}
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                if market.get("active") is not True or market.get("closed") is not False:
+                    continue
+                position_ids = _json_array(market.get("positionIds"))
+                outcomes = _json_array(market.get("outcomes"))
+                if position_ids is None or outcomes is None or len(position_ids) != len(outcomes):
+                    continue
+                condition_id = market.get("conditionId", market.get("condition_id"))
+                for index, raw_id in enumerate(position_ids):
+                    try:
+                        identity = decode_position_id(str(raw_id))
+                    except (V3IdentityError, TypeError, ValueError):
+                        continue
+                    if identity["classification"] != "SUPPORTED":
+                        continue
+                    if not condition_matches_position(condition_id, identity["condition_id"]):
+                        continue
+                    expected_outcome = "YES" if identity["outcome_index"] == 0 else "NO"
+                    if str(outcomes[index]).strip().upper() != expected_outcome:
+                        continue
+                    candidates.setdefault(identity["position_id"], {
+                        "position_id": identity["position_id"],
+                        "module": identity["module"],
+                        "condition_id": identity["condition_id"],
+                        "outcome_index": identity["outcome_index"],
+                        "outcome": expected_outcome,
+                        "gamma_condition_id": condition_id,
+                        "market_id": market.get("id"),
+                        "slug": market.get("slug"),
+                        "active": market.get("active"),
+                        "closed": market.get("closed"),
+                        "gamma_identity_status": "EXACT_CONDITION_AND_OUTCOME_MATCH",
+                    })
+            if not next_cursor:
+                cursor = None
+                break
+            if next_cursor in seen_cursors:
+                complete = False
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        else:
+            if cursor:
+                complete = False
+    except Exception as exc:
+        return {
+            "status": "GAMMA_LOOKUP_ERROR_INCONCLUSIVE",
+            "pages_scanned": pages,
+            "error_type": type(exc).__name__,
+            "candidates": [],
+        }
+
+    clob_verified = []
+    clob_checks = []
+    for candidate in candidates.values():
+        clob = audit_clob_asset(candidate["position_id"], session=session)
+        clob_checks.append({**candidate, "clob_status": clob.get("status")})
+        if clob.get("status") == "EXACT_CLOB_ASSET_ID_MATCH":
+            clob_verified.append(clob_checks[-1])
+
+    try:
+        finalized = rpc.call("eth_getBlockByNumber", ["finalized", False])
+        end_block = _hex_block(finalized.get("number"), "finalized block") if isinstance(finalized, dict) else None
+        if end_block is None:
+            raise ProbeError("no finalized block")
+        start_block = max(0, end_block - lookback_blocks + 1)
+        logs = _scan_logs(rpc, EXCHANGE_V3_ADDRESS, start_block, end_block, 500)
+    except Exception as exc:
+        return {
+            "status": "ONCHAIN_SCAN_ERROR_INCONCLUSIVE",
+            "gamma_pages_scanned": pages,
+            "gamma_scan_complete": complete,
+            "gamma_candidates": len(candidates),
+            "clob_candidate_checks": clob_checks,
+            "clob_verified_candidates": clob_verified,
+            "error_type": type(exc).__name__,
+            "event_matches": [],
+            "interpretation": "No candidate was disproved; the finalized event scan was unavailable.",
+        }
+
+    wanted = {item["position_id"]: item for item in clob_verified}
+    event_matches = []
+    for log in logs:
+        try:
+            event = decode_order_filled(log)
+        except (TypeError, ValueError):
+            continue
+        candidate = wanted.get(event["position_id"])
+        if candidate is None:
+            continue
+        provenance = audit_receipt_event(rpc, event)
+        event_matches.append({
+            **candidate,
+            "transaction_hash": event["transaction_hash"],
+            "log_index": event["log_index"],
+            "block_number": event["block_number"],
+            "block_hash": event["block_hash"],
+            "receipt_status": provenance["status"],
+        })
+    confirmed = [item for item in event_matches if item["receipt_status"] == "RECEIPT_AND_CANONICAL_BLOCK_MATCH"]
+    return {
+        "status": "CONFIRMED_CANDIDATE_FOUND" if confirmed else "NO_CANDIDATE_PROVEN_INCONCLUSIVE",
+        "read_only": True,
+        "gamma_pages_scanned": pages,
+        "gamma_scan_complete": complete,
+        "gamma_candidates": len(candidates),
+        "clob_candidate_checks": clob_checks,
+        "clob_verified_candidates": clob_verified,
+        "finalized_block": end_block,
+        "event_scan_range": {"start_block": start_block, "end_block": end_block},
+        "event_matches": event_matches,
+        "confirmed_candidates": confirmed,
+        "interpretation": "A missing Gamma or OrderFilled match is not evidence that no eligible market exists.",
+    }
+
+
 def run_audit(
     source_report: dict[str, Any],
     rpc_url: str,
@@ -535,7 +687,10 @@ def run_audit(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only receipt provenance and V2 identity audit")
-    parser.add_argument("--report", required=True, help="saved JSON report emitted by v2_coverage_probe.py")
+    parser.add_argument("--report", help="saved JSON report emitted by v2_coverage_probe.py")
+    parser.add_argument("--discover-active", action="store_true", help="search active Gamma markets for exact V3 candidates, then verify CLOB and finalized fills")
+    parser.add_argument("--lookback-blocks", type=int, default=10_000)
+    parser.add_argument("--gamma-max-pages", type=int, default=100)
     parser.add_argument("--receipt-sample", type=int, default=10)
     parser.add_argument("--gamma-sample", type=int, default=25)
     parser.add_argument(
@@ -547,12 +702,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--env-file", help="optional .env file; only POLYMARKET_RPC_URL is read")
     args = parser.parse_args(argv)
     try:
-        with open(args.report, "r", encoding="utf-8") as handle:
-            source_report = json.load(handle)
         rpc_url = _rpc_url_from_config(args.env_file)
         if not rpc_url:
             print("Missing POLYMARKET_RPC_URL configuration; RPC endpoint was not contacted.", file=sys.stderr)
             return 2
+        if args.discover_active:
+            if args.lookback_blocks < 1 or args.gamma_max_pages < 1:
+                raise ValueError("lookback-blocks and gamma-max-pages must be positive")
+            report = discover_active_v3_candidates(
+                JsonRpcReader(rpc_url), max_pages=args.gamma_max_pages,
+                lookback_blocks=args.lookback_blocks,
+            )
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0
+        if not args.report:
+            parser.error("--report is required unless --discover-active is used")
+        with open(args.report, "r", encoding="utf-8") as handle:
+            source_report = json.load(handle)
         report = run_audit(
             source_report,
             rpc_url,

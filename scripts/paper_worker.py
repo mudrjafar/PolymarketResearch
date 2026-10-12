@@ -248,6 +248,22 @@ SETTLEMENT_IDENTITY_FIELDS = (
     "position_collateral",
     "outcome_index",
 )
+V2_SETTLEMENT_IDENTITY_FIELDS = (
+    "settlement_protocol",
+    "settlement_family",
+    "settlement_contract",
+    "position_collateral",
+    "outcome_index",
+    "position_module_id",
+)
+
+
+def _settlement_fields_for_protocol(protocol):
+    if protocol == paper_settlement.PROTOCOL_LEGACY_CTF:
+        return SETTLEMENT_IDENTITY_FIELDS
+    if protocol == paper_settlement.PROTOCOL_V2_POSITION:
+        return V2_SETTLEMENT_IDENTITY_FIELDS
+    return None
 
 
 def _paper_event(event_type, now, **extra):
@@ -263,17 +279,21 @@ def _paper_event(event_type, now, **extra):
 def _apply_settlement_identity(position, identity):
     if not isinstance(identity, dict):
         raise paper_settlement.SettlementIdentityError("IDENTITY_PAYLOAD_INVALID")
-    for field in SETTLEMENT_IDENTITY_FIELDS:
+    fields = _settlement_fields_for_protocol(identity.get("settlement_protocol"))
+    if fields is None:
+        raise paper_settlement.SettlementIdentityError("IDENTITY_PROTOCOL_UNSUPPORTED")
+    for field in fields:
         if field not in identity or identity.get(field) is None:
             raise paper_settlement.SettlementIdentityError(
                 f"IDENTITY_{field.upper()}_MISSING"
             )
-    for field in SETTLEMENT_IDENTITY_FIELDS:
+    for field in fields:
         position[field] = identity[field]
 
 
 def _ensure_settlement_identity(position, identity_loader):
-    if all(position.get(field) is not None for field in SETTLEMENT_IDENTITY_FIELDS):
+    fields = _settlement_fields_for_protocol(position.get("settlement_protocol"))
+    if fields and all(position.get(field) is not None for field in fields):
         try:
             paper_settlement.validate_outcome_identity(
                 position.get("outcome"),

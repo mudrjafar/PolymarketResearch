@@ -19,6 +19,11 @@ from typing import Any
 import requests
 from eth_abi import decode, encode
 
+try:  # Support both `python scripts/...py` and package-based tests.
+    from .v3_identity import MODULE_NAMES as RUNTIME_MODULE_NAMES, V3IdentityError, decode_position_id
+except ImportError:  # pragma: no cover - used by direct script execution
+    from v3_identity import MODULE_NAMES as RUNTIME_MODULE_NAMES, V3IdentityError, decode_position_id
+
 
 POLYGON_CHAIN_ID = 137
 EXCHANGE_V3_ADDRESS = "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa"
@@ -41,7 +46,7 @@ POSITION_LAYOUT = {
     "condition_index": "bits 8-23",
     "outcome_index": "bits 0-7",
 }
-MODULE_NAMES = {1: "BINARY", 2: "NEG_RISK", 3: "COMBINATORIAL"}
+MODULE_NAMES = RUNTIME_MODULE_NAMES
 
 
 class ProbeError(RuntimeError):
@@ -62,37 +67,13 @@ class ProbeError(RuntimeError):
 
 
 def parse_position_id(value: int) -> dict[str, Any]:
-    """Decode the documented PositionId bit fields without guessing identity."""
-    if not isinstance(value, int) or value < 0 or value >= 1 << 256:
-        raise ValueError("position id is outside uint256")
-    module_id = (value >> 248) & 0xFF
-    result = {
-        "position_id": str(value),
-        "module_id": module_id,
-        "module": MODULE_NAMES.get(module_id, "UNKNOWN_MODULE"),
-        "base_hash": f"0x{((value >> 120) & ((1 << 128) - 1)):032x}",
-        "arity": (value >> 104) & 0xFFFF,
-        "reserved": f"0x{((value >> 40) & ((1 << 64) - 1)):016x}",
-        "resolution_chain": (value >> 24) & 0xFFFF,
-        "condition_index": (value >> 8) & 0xFFFF,
-        "outcome_index": value & 0xFF,
-    }
-    if module_id == 1:
-        valid = result["arity"] == 0 and result["condition_index"] == 0 and result["outcome_index"] in (0, 1)
-    elif module_id == 2:
-        valid = result["arity"] > 0 and result["condition_index"] <= result["arity"] and result["outcome_index"] in (0, 1)
-    elif module_id == 3:
-        # Combinatorial identity semantics are deliberately not inferred here.
-        valid = True
-    else:
-        valid = False
-    if not valid or module_id not in MODULE_NAMES:
-        result["classification"] = "FAIL_CLOSED"
-    elif module_id == 3:
-        result["classification"] = "RESEARCH_ONLY"
-    else:
-        result["classification"] = "RECOGNIZED"
-    return result
+    """Compatibility wrapper around the Runtime's single PositionId decoder."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("position id is invalid")
+    try:
+        return decode_position_id(str(value))
+    except V3IdentityError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _canonical_hash(value: Any, label: str) -> str:
@@ -446,7 +427,7 @@ def run_probe(
     unique_ids: dict[str, dict[str, Any]] = {}
     malformed_positions = 0
     for fill in unique_fills:
-        status = fill["module"] if fill["classification"] == "RECOGNIZED" else fill["classification"]
+        status = fill["module"] if fill["classification"] == "SUPPORTED" else fill["classification"]
         by_module[status] += 1
         if fill["classification"] == "FAIL_CLOSED":
             malformed_positions += 1

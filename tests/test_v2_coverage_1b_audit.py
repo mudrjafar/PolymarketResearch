@@ -38,7 +38,7 @@ def sample_event():
 
 
 class FakeRpc:
-    def __init__(self, *, receipt=None, block_hash=None, chain_id="0x89"):
+    def __init__(self, *, receipt=None, block_hash=None, chain_id="0x89", logs=None):
         self.receipt = receipt if receipt is not None else {
             "transactionHash": "0x" + "ab" * 32,
             "blockNumber": "0xe6",
@@ -48,6 +48,7 @@ class FakeRpc:
         }
         self.block_hash = block_hash if block_hash is not None else "0x" + "cd" * 32
         self.chain_id = chain_id
+        self.logs = logs or []
 
     def call(self, method, params):
         if method == "eth_chainId":
@@ -55,7 +56,11 @@ class FakeRpc:
         if method == "eth_getTransactionReceipt":
             return self.receipt
         if method == "eth_getBlockByNumber":
+            if params[0] == "finalized":
+                return {"number": "0xe6", "hash": self.block_hash}
             return {"number": "0xe6", "hash": self.block_hash}
+        if method == "eth_getLogs":
+            return self.logs
         raise AssertionError(method)
 
 
@@ -95,7 +100,7 @@ class FakeGamma:
     (3, "COMBO", 0, "YES"),
 ])
 def test_v2_position_id_decoder(module_id, module, outcome_index, outcome):
-    value = (module_id << 248) | (123 << 120) | outcome_index
+    value = (module_id << 248) | (123 << 120) | ((2 << 104) if module_id == 2 else 0) | outcome_index
     result = audit.decode_v2_position_id(str(value))
     assert result["status"] == "V2_POSITION_ID_DECODED"
     assert result["module_id"] == module_id
@@ -107,6 +112,76 @@ def test_v2_position_id_decoder(module_id, module, outcome_index, outcome):
 def test_v2_position_id_decoder_rejects_invalid_layout():
     assert audit.decode_v2_position_id("-1")["status"] == "INVALID_POSITION_ID_ENCODING"
     assert audit.decode_v2_position_id("0")["status"] == "UNRECOGNIZED_V2_POSITION_ID_LAYOUT"
+
+
+@pytest.mark.parametrize("position_id", [
+    str((1 << 248) | (1 << 24)),
+    str((2 << 248) | (1 << 104)),
+])
+def test_audit_uses_runtime_decoder_fail_closed_rules(position_id):
+    decoded = audit.decode_v2_position_id(position_id)
+    assert decoded["classification"] == "FAIL_CLOSED"
+    assert decoded["status"] == "UNRECOGNIZED_V2_POSITION_ID_LAYOUT"
+
+
+def test_active_candidate_discovery_requires_exact_gamma_and_clob_identity():
+    position_id = str((1 << 248) | (123 << 120))
+    other_id = str((1 << 248) | (123 << 120) | 1)
+    condition = f"0x{(int(position_id) >> 8):062x}"
+    combo_id = str((3 << 248) | (123 << 120))
+    bad_chain_id = str((1 << 248) | (123 << 120) | (1 << 24))
+    markets = [{
+        "id": "active-market",
+        "active": True,
+        "closed": False,
+        "conditionId": condition,
+        "positionIds": [position_id, other_id, combo_id, bad_chain_id],
+        "outcomes": ["YES", "NO", "YES", "YES"],
+    }, {
+        "id": "wrong-outcome",
+        "active": True,
+        "closed": False,
+        "conditionId": condition,
+        "positionIds": [position_id],
+        "outcomes": ["NO"],
+    }]
+    session = FakeGamma(
+        {"markets": markets, "next_cursor": None},
+        clob_book={"asset_id": position_id, "market": condition},
+    )
+    result = audit.discover_active_v3_candidates(FakeRpc(), session=session, lookback_blocks=1)
+    assert result["status"] == "NO_CANDIDATE_PROVEN_INCONCLUSIVE"
+    assert result["gamma_candidates"] == 2
+    assert [item["position_id"] for item in result["clob_verified_candidates"]] == [position_id]
+    assert result["event_matches"] == []
+
+
+def test_active_candidate_becomes_confirmed_only_after_receipt_and_block_match():
+    position_id = str((1 << 248) | (123 << 120))
+    condition = f"0x{(int(position_id) >> 8):062x}"
+    log = make_log()
+    log["data"] = "0x" + encode(
+        ["uint8", "uint256", "uint256", "uint256", "uint256", "bytes32", "bytes32"],
+        [0, int(position_id), 100, 200, 1, bytes.fromhex("22" * 32), bytes.fromhex("33" * 32)],
+    ).hex()
+    receipt = {
+        "transactionHash": log["transactionHash"],
+        "blockNumber": log["blockNumber"],
+        "blockHash": log["blockHash"],
+        "status": "0x1",
+        "logs": [log],
+    }
+    rpc = FakeRpc(logs=[log], receipt=receipt)
+    session = FakeGamma(
+        {"markets": [{
+            "id": "active-market", "active": True, "closed": False,
+            "conditionId": condition, "positionIds": [position_id], "outcomes": ["YES"],
+        }], "next_cursor": None},
+        clob_book={"asset_id": position_id, "market": condition},
+    )
+    result = audit.discover_active_v3_candidates(rpc, session=session, lookback_blocks=1)
+    assert result["status"] == "CONFIRMED_CANDIDATE_FOUND"
+    assert result["confirmed_candidates"][0]["receipt_status"] == "RECEIPT_AND_CANONICAL_BLOCK_MATCH"
 
 
 def test_combo_catalog_requires_exact_position_id_and_reports_market_metadata():

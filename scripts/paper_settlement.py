@@ -23,6 +23,14 @@ STANDARD_USDCE = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 NEGRISK_WRAPPED_COLLATERAL = "0x3a3bd7bb9528e159577f7c2e685cc81a765002e2"
 
 PROTOCOL_LEGACY_CTF = "LEGACY_CTF"
+PROTOCOL_V2_POSITION = "V2_POSITION"
+V2_COLLATERAL = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+V2_MODULE_CONTRACTS = {
+    1: "0x1000008dd9001b968442c1000017eae6e0da00ba",
+    2: "0x200000900045e3b6259600682756002200028933",
+}
+V2_FAMILIES = {1: "V2_BINARY", 2: "V2_NEGRISK"}
+V2_RESULT_DENOMINATOR = 1_000_000
 
 FAMILY_STANDARD = "CTF_STANDARD"
 FAMILY_NEGRISK = "CTF_NEGRISK"
@@ -65,6 +73,35 @@ def _condition_bytes(condition_id):
     if _BYTES32_RE.fullmatch(value) is None:
         raise SettlementIdentityError("CONDITION_ID_INVALID")
     return bytes.fromhex(value[2:])
+
+
+def _v2_condition_bytes(condition_id, expected):
+    value = str(condition_id or "").strip().lower()
+    if value != str(expected or "").strip().lower():
+        raise SettlementIdentityError("CONDITION_ID_POSITION_MISMATCH")
+    if _BYTES31_RE.fullmatch(value) is None:
+        raise SettlementIdentityError("V2_CONDITION_ID_INVALID")
+    return bytes.fromhex(value[2:])
+
+
+def _v2_identity(condition_id, token_id):
+    try:
+        from .v3_identity import V3IdentityError, decode_position_id
+    except ImportError:  # pragma: no cover - direct script execution
+        from v3_identity import V3IdentityError, decode_position_id
+    try:
+        identity = decode_position_id(token_id)
+    except (V3IdentityError, TypeError, ValueError):
+        raise SettlementIdentityError("POSITION_ID_INVALID") from None
+    if identity["module_id"] not in (1, 2):
+        raise SettlementIdentityError("V2_POSITION_MODULE_UNSUPPORTED")
+    if identity["classification"] != "SUPPORTED":
+        raise SettlementIdentityError("V2_POSITION_ID_UNSUPPORTED")
+    try:
+        condition = _v2_condition_bytes(condition_id, identity["condition_id"])
+    except SettlementIdentityError:
+        raise
+    return identity, condition
 
 
 def _address(value, label="ADDRESS_INVALID"):
@@ -358,6 +395,21 @@ def resolve_position_identity(
     rpc_url = str(rpc_url or os.getenv("POLYMARKET_RPC_URL", "")).strip()
     if validate_chain:
         _assert_polygon_chain(rpc_url, timeout=timeout)
+    raw_token = str(token_id or "").strip()
+    try:
+        leading_byte = int(raw_token, 10) >> 248
+    except (TypeError, ValueError):
+        leading_byte = None
+    if leading_byte in (1, 2, 3):
+        identity, _ = _v2_identity(condition_id, raw_token)
+        return {
+            "settlement_protocol": PROTOCOL_V2_POSITION,
+            "settlement_family": V2_FAMILIES[identity["module_id"]],
+            "settlement_contract": V2_MODULE_CONTRACTS[identity["module_id"]],
+            "position_collateral": V2_COLLATERAL,
+            "outcome_index": identity["outcome_index"],
+            "position_module_id": identity["module_id"],
+        }
     condition = _condition_bytes(condition_id)
     token = _token_int(token_id)
 
@@ -439,6 +491,32 @@ def _frozen_identity(position):
         raise SettlementIdentityError("POSITION_INVALID")
 
     protocol = str(position.get("settlement_protocol") or "").strip()
+    if protocol == PROTOCOL_V2_POSITION:
+        identity, _ = _v2_identity(position.get("condition_id"), position.get("token_id"))
+        module_id = identity["module_id"]
+        family = str(position.get("settlement_family") or "").strip()
+        if family != V2_FAMILIES[module_id]:
+            raise SettlementIdentityError("SETTLEMENT_FAMILY_INVALID")
+        contract = _address(position.get("settlement_contract"), "SETTLEMENT_ADDRESS_INVALID")
+        if contract != V2_MODULE_CONTRACTS[module_id]:
+            raise SettlementIdentityError("SETTLEMENT_ADDRESS_MISMATCH")
+        collateral = _address(position.get("position_collateral"), "POSITION_COLLATERAL_INVALID")
+        if collateral != V2_COLLATERAL:
+            raise SettlementIdentityError("POSITION_COLLATERAL_MISMATCH")
+        if position.get("position_module_id") != module_id:
+            raise SettlementIdentityError("POSITION_MODULE_MISMATCH")
+        outcome_index = position.get("outcome_index")
+        if outcome_index != identity["outcome_index"]:
+            raise SettlementIdentityError("OUTCOME_INDEX_POSITION_MISMATCH")
+        validate_outcome_identity(position.get("outcome"), outcome_index)
+        return {
+            "settlement_protocol": protocol,
+            "settlement_family": family,
+            "settlement_contract": contract,
+            "position_collateral": collateral,
+            "outcome_index": outcome_index,
+            "position_module_id": module_id,
+        }
     if protocol != PROTOCOL_LEGACY_CTF:
         raise SettlementIdentityError("SETTLEMENT_PROTOCOL_INVALID")
 
@@ -495,6 +573,54 @@ def check_settlement(
             timeout=timeout,
         )
         block_tag = hex(finalized.number)
+
+        if frozen["settlement_protocol"] == PROTOCOL_V2_POSITION:
+            _, condition31 = _v2_identity(position.get("condition_id"), position.get("token_id"))
+            module = frozen["settlement_contract"]
+            observed_module_id = int(_eth_call(
+                "moduleId()", [], [], ["uint256"], rpc_url=rpc_url,
+                block_tag=block_tag, contract=module, timeout=timeout,
+            )[0])
+            observed_collateral = str(_eth_call(
+                "COLLATERAL_TOKEN()", [], [], ["address"], rpc_url=rpc_url,
+                block_tag=block_tag, contract=module, timeout=timeout,
+            )[0]).lower()
+            if observed_module_id != frozen["position_module_id"]:
+                raise SettlementSourceError("V2_MODULE_CONTRACT_ID_MISMATCH")
+            if observed_collateral != frozen["position_collateral"]:
+                raise SettlementSourceError("V2_MODULE_COLLATERAL_MISMATCH")
+
+            def _v2_result(tag):
+                return tuple(int(value) for value in _eth_call(
+                    "getResult(bytes31)", ["bytes31"], [condition31], ["uint256[]"],
+                    rpc_url=rpc_url, block_tag=tag, contract=module, timeout=timeout,
+                )[0])
+
+            results = _v2_result(block_tag)
+            base = {
+                "settlement_read_block": finalized.number,
+                "settlement_read_block_hash": finalized.block_hash,
+                "settlement_authority": module,
+                "settlement_finality_source": finalized.source,
+            }
+            if not results:
+                try:
+                    if _v2_result("latest"):
+                        return {**base, "status": RESOLVED_NOT_FINAL, "reason_code": None}
+                except SettlementSourceError:
+                    return {**base, "status": UNRESOLVED, "reason_code": "LATEST_DIAGNOSTIC_UNAVAILABLE"}
+                return {**base, "status": UNRESOLVED, "reason_code": None}
+            if len(results) != 2 or any(value < 0 for value in results) or sum(results) != V2_RESULT_DENOMINATOR:
+                raise SettlementSourceError("V2_PAYOUT_STRUCTURE_INVALID")
+            if frozen["position_module_id"] == 2 and any(value not in (0, V2_RESULT_DENOMINATOR) for value in results):
+                raise SettlementSourceError("V2_NEGRISK_PAYOUT_STRUCTURE_INVALID")
+            return {
+                **base,
+                "status": FINAL_SETTLED,
+                "reason_code": None,
+                "payout_numerator": results[frozen["outcome_index"]],
+                "payout_denominator": V2_RESULT_DENOMINATOR,
+            }
 
         condition = _condition_bytes(position.get("condition_id"))
         denominator = _ctf_uint(
