@@ -244,7 +244,8 @@ def test_focus_engine_accepts_flow_evidence_as_is(pipeline):
         "ctf_token_id", "position_id", "exchange_address",
     )
     candidate = focus_candidate_result(
-        {"token_id": TOKEN_YES, **{field: entry.get(field) for field in identity_fields}},
+        {"token_id": TOKEN_YES, "condition_id": entry["condition_id"],
+         **{field: entry.get(field) for field in identity_fields}},
         {TOKEN_YES: entry},
         candidate,
     )
