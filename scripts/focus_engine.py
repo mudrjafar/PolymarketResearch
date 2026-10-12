@@ -9,6 +9,8 @@ step(state, candidates, now) -> (new_state, events)
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
+from scripts.protocol_identity import legacy_ctf_identity
+
 
 STATE_VERSION = 3
 
@@ -171,16 +173,9 @@ def execution_protocol_eligible(candidate):
     """Only frozen, matching Legacy CTF identity may occupy Execution Focus."""
     if not isinstance(candidate, dict):
         return False
-    token = candidate.get("token_id")
     return (
         candidate.get("execution_protocol_eligible") is True
-        and isinstance(token, str)
-        and bool(token.strip())
-        and candidate.get("asset_type") == "CTF_TOKEN"
-        and candidate.get("protocol_version") == "LEGACY_CTF"
-        and candidate.get("asset_id") == token
-        and candidate.get("ctf_token_id") == token
-        and candidate.get("position_id") is None
+        and legacy_ctf_identity(candidate)
     )
 
 
@@ -188,6 +183,7 @@ def _snapshot(candidate):
     return {
         "asset_type": candidate.get("asset_type"),
         "protocol_version": candidate.get("protocol_version"),
+        "exchange_address": candidate.get("exchange_address"),
         "asset_id": candidate.get("asset_id"),
         "ctf_token_id": candidate.get("ctf_token_id"),
         "position_id": candidate.get("position_id"),
@@ -851,6 +847,7 @@ def _candidate(
     return {
         "asset_type": "CTF_TOKEN",
         "protocol_version": "LEGACY_CTF",
+        "exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
         "asset_id": token,
         "ctf_token_id": token,
         "position_id": None,
