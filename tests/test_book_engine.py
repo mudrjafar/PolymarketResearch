@@ -1,3 +1,5 @@
+import pytest
+
 from scripts.book_engine import analyze_book
 
 
@@ -117,3 +119,41 @@ def test_price_move_is_measured_against_focus_price():
 
     assert result["best_ask_move_from_focus"] == 0.02
     assert result["best_ask_move_from_focus_bps"] == 400.0
+
+
+@pytest.mark.parametrize(("field", "value", "code"), [
+    ("asset_id", None, "BOOK_ASSET_ID_MISSING"),
+    ("asset_id", "", "BOOK_ASSET_ID_MISSING"),
+    ("market", None, "BOOK_MARKET_ID_MISSING"),
+    ("market", "  ", "BOOK_MARKET_ID_MISSING"),
+])
+def test_missing_clob_identity_cannot_produce_book_pass(field, value, code):
+    raw = book()
+    raw[field] = value
+    result = analyze_book(raw, focus())
+    assert result["book_ok"] is False
+    assert code in result["reason_codes"]
+
+
+@pytest.mark.parametrize(("field", "code"), [
+    ("asset_id", "BOOK_ASSET_ID_MISSING"),
+    ("market", "BOOK_MARKET_ID_MISSING"),
+])
+def test_absent_clob_identity_cannot_produce_book_pass(field, code):
+    raw = book()
+    raw.pop(field)
+    result = analyze_book(raw, focus())
+    assert result["book_ok"] is False
+    assert code in result["reason_codes"]
+
+
+@pytest.mark.parametrize(("field", "code"), [
+    ("token_id", "TOKEN_ID_MISSING"),
+    ("condition_id", "CONDITION_ID_MISSING"),
+])
+def test_missing_focus_identity_cannot_produce_book_pass(field, code):
+    f = focus()
+    f[field] = ""
+    result = analyze_book(book(), f)
+    assert result["book_ok"] is False
+    assert code in result["reason_codes"]
