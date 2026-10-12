@@ -32,6 +32,7 @@ def candidate(token_id, block, log_index, at, *, tx_byte="a", risk_ok=True, code
     return {
         "asset_type": "CTF_TOKEN",
         "protocol_version": "LEGACY_CTF",
+        "exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
         "asset_id": token_id,
         "ctf_token_id": token_id,
         "position_id": None,
