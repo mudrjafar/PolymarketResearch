@@ -10,6 +10,7 @@ submits a real order.
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -597,6 +598,12 @@ def _process_open(
     focus = focus_payload["focus"]
     token_id = str(focus["token_id"]).strip()
     condition_id = str(focus["condition_id"]).strip()
+
+    # Exchange V3 position conditions are bytes31. Paper settlement still
+    # supports ONLY legacy CTF bytes32 conditions; reject before RPC/CLOB.
+    # Do not reconstruct a V3 payout or reinterpret a position as a CTF token.
+    if re.fullmatch(r"0x[0-9a-fA-F]{62}", condition_id) is not None:
+        return _reject(request_id, now, "UNSUPPORTED_PROTOCOL_V2")
 
     for position in state["positions"]:
         if (
