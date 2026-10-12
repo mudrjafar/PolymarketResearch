@@ -250,3 +250,50 @@ def test_canonical_evidence_id_accepts_hex_case_but_preserves_cursor_coherence()
         now=NOW,
     )
     assert result["decision"] == "PASS"
+
+
+
+def test_risk_attaches_only_source_consistent_legacy_execution_protocol():
+    from scripts.risk_engine import focus_candidate_result
+
+    token = "yes-token"
+    identity = {
+        "asset_type": "CTF_TOKEN",
+        "protocol_version": "LEGACY_CTF",
+        "asset_id": token,
+        "ctf_token_id": token,
+        "position_id": None,
+        "exchange_address": "0x" + "e1" * 20,
+    }
+    row = make_row(**identity)
+    source_flow = make_flow(**identity)
+    source_flow["market"].update(identity)
+    base = assess(row, {token: source_flow}, now=NOW)
+    assert base["risk_ok"] is True
+    enriched = focus_candidate_result(row, {token: source_flow}, base)
+    assert enriched["risk_ok"] is True
+    assert enriched["execution_protocol_eligible"] is True
+    assert enriched["asset_type"] == "CTF_TOKEN"
+
+    for change in (
+        {"asset_type": "POSITION", "protocol_version": "V2",
+         "position_id": token, "ctf_token_id": None},
+        {"ctf_token_id": "different"},
+        {"asset_type": None},
+        {"protocol_version": None},
+        {"asset_id": 99},
+    ):
+        altered = make_row(**identity)
+        altered.update(change)
+        result = focus_candidate_result(altered, {token: source_flow}, base)
+        assert result["execution_protocol_eligible"] is False
+        assert result["risk_ok"] is True  # execution gate does not rewrite Risk scoring
+
+    changed_flow = make_flow(**identity)
+    changed_flow["market"].update(identity)
+    changed_flow["protocol_version"] = "V2"
+    assert focus_candidate_result(row, {token: changed_flow}, base)["execution_protocol_eligible"] is False
+    changed_flow = make_flow(**identity)
+    changed_flow["market"].update(identity)
+    changed_flow["market"]["asset_type"] = "POSITION"
+    assert focus_candidate_result(row, {token: changed_flow}, base)["execution_protocol_eligible"] is False
