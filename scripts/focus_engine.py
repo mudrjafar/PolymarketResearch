@@ -167,7 +167,7 @@ def label(focus):
     return f"WAIT {progress}/{REQUIRED_EVIDENCE}{suffix}"
 
 
-def _executable_legacy_identity(candidate):
+def execution_protocol_eligible(candidate):
     """Only frozen, matching Legacy CTF identity may occupy Execution Focus."""
     if not isinstance(candidate, dict):
         return False
@@ -258,7 +258,7 @@ def _eligible(candidate, state):
     if candidate.get("risk_ok") is not True:
         return False
 
-    if not _executable_legacy_identity(candidate):
+    if not execution_protocol_eligible(candidate):
         return False
 
     if not _text(candidate.get("evidence_id")):
@@ -461,7 +461,7 @@ def step(state, candidates, now=None):
     # Existing V3/ambiguous locks (including locks persisted by older code)
     # are released without consuming evidence or letting a challenger take
     # over this tick. Do not wait for timeout or two soft failures.
-    if isinstance(state.get("focus"), dict) and not _executable_legacy_identity(state["focus"]):
+    if isinstance(state.get("focus"), dict) and not execution_protocol_eligible(state["focus"]):
         _invalidate(
             state, state["focus"], ["EXECUTION_IDENTITY_UNVERIFIED"], now, events,
         )
@@ -588,7 +588,7 @@ def step(state, candidates, now=None):
 
     # A formerly verified token whose fresh provenance no longer matches
     # Legacy CTF is a hard safety break regardless of blockchain cursor.
-    if not _executable_legacy_identity(current):
+    if not execution_protocol_eligible(current):
         _invalidate(
             state, focus, ["EXECUTION_IDENTITY_UNVERIFIED"], now, events,
         )
@@ -849,6 +849,12 @@ def _candidate(
     codes=None,
 ):
     return {
+        "asset_type": "CTF_TOKEN",
+        "protocol_version": "LEGACY_CTF",
+        "asset_id": token,
+        "ctf_token_id": token,
+        "position_id": None,
+        "execution_protocol_eligible": True,
         "token_id": token,
         "condition_id": f"condition-{token}",
         "outcome": "Yes",
