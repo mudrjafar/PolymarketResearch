@@ -167,8 +167,31 @@ def label(focus):
     return f"WAIT {progress}/{REQUIRED_EVIDENCE}{suffix}"
 
 
+def _executable_legacy_identity(candidate):
+    """Only frozen, matching Legacy CTF identity may occupy Execution Focus."""
+    if not isinstance(candidate, dict):
+        return False
+    token = candidate.get("token_id")
+    return (
+        candidate.get("execution_protocol_eligible") is True
+        and isinstance(token, str)
+        and bool(token.strip())
+        and candidate.get("asset_type") == "CTF_TOKEN"
+        and candidate.get("protocol_version") == "LEGACY_CTF"
+        and candidate.get("asset_id") == token
+        and candidate.get("ctf_token_id") == token
+        and candidate.get("position_id") is None
+    )
+
+
 def _snapshot(candidate):
     return {
+        "asset_type": candidate.get("asset_type"),
+        "protocol_version": candidate.get("protocol_version"),
+        "asset_id": candidate.get("asset_id"),
+        "ctf_token_id": candidate.get("ctf_token_id"),
+        "position_id": candidate.get("position_id"),
+        "execution_protocol_eligible": candidate.get("execution_protocol_eligible") is True,
         "token_id": _text(candidate.get("token_id")),
         "condition_id": _text(candidate.get("condition_id")),
         "outcome": _text(candidate.get("outcome")),
@@ -233,6 +256,9 @@ def _eligible(candidate, state):
         return False
 
     if candidate.get("risk_ok") is not True:
+        return False
+
+    if not _executable_legacy_identity(candidate):
         return False
 
     if not _text(candidate.get("evidence_id")):
@@ -432,6 +458,15 @@ def step(state, candidates, now=None):
     state.setdefault("cooldowns", {})
     state.setdefault("last_invalidated", None)
 
+    # Existing V3/ambiguous locks (including locks persisted by older code)
+    # are released without consuming evidence or letting a challenger take
+    # over this tick. Do not wait for timeout or two soft failures.
+    if isinstance(state.get("focus"), dict) and not _executable_legacy_identity(state["focus"]):
+        _invalidate(
+            state, state["focus"], ["EXECUTION_IDENTITY_UNVERIFIED"], now, events,
+        )
+        return state, events
+
     candidates = [
         candidate
         for candidate in (candidates or [])
@@ -550,6 +585,14 @@ def step(state, candidates, now=None):
         return state, events
 
     focus["absent_since"] = None
+
+    # A formerly verified token whose fresh provenance no longer matches
+    # Legacy CTF is a hard safety break regardless of blockchain cursor.
+    if not _executable_legacy_identity(current):
+        _invalidate(
+            state, focus, ["EXECUTION_IDENTITY_UNVERIFIED"], now, events,
+        )
+        return state, events
 
     codes = set(
         current.get("reason_codes")
