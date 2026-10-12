@@ -98,23 +98,17 @@ def parse_position_id(value: int) -> dict[str, Any]:
 def _canonical_hash(value: Any, label: str) -> str:
     if not isinstance(value, str) or len(value) != 66 or not value.startswith("0x"):
         raise ValueError(f"invalid {label}")
-    try:
-        int(value[2:], 16)
-    except ValueError as exc:
-        raise ValueError(f"invalid {label}") from exc
+    if re.fullmatch(r"[0-9a-fA-F]{64}", value[2:]) is None:
+        raise ValueError(f"invalid {label}")
     return value.lower()
 
 
 def _hex_log_integer(value: Any, label: str) -> int:
     if not isinstance(value, str) or not value.startswith("0x") or len(value) <= 2:
         raise ValueError(f"invalid {label}")
-    try:
-        parsed = int(value[2:], 16)
-    except ValueError as exc:
-        raise ValueError(f"invalid {label}") from exc
-    if parsed < 0:
+    if re.fullmatch(r"[0-9a-fA-F]+", value[2:]) is None:
         raise ValueError(f"invalid {label}")
-    return parsed
+    return int(value[2:], 16)
 
 
 def _indexed_address(topic: Any, label: str) -> str:
