@@ -511,7 +511,6 @@ def test_rpc_quantity_leading_zero_rejected_by_decoder(field, bad):
 @pytest.mark.parametrize(("field", "bad"), [
     ("logIndex", "0x00"),
     ("logIndex", "0x01"),
-    ("blockNumber", "0x0e6"),
 ])
 def test_rpc_quantity_leading_zero_fails_entire_probe(field, bad):
     log = make_log(make_position(1), log_index=1)
@@ -537,3 +536,19 @@ def test_rpc_quantity_minimal_zero_and_one_are_valid():
     decoded = probe.decode_order_filled(log)
     assert decoded["log_index"] == 0
     assert decoded["block_number"] == 1
+
+
+
+def test_rpc_scan_rejects_noncanonical_block_quantity_before_reconciliation():
+    log = make_log(make_position(1), log_index=1)
+    log["blockNumber"] = "0x0e6"
+    # Scanning detects invalid block identity before the reconciliation report
+    # can be constructed. A raised ProbeError is the fail-closed result.
+    with pytest.raises(probe.ProbeError, match="invalid block number"):
+        probe.run_probe(
+            "http://rpc.invalid",
+            lookback_blocks=20,
+            chunk_size=20,
+            gamma_sample=0,
+            session=FakeSession([log]),
+        )
