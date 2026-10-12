@@ -106,7 +106,7 @@ def _canonical_hash(value: Any, label: str) -> str:
 def _hex_log_integer(value: Any, label: str) -> int:
     if not isinstance(value, str) or not value.startswith("0x") or len(value) <= 2:
         raise ValueError(f"invalid {label}")
-    if re.fullmatch(r"[0-9a-fA-F]+", value[2:]) is None:
+    if re.fullmatch(r"0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)", value) is None:
         raise ValueError(f"invalid {label}")
     return int(value[2:], 16)
 
