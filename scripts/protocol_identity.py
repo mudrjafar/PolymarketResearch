@@ -13,6 +13,9 @@ LEGACY_CTF_EXCHANGES = frozenset({
     "0xe2222d279d744050d28e00520010520000310f59",
 })
 _ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}\Z")
+_CTF_TOKEN = re.compile(r"(?:[1-9][0-9]*)\Z")
+_CTF_CONDITION = re.compile(r"0x[0-9a-fA-F]{64}\Z")
+_MAX_CTF_TOKEN = 1 << 256
 
 
 def legacy_ctf_identity(row):
@@ -23,9 +26,10 @@ def legacy_ctf_identity(row):
     address = row.get("exchange_address")
     return (
         isinstance(token, str)
-        and bool(token.strip())
+        and _CTF_TOKEN.fullmatch(token) is not None
+        and 0 < int(token) < _MAX_CTF_TOKEN
         and isinstance(condition, str)
-        and bool(condition.strip())
+        and _CTF_CONDITION.fullmatch(condition) is not None
         and row.get("asset_type") == "CTF_TOKEN"
         and row.get("protocol_version") == "LEGACY_CTF"
         and row.get("asset_id") == token
