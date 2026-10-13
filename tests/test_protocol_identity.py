@@ -48,3 +48,35 @@ def test_non_executable_or_unknown_identity_is_blocked(field, value):
     source = _legacy()
     source[field] = value
     assert legacy_ctf_identity(source) is False
+
+
+
+@pytest.mark.parametrize(("field", "invalid"), [
+    ("token_id", "not-a-real-CTF-token"),
+    ("token_id", "0"), ("token_id", "00"), ("token_id", "01"),
+    ("token_id", "-1"), ("token_id", "+1"), ("token_id", "1 "),
+    ("token_id", " 1"), ("token_id", "0x1"),
+    ("token_id", str(1 << 256)), ("token_id", 1), ("token_id", True),
+    ("condition_id", "not-a-32-byte-hash"),
+    ("condition_id", "0x" + "aa" * 31),
+    ("condition_id", "0x" + "aa" * 33),
+    ("condition_id", "0X" + "aa" * 32),
+    ("condition_id", "0x" + "zz" * 32),
+    ("condition_id", 42),
+])
+def test_noncanonical_legacy_token_or_condition_fails_closed(field, invalid):
+    row = _legacy()
+    row[field] = invalid
+    if field == "token_id":
+        row["asset_id"] = invalid
+        row["ctf_token_id"] = invalid
+    assert legacy_ctf_identity(row) is False
+
+
+def test_valid_uint256_boundary_and_mixedcase_condition_are_supported():
+    row = _legacy()
+    row["token_id"] = str((1 << 256) - 1)
+    row["asset_id"] = row["token_id"]
+    row["ctf_token_id"] = row["token_id"]
+    row["condition_id"] = "0x" + "aB" * 32
+    assert legacy_ctf_identity(row) is True
