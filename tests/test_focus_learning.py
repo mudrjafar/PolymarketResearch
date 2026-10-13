@@ -31,9 +31,9 @@ def versions(sha="a"):
 def focus_candidate(token, block, log_index, at, *, tx="a", price=0.42):
     return {
         "checked_at": at.isoformat(),
-        "market_key": f"condition:condition-{token}|outcome:yes",
+        "market_key": "condition:0xabababababababababababababababababababababababababababababababab|outcome:yes",
         "question": f"Market {token}",
-        "condition_id": f"condition-{token}",
+        "condition_id": ("0x" + ("ab" if token == "101" else "cd") * 32),
         "token_id": token,
         "asset_type": "CTF_TOKEN",
         "protocol_version": "LEGACY_CTF",
@@ -96,8 +96,8 @@ def signal_row(generation, observed_at, price):
     return {
         "observed_at": observed_at.isoformat(),
         "source_generation_id": generation,
-        "condition_id": "condition-A",
-        "token_id": "A",
+        "condition_id": "0xabababababababababababababababababababababababababababababababab",
+        "token_id": "101",
         "outcome": "Yes",
         "direction": "BUY",
         "classification": "DIAMOND",
@@ -131,7 +131,7 @@ def test_focus_runner_projects_locked_evidence_without_changing_authority(
 
     monkeypatch.setattr(focus_runner, "enqueue_focus_event", capture)
 
-    candidate = focus_candidate("A", 100, 1, T0)
+    candidate = focus_candidate("101", 100, 1, T0)
     save_json_atomic(
         paths["risk"],
         risk_snapshot("GEN-LOCK", [candidate], T0),
@@ -169,7 +169,7 @@ def test_learning_failure_cannot_block_focus(monkeypatch, tmp_path, capsys):
         paths["risk"],
         risk_snapshot(
             "GEN-LOCK",
-            [focus_candidate("A", 100, 1, T0)],
+            [focus_candidate("101", 100, 1, T0)],
             T0,
         ),
     )
@@ -206,8 +206,8 @@ def test_lock_lineage_uses_earliest_candidate_since_last_invalidation(tmp_path):
             "source_evidence_id": EVIDENCE_A,
             "source_evidence_cursor": [100, 1],
             "source_evidence_at": T0.isoformat(),
-            "condition_id": "condition-A",
-            "token_id": "A",
+            "condition_id": "0xabababababababababababababababababababababababababababababababab",
+            "token_id": "101",
             "outcome": "Yes",
             "direction": "BUY",
             "price": 0.42,
@@ -255,8 +255,8 @@ def test_ready_lineage_preserves_exact_evidence_and_flags_mixed_version(tmp_path
             "source_evidence_id": EVIDENCE_A,
             "source_evidence_cursor": [100, 1],
             "source_evidence_at": T0.isoformat(),
-            "condition_id": "condition-A",
-            "token_id": "A",
+            "condition_id": "0xabababababababababababababababababababababababababababababababab",
+            "token_id": "101",
             "outcome": "Yes",
             "direction": "BUY",
             "price": 0.42,
@@ -278,8 +278,8 @@ def test_ready_lineage_preserves_exact_evidence_and_flags_mixed_version(tmp_path
             "source_evidence_id": EVIDENCE_B,
             "source_evidence_cursor": [103, 2],
             "source_evidence_at": ready_at.isoformat(),
-            "condition_id": "condition-A",
-            "token_id": "A",
+            "condition_id": "0xabababababababababababababababababababababababababababababababab",
+            "token_id": "101",
             "outcome": "Yes",
             "direction": "BUY",
             "price": 0.50,
@@ -291,8 +291,8 @@ def test_ready_lineage_preserves_exact_evidence_and_flags_mixed_version(tmp_path
             "price_at_ready": 0.50,
             "challenger_present": True,
             "challenger": {
-                "token_id": "B",
-                "condition_id": "condition-B",
+                "token_id": "102",
+                "condition_id": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
                 "outcome": "Yes",
                 "direction": "BUY",
                 "price": 0.44,
@@ -314,7 +314,7 @@ def test_ready_lineage_preserves_exact_evidence_and_flags_mixed_version(tmp_path
         assert payload["source_evidence_cursor"] == [103, 2]
         assert payload["source_evidence_at"] == ready_at.isoformat()
         assert payload["challenger_present"] is True
-        assert payload["challenger"]["token_id"] == "B"
+        assert payload["challenger"]["token_id"] == "102"
         assert payload["focus_episode_mixed_version"] is True
 
 
@@ -337,8 +337,8 @@ def test_invalidation_keeps_episode_and_first_ready_lineage(tmp_path):
             "source_evidence_id": EVIDENCE_A,
             "source_evidence_cursor": [100, 1],
             "source_evidence_at": T0.isoformat(),
-            "condition_id": "condition-A",
-            "token_id": "A",
+            "condition_id": "0xabababababababababababababababababababababababababababababababab",
+            "token_id": "101",
             "outcome": "Yes",
             "direction": "BUY",
             "price": 0.42,
@@ -412,10 +412,10 @@ def test_learning_worker_ingests_risk_before_focus_lock(tmp_path):
         "source_updated_at": T0.isoformat(),
         "last_trade_at": T0.isoformat(),
         "schema_version": 4,
-        "market_key": "condition:condition-A|outcome:yes",
+        "market_key": "condition:0xabababababababababababababababababababababababababababababababab|outcome:yes",
         "question": "Market A",
-        "condition_id": "condition-A",
-        "token_id": "A",
+        "condition_id": "0xabababababababababababababababababababababababababababababababab",
+        "token_id": "101",
         "outcome": "Yes",
         "direction": "BUY",
         "price": 0.42,
@@ -456,9 +456,9 @@ def test_learning_worker_ingests_risk_before_focus_lock(tmp_path):
     (generation_dir / "flow_state.json").write_text(
         json.dumps(
             {
-                "A": {
-                    "token_id": "A",
-                    "condition_id": "condition-A",
+                "101": {
+                    "token_id": "101",
+                    "condition_id": "0xabababababababababababababababababababababababababababababababab",
                     "outcome": "Yes",
                     "evidence_id": EVIDENCE_A,
                     "evidence_cursor": [100, 1],
@@ -469,7 +469,7 @@ def test_learning_worker_ingests_risk_before_focus_lock(tmp_path):
         encoding="utf-8",
     )
 
-    risk_row = focus_candidate("A", 100, 1, T0)
+    risk_row = focus_candidate("101", 100, 1, T0)
     enqueue_risk_snapshot(
         {
             "source_generation_id": generation,
@@ -491,8 +491,8 @@ def test_learning_worker_ingests_risk_before_focus_lock(tmp_path):
             "source_evidence_id": EVIDENCE_A,
             "source_evidence_cursor": [100, 1],
             "source_evidence_at": T0.isoformat(),
-            "condition_id": "condition-A",
-            "token_id": "A",
+            "condition_id": "0xabababababababababababababababababababababababababababababababab",
+            "token_id": "101",
             "outcome": "Yes",
             "direction": "BUY",
             "price": 0.42,
@@ -533,7 +533,7 @@ def test_challenger_is_projected_on_wait_transition(monkeypatch, tmp_path):
         paths["risk"],
         risk_snapshot(
             "GEN-1",
-            [focus_candidate("A", 100, 1, T0)],
+            [focus_candidate("101", 100, 1, T0)],
             T0,
         ),
     )
@@ -545,8 +545,8 @@ def test_challenger_is_projected_on_wait_transition(monkeypatch, tmp_path):
         risk_snapshot(
             "GEN-2",
             [
-                focus_candidate("A", 101, 1, later, tx="b", price=0.45),
-                focus_candidate("B", 200, 1, later, tx="c", price=0.44),
+                focus_candidate("101", 101, 1, later, tx="b", price=0.45),
+                focus_candidate("102", 200, 1, later, tx="c", price=0.44),
             ],
             later,
         ),
@@ -555,10 +555,10 @@ def test_challenger_is_projected_on_wait_transition(monkeypatch, tmp_path):
 
     assert status == "OK"
     assert state["focus"]["status"] == "WAIT"
-    assert state["challenger"]["token_id"] == "B"
+    assert state["challenger"]["token_id"] == "102"
     assert events[-1]["type"] == "WAIT"
 
     wait = captured[-1]
     assert wait["event_type"] == "WAIT"
     assert wait["challenger_present"] is True
-    assert wait["challenger"]["token_id"] == "B"
+    assert wait["challenger"]["token_id"] == "102"
