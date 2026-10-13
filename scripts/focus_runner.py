@@ -385,7 +385,7 @@ def _self_test_candidate(token_id, tx_byte):
         "position_id": None,
         "execution_protocol_eligible": True,
         "token_id": token_id,
-        "condition_id": f"condition-{token_id}",
+        "condition_id": "0x" + "ab" * 32,
         "outcome": "Yes",
         "question": f"Market {token_id}",
         "direction": "BUY",
@@ -420,8 +420,8 @@ def self_test():
                     "source_generated_at": now.isoformat(),
                     "generated_at": now.isoformat(),
                     "results": [
-                        _self_test_candidate("B", "b"),
-                        _self_test_candidate("A", "a"),
+                        _self_test_candidate("102", "b"),
+                        _self_test_candidate("101", "a"),
                     ],
                 },
             )
@@ -429,7 +429,7 @@ def self_test():
             state, events, status = run_once(now=now)
 
             assert status == "OK"
-            assert state["focus"]["token_id"] == "B"
+            assert state["focus"]["token_id"] == "102"
             assert "score" not in state["focus"]
             assert events[-1]["type"] == "LOCKED"
             assert STATE_FILE.exists()
