@@ -36,11 +36,12 @@ BASE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE))
 
 from scripts import flow_tracker as flow
+from scripts.risk_engine import focus_candidate_result
 from scripts.focus_engine import label, new_state, step
 
 
-TOKEN_YES = "yes-token"
-TOKEN_NO = "no-token"
+TOKEN_YES = "111"
+TOKEN_NO = "112"
 
 EVIDENCE_FIELDS = ("evidence_id", "evidence_cursor", "evidence_at")
 
@@ -124,8 +125,14 @@ class Pipeline:
         uid = n + (500 if token == TOKEN_NO else 0)
         return {
             "collector_version": 4,
-            "condition_id": "same-condition",
+            "condition_id": "0xabababababababababababababababababababababababababababababababab",
             "token_id": token,
+            "asset_type": "CTF_TOKEN",
+            "protocol_version": "LEGACY_CTF",
+            "asset_id": token,
+            "ctf_token_id": token,
+            "position_id": None,
+            "exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
             "outcome": "Yes" if token == TOKEN_YES else "No",
             "question": "EVIDENCE INTERFACE TEST",
             "side_label": side,
@@ -197,7 +204,7 @@ def test_flow_state_contract_keys_and_types_are_frozen(pipeline):
     assert CONTRACT_KEYS <= set(entry)
     assert entry["schema_version"] == flow.FLOW_SCHEMA_VERSION == 4
     assert entry["token_id"] == TOKEN_YES
-    assert entry["condition_id"] == "same-condition"
+    assert entry["condition_id"] == "0xabababababababababababababababababababababababababababababababab"
     assert entry["outcome"] == "Yes"
 
     assert isinstance(entry["evidence_id"], str)
@@ -231,6 +238,18 @@ def test_focus_engine_accepts_flow_evidence_as_is(pipeline):
         "evidence_at": entry["evidence_at"],
     }
 
+    # Focus requires the Risk-bound protocol proof, not just Flow timestamps.
+    identity_fields = (
+        "asset_type", "protocol_version", "asset_id",
+        "ctf_token_id", "position_id", "exchange_address",
+    )
+    candidate = focus_candidate_result(
+        {"token_id": TOKEN_YES, "condition_id": entry["condition_id"],
+         **{field: entry.get(field) for field in identity_fields}},
+        {TOKEN_YES: entry},
+        candidate,
+    )
+    assert candidate["execution_protocol_eligible"] is True
     state, events = step(new_state(), [candidate], datetime.now(timezone.utc))
     focus = state["focus"]
 

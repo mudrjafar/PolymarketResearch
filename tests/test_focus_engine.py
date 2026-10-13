@@ -35,8 +35,15 @@ def candidate(
     codes=None,
 ):
     return {
+        "asset_type": "CTF_TOKEN",
+        "protocol_version": "LEGACY_CTF",
+        "exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
+        "asset_id": token,
+        "ctf_token_id": token,
+        "position_id": None,
+        "execution_protocol_eligible": True,
         "token_id": token,
-        "condition_id": f"condition-{token}",
+        "condition_id": "0x" + "ab" * 32,
         "outcome": "Yes",
         "question": f"Market {token}",
         "direction": "BUY",
@@ -53,11 +60,11 @@ def candidate(
 def lock_a():
     state, events = step(
         new_state(),
-        [candidate("A", 100, 1, T0)],
+        [candidate("101", 100, 1, T0)],
         T0,
     )
 
-    assert state["focus"]["token_id"] == "A"
+    assert state["focus"]["token_id"] == "101"
     assert events[-1]["type"] == "LOCKED"
 
     return state
@@ -75,7 +82,7 @@ def make_ready():
             state,
             [
                 candidate(
-                    "A",
+                    "101",
                     block,
                     1,
                     T0 + timedelta(seconds=seconds),
@@ -92,16 +99,16 @@ def test_lock_preserves_upstream_candidate_order_without_reranking():
     state, _ = step(
         new_state(),
         [
-            candidate("B", 100, 1, T0, score=10),
-            candidate("A", 100, 2, T0, score=99),
-            candidate("C", 100, 3, T0, score=80),
+            candidate("102", 100, 1, T0, score=10),
+            candidate("101", 100, 2, T0, score=99),
+            candidate("103", 100, 3, T0, score=80),
         ],
         T0,
     )
 
     # Risk preserves authoritative Diamond order. Focus must not synthesize
     # or re-rank on a numeric score.
-    assert state["focus"]["token_id"] == "B"
+    assert state["focus"]["token_id"] == "102"
     assert "score" not in state["focus"]
     assert "score_at_lock" not in state["focus"]
     assert label(state["focus"]) == "LOCKED"
@@ -112,7 +119,7 @@ def test_duplicate_and_older_evidence_do_not_progress():
 
     state, events = step(
         state,
-        [candidate("A", 100, 1, T0)],
+        [candidate("101", 100, 1, T0)],
         T0 + timedelta(seconds=60),
     )
 
@@ -123,7 +130,7 @@ def test_duplicate_and_older_evidence_do_not_progress():
         state,
         [
             candidate(
-                "A",
+                "101",
                 99,
                 99,
                 T0 - timedelta(seconds=10),
@@ -144,7 +151,7 @@ def test_confirmation_spacing_prevents_fast_ready():
         state,
         [
             candidate(
-                "A",
+                "101",
                 101,
                 1,
                 T0 + timedelta(seconds=20),
@@ -160,7 +167,7 @@ def test_confirmation_spacing_prevents_fast_ready():
         state,
         [
             candidate(
-                "A",
+                "101",
                 102,
                 1,
                 T0 + timedelta(seconds=40),
@@ -176,7 +183,7 @@ def test_confirmation_spacing_prevents_fast_ready():
         state,
         [
             candidate(
-                "A",
+                "101",
                 103,
                 1,
                 T0 + timedelta(seconds=60),
@@ -202,14 +209,14 @@ def test_stronger_challenger_cannot_steal_focus():
         state,
         [
             candidate(
-                "A",
+                "101",
                 103,
                 1,
                 T0 + timedelta(seconds=180),
                 score=90,
             ),
             candidate(
-                "B",
+                "102",
                 200,
                 1,
                 T0 + timedelta(seconds=180),
@@ -219,8 +226,8 @@ def test_stronger_challenger_cannot_steal_focus():
         T0 + timedelta(seconds=190),
     )
 
-    assert state["focus"]["token_id"] == "A"
-    assert state["challenger"]["token_id"] == "B"
+    assert state["focus"]["token_id"] == "101"
+    assert state["challenger"]["token_id"] == "102"
     assert events == []
 
 
@@ -232,7 +239,7 @@ def test_stale_flow_trade_is_neutral_and_does_not_consume_evidence():
         state,
         [
             candidate(
-                "A",
+                "101",
                 104,
                 1,
                 T0 + timedelta(seconds=240),
@@ -260,7 +267,7 @@ def test_stale_data_is_neutral_and_does_not_consume_evidence():
         state,
         [
             candidate(
-                "A",
+                "101",
                 104,
                 1,
                 T0 + timedelta(seconds=240),
@@ -283,7 +290,7 @@ def test_stale_data_is_neutral_and_does_not_consume_evidence():
         state,
         [
             candidate(
-                "A",
+                "101",
                 104,
                 1,
                 T0 + timedelta(seconds=240),
@@ -302,7 +309,7 @@ def test_mixed_stale_and_divergence_is_neutral():
         state,
         [
             candidate(
-                "A",
+                "101",
                 104,
                 1,
                 T0 + timedelta(seconds=240),
@@ -329,7 +336,7 @@ def test_hard_block_invalidates_without_new_evidence():
         state,
         [
             candidate(
-                "A",
+                "101",
                 103,
                 1,
                 T0 + timedelta(seconds=180),
@@ -352,7 +359,7 @@ def test_two_consecutive_soft_fails_invalidate():
         state,
         [
             candidate(
-                "A",
+                "101",
                 104,
                 1,
                 T0 + timedelta(seconds=240),
@@ -370,7 +377,7 @@ def test_two_consecutive_soft_fails_invalidate():
         state,
         [
             candidate(
-                "A",
+                "101",
                 105,
                 1,
                 T0 + timedelta(seconds=300),
@@ -392,7 +399,7 @@ def test_pass_between_soft_fails_resets_fail_streak():
         state,
         [
             candidate(
-                "A",
+                "101",
                 104,
                 1,
                 T0 + timedelta(seconds=240),
@@ -409,7 +416,7 @@ def test_pass_between_soft_fails_resets_fail_streak():
         state,
         [
             candidate(
-                "A",
+                "101",
                 105,
                 1,
                 T0 + timedelta(seconds=300),
@@ -429,7 +436,7 @@ def test_stale_pipeline_pauses_silence_timeout():
         state,
         [
             candidate(
-                "A",
+                "101",
                 100,
                 1,
                 T0,
@@ -454,7 +461,7 @@ def test_fresh_pipeline_without_new_evidence_times_out():
     # Fresh row, same evidence.
     state, _ = step(
         state,
-        [candidate("A", 100, 1, T0)],
+        [candidate("101", 100, 1, T0)],
         T0 + timedelta(
             seconds=MAX_FRESH_SILENCE_SECONDS
         ),
@@ -519,7 +526,7 @@ def test_challenger_only_takes_over_on_next_tick():
         state,
         [
             candidate(
-                "A",
+                "101",
                 104,
                 1,
                 T0 + timedelta(seconds=240),
@@ -527,7 +534,7 @@ def test_challenger_only_takes_over_on_next_tick():
                 codes=["MARKET_EXPIRED"],
             ),
             candidate(
-                "B",
+                "102",
                 200,
                 1,
                 T0 + timedelta(seconds=240),
@@ -545,7 +552,7 @@ def test_challenger_only_takes_over_on_next_tick():
         state,
         [
             candidate(
-                "B",
+                "102",
                 200,
                 1,
                 T0 + timedelta(seconds=240),
@@ -555,7 +562,7 @@ def test_challenger_only_takes_over_on_next_tick():
         T0 + timedelta(seconds=255),
     )
 
-    assert state["focus"]["token_id"] == "B"
+    assert state["focus"]["token_id"] == "102"
     assert events[-1]["type"] == "LOCKED"
 
 
@@ -566,7 +573,7 @@ def test_invalidated_market_cannot_relock_during_cooldown():
         state,
         [
             candidate(
-                "A",
+                "101",
                 103,
                 1,
                 T0 + timedelta(seconds=180),
@@ -578,13 +585,13 @@ def test_invalidated_market_cannot_relock_during_cooldown():
     )
 
     assert state["focus"] is None
-    assert "A" in state["cooldowns"]
+    assert "101" in state["cooldowns"]
 
     state, _ = step(
         state,
         [
             candidate(
-                "A",
+                "101",
                 200,
                 1,
                 T0 + timedelta(seconds=300),
@@ -600,7 +607,7 @@ def test_invalidated_market_cannot_relock_during_cooldown():
         state,
         [
             candidate(
-                "A",
+                "101",
                 300,
                 1,
                 T0
@@ -617,7 +624,7 @@ def test_invalidated_market_cannot_relock_during_cooldown():
         ),
     )
 
-    assert state["focus"]["token_id"] == "A"
+    assert state["focus"]["token_id"] == "101"
     assert events[-1]["type"] == "LOCKED"
 
 
@@ -626,7 +633,7 @@ def test_old_state_version_resets_fail_closed():
         {
             "version": 1,
             "focus": {
-                "token_id": "OLD",
+                "token_id": "104",
                 "status": "READY",
             },
         },
@@ -643,3 +650,71 @@ def test_old_state_version_resets_fail_closed():
         "old_version": 1,
         "new_version": STATE_VERSION,
     }]
+
+
+def test_v3_only_cannot_lock_exclusive_execution_focus():
+    v3 = candidate("107", 101, 1, T0)
+    v3.update(
+        asset_type="POSITION",
+        protocol_version="V2",
+        asset_id="107",
+        ctf_token_id=None,
+        position_id="107",
+        execution_protocol_eligible=False,
+    )
+    state, events = step(new_state(), [v3], T0)
+    assert state["focus"] is None
+    assert events == []
+
+
+def test_upstream_v3_rank_does_not_preempt_executable_legacy():
+    v3 = candidate("107", 101, 1, T0)
+    v3.update(asset_type="POSITION", protocol_version="V2",
+              ctf_token_id=None, position_id="107",
+              execution_protocol_eligible=False)
+    legacy = candidate("105", 100, 1, T0)
+    state, events = step(new_state(), [v3, legacy], T0)
+    assert state["focus"]["token_id"] == "105"
+    assert events[-1]["type"] == "LOCKED"
+
+
+def test_previously_persisted_v3_focus_invalidates_without_challenger_takeover():
+    state = new_state()
+    state, _ = step(state, [candidate("106", 100, 1, T0)], T0)
+    state["focus"].update(asset_type="POSITION", protocol_version="V2",
+                          ctf_token_id=None, position_id="106",
+                          execution_protocol_eligible=False)
+    future = T0 + timedelta(seconds=60)
+    state, events = step(state, [candidate("105", 101, 1, future)], future)
+    assert state["focus"] is None
+    assert [e["type"] for e in events] == ["INVALIDATED"]
+    assert state["last_invalidated"]["invalidation_reasons"] == ["EXECUTION_IDENTITY_UNVERIFIED"]
+    state, events = step(state, [candidate("105", 101, 1, future)], future)
+    assert state["focus"]["token_id"] == "105"
+    assert events[-1]["type"] == "LOCKED"
+
+
+def test_missing_protocol_and_inconsistent_ctf_token_fail_closed():
+    for changes in (
+        {"asset_type": None},
+        {"protocol_version": None},
+        {"execution_protocol_eligible": None},
+        {"ctf_token_id": "other"},
+        {"asset_id": 7},
+        {"position_id": "unexpected-position"},
+    ):
+        row = candidate("105", 100, 1, T0)
+        row.update(changes)
+        state, events = step(new_state(), [row], T0)
+        assert state["focus"] is None
+        assert events == []
+
+
+def test_active_legacy_invalidates_when_fresh_protocol_identity_changes():
+    state, _ = step(new_state(), [candidate("105", 100, 1, T0)], T0)
+    future = T0 + timedelta(seconds=60)
+    changed = candidate("105", 101, 1, future)
+    changed["execution_protocol_eligible"] = False
+    state, events = step(state, [changed], future)
+    assert state["focus"] is None
+    assert events[-1]["type"] == "INVALIDATED"

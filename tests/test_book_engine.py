@@ -1,3 +1,5 @@
+import pytest
+
 from scripts.book_engine import analyze_book
 
 
@@ -117,3 +119,82 @@ def test_price_move_is_measured_against_focus_price():
 
     assert result["best_ask_move_from_focus"] == 0.02
     assert result["best_ask_move_from_focus_bps"] == 400.0
+
+
+@pytest.mark.parametrize(("field", "value", "code"), [
+    ("asset_id", None, "BOOK_ASSET_ID_MISSING"),
+    ("asset_id", "", "BOOK_ASSET_ID_MISSING"),
+    ("market", None, "BOOK_MARKET_ID_MISSING"),
+    ("market", "  ", "BOOK_MARKET_ID_MISSING"),
+])
+def test_missing_clob_identity_cannot_produce_book_pass(field, value, code):
+    raw = book()
+    raw[field] = value
+    result = analyze_book(raw, focus())
+    assert result["book_ok"] is False
+    assert code in result["reason_codes"]
+
+
+@pytest.mark.parametrize(("field", "code"), [
+    ("asset_id", "BOOK_ASSET_ID_MISSING"),
+    ("market", "BOOK_MARKET_ID_MISSING"),
+])
+def test_absent_clob_identity_cannot_produce_book_pass(field, code):
+    raw = book()
+    raw.pop(field)
+    result = analyze_book(raw, focus())
+    assert result["book_ok"] is False
+    assert code in result["reason_codes"]
+
+
+@pytest.mark.parametrize(("field", "code"), [
+    ("token_id", "TOKEN_ID_MISSING"),
+    ("condition_id", "CONDITION_ID_MISSING"),
+])
+def test_missing_focus_identity_cannot_produce_book_pass(field, code):
+    f = focus()
+    f[field] = ""
+    result = analyze_book(book(), f)
+    assert result["book_ok"] is False
+    assert code in result["reason_codes"]
+
+
+
+@pytest.mark.parametrize(("field", "value", "reason"), [
+    ("asset_id", 123, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", 0, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", True, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", [], "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", {"id": "token-a"}, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("market", 123, "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", False, "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", [], "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", {"id": "condition-a"}, "BOOK_MARKET_ID_INVALID_TYPE"),
+])
+def test_non_string_clob_identity_is_never_coerced(field, value, reason):
+    raw = book()
+    raw[field] = value
+    result = analyze_book(raw, focus())
+    assert result["book_ok"] is False
+    assert reason in result["reason_codes"]
+
+
+@pytest.mark.parametrize(("field", "focus_field"), [
+    ("asset_id", "token_id"),
+    ("market", "condition_id"),
+])
+def test_matching_numeric_ids_on_both_sides_do_not_pass(field, focus_field):
+    raw = book()
+    f = focus()
+    raw[field] = 12345
+    f[focus_field] = 12345
+    result = analyze_book(raw, f)
+    assert result["book_ok"] is False
+
+
+def test_legacy_ctf_string_ids_still_match():
+    f = focus()
+    f["token_id"] = "123456789012345678901234567890"
+    f["condition_id"] = "0x" + "ab" * 32
+    raw = book(asset_id=f["token_id"], market=f["condition_id"].upper().replace("0X", "0x"))
+    assert analyze_book(raw, f)["book_ok"] is True

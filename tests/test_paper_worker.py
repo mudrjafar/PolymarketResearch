@@ -43,8 +43,15 @@ def write_gate(
 ):
     evidence = evidence or ("0x" + "ab" * 32 + ":7")
     focus = {
-        "token_id": "token-a",
-        "condition_id": "condition-a",
+        "asset_type": "CTF_TOKEN",
+        "protocol_version": "LEGACY_CTF",
+        "exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
+        "asset_id": "101",
+        "ctf_token_id": "101",
+        "position_id": None,
+        "execution_protocol_eligible": True,
+        "token_id": "101",
+        "condition_id": "0xabababababababababababababababababababababababababababababababab",
         "outcome": outcome,
         "question": "Market A",
         "direction": "BUY",
@@ -75,8 +82,8 @@ def write_gate(
             "reason_codes": [],
             "source_generation_id": generation,
             "source_evidence_id": evidence,
-            "token_id": "token-a",
-            "condition_id": "condition-a",
+            "token_id": "101",
+            "condition_id": "0xabababababababababababababababababababababababababababababababab",
         },
     )
     return focus
@@ -84,8 +91,8 @@ def write_gate(
 
 def raw_book(*, bid="0.49", ask="0.50", bid_size="1000", ask_size="1000"):
     return {
-        "market": "condition-a",
-        "asset_id": "token-a",
+        "market": "0xabababababababababababababababababababababababababababababababab",
+        "asset_id": "101",
         "timestamp": "123",
         "hash": "book-x",
         "bids": [{"price": bid, "size": bid_size}],
@@ -95,7 +102,7 @@ def raw_book(*, bid="0.49", ask="0.50", bid_size="1000", ask_size="1000"):
 
 def market_info():
     return {
-        "t": [{"t": "token-a"}],
+        "t": [{"t": "101"}],
         "fd": {"r": 0.05, "e": 1},
     }
 
@@ -111,8 +118,8 @@ def write_open_request(paths, *, request_id="REQ-open", generation="GEN-X", evid
             "action": "OPEN",
             "amount_usd": 25,
             "chat_id": "123",
-            "token_id": "token-a",
-            "condition_id": "condition-a",
+            "token_id": "101",
+            "condition_id": "0xabababababababababababababababababababababababababababababababab",
             "source_generation_id": generation,
             "source_evidence_id": evidence,
             "focus_locked_at": NOW.isoformat(),
@@ -255,8 +262,8 @@ def test_open_rejects_resolved_unknown_or_unavailable_settlement(
     assert len(rejected) == 1
     assert rejected[0]["reason_code"] == expected_reason
     assert len(checked) == 1
-    assert checked[0]["condition_id"] == "condition-a"
-    assert checked[0]["token_id"] == "token-a"
+    assert checked[0]["condition_id"] == "0xabababababababababababababababababababababababababababababababab"
+    assert checked[0]["token_id"] == "101"
     assert checked[0]["outcome_index"] == 0
 
 
@@ -745,3 +752,307 @@ def test_learning_queue_failure_never_rejects_successful_paper_open(
 
     stored = json.loads(paths["state"].read_text(encoding="utf-8"))
     assert stored["positions"][0]["status"] == "OPEN"
+
+
+@pytest.mark.parametrize(("missing_field", "expected"), [
+    ("asset_id", "BOOK_BOOK_ASSET_ID_MISSING"),
+    ("market", "BOOK_BOOK_MARKET_ID_MISSING"),
+])
+def test_open_rejects_latest_clob_book_without_bound_identity(
+    monkeypatch, tmp_path, missing_field, expected
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    bad_book = raw_book()
+    bad_book.pop(missing_field)
+
+    def forbidden(_):
+        raise AssertionError("Rejected Paper must not request fees")
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: bad_book,
+        market_info_loader=forbidden,
+    )
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == expected
+
+
+@pytest.mark.parametrize(("missing_field", "expected"), [
+    ("asset_id", "BOOK_ASSET_ID_MISSING"),
+    ("market", "BOOK_MARKET_ID_MISSING"),
+])
+def test_close_and_mark_reject_latest_clob_book_without_identity(
+    monkeypatch, tmp_path, missing_field, expected
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    paper_id = state["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+    bad_book = raw_book()
+    bad_book.pop(missing_field)
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: bad_book,
+        market_info_loader=lambda _: market_info(),
+    )
+    rejected = [event for event in events if event["type"] == "REJECTED"]
+    assert len(rejected) == 1
+    assert rejected[0]["reason_code"] == expected
+    assert state["positions"][0]["status"] == "OPEN"
+    assert state["positions"][0]["mark_status"] == expected
+
+
+def test_v3_position_paper_open_blocks_before_network_or_legacy_ctf_identity(
+    monkeypatch, tmp_path
+):
+    from scripts.v3_identity import decode_position_id
+
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    identity = decode_position_id((1 << 248) | (123 << 120))
+    assert identity["classification"] == "SUPPORTED"
+    assert len(identity["condition_id"]) == 64
+
+    for path in (paths["focus"], paths["book"], paths["requests"] / "REQ-open.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if path == paths["focus"]:
+            payload["focus"]["token_id"] = identity["position_id"]
+            payload["focus"]["condition_id"] = identity["condition_id"]
+        else:
+            payload["token_id"] = identity["position_id"]
+            payload["condition_id"] = identity["condition_id"]
+        save_json_atomic(path, payload)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("V3 position must not make CLOB/CTF/network calls")
+
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=forbidden,
+        market_info_loader=forbidden,
+        identity_loader=forbidden,
+        settlement_checker=forbidden,
+    )
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == "UNSUPPORTED_PROTOCOL_V2"
+
+
+
+@pytest.mark.parametrize(("field", "malformed", "reason"), [
+    ("asset_id", 123, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", True, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", ["101"], "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("market", 123, "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", False, "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", {"id": "0xabababababababababababababababababababababababababababababababab"}, "BOOK_MARKET_ID_INVALID_TYPE"),
+])
+def test_open_rejects_nonstring_latest_clob_identity_before_fees(
+    monkeypatch, tmp_path, field, malformed, reason
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    untrusted = raw_book()
+    untrusted[field] = malformed
+
+    def forbidden(*_args):
+        raise AssertionError("Invalid identity must reject before fee lookup")
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: untrusted,
+        market_info_loader=forbidden,
+    )
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == "BOOK_" + reason
+
+
+@pytest.mark.parametrize(("field", "malformed", "reason"), [
+    ("asset_id", 123, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", True, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("market", 123, "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", ["0xabababababababababababababababababababababababababababababababab"], "BOOK_MARKET_ID_INVALID_TYPE"),
+])
+def test_close_and_mark_reject_nonstring_clob_identity_and_keep_open(
+    monkeypatch, tmp_path, field, malformed, reason
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    opened, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    assert [e["type"] for e in events] == ["OPENED"]
+    paper_id = opened["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+    untrusted = raw_book()
+    untrusted[field] = malformed
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: untrusted,
+        market_info_loader=lambda _: market_info(),
+    )
+    rejected = [e for e in events if e["type"] == "REJECTED"]
+    assert len(rejected) == 1
+    assert rejected[0]["reason_code"] == reason
+    assert state["positions"][0]["status"] == "OPEN"
+    assert state["positions"][0]["mark_status"] == reason
+    assert state["positions"][0]["mark"] is None or state["positions"][0]["mark_status"] != "OK"
+
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("token_id", 123), ("token_id", True), ("token_id", ["101"]),
+    ("condition_id", 123), ("condition_id", False),
+    ("source_evidence_id", 7), ("source_evidence_id", True),
+    ("source_generation_id", 44), ("source_generation_id", False),
+])
+@pytest.mark.parametrize("side", ["focus", "book", "both"])
+def test_snapshot_gate_never_coerces_nonstring_id(
+    monkeypatch, tmp_path, field, value, side
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    focus_payload = json.loads(paths["focus"].read_text(encoding="utf-8"))
+    book_payload = json.loads(paths["book"].read_text(encoding="utf-8"))
+    focus_key = {
+        "source_evidence_id": "last_evidence_id",
+        "source_generation_id": "source_generation_id",
+    }.get(field, field)
+    if side in ("focus", "both"):
+        target = focus_payload if field == "source_generation_id" else focus_payload["focus"]
+        target[focus_key] = value
+    if side in ("book", "both"):
+        book_payload[field] = value
+    save_json_atomic(paths["focus"], focus_payload)
+    save_json_atomic(paths["book"], book_payload)
+    gate, _, _ = paper_worker.read_execution_gate(now=NOW)
+    assert gate == ("FOCUS_BINDING_INCOMPLETE" if side != "book" else "BOOK_BINDING_INVALID")
+    write_open_request(paths)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Malformed authority must not reach any remote lookup")
+    state, events = paper_worker.run_once(
+        now=NOW, book_loader=forbidden, market_info_loader=forbidden,
+        identity_loader=forbidden, settlement_checker=forbidden,
+    )
+    assert state["positions"] == []
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == gate
+
+
+@pytest.mark.parametrize("bad", [None, "", "  ", " 101 ", 5, False, []])
+def test_open_request_identity_never_coerces_even_when_gate_valid(
+    monkeypatch, tmp_path, bad
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    request_path = paths["requests"] / "REQ-open.json"
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    request["token_id"] = bad
+    save_json_atomic(request_path, request)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Malformed request must reject before external lookup")
+    state, events = paper_worker.run_once(
+        now=NOW, book_loader=forbidden, market_info_loader=forbidden,
+        identity_loader=forbidden, settlement_checker=forbidden,
+    )
+    assert state["positions"] == []
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == "REQUEST_TOKEN_ID_MISMATCH"
+
+
+def test_valid_legacy_string_binding_still_passes_paper_snapshot_gate(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    assert paper_worker.read_execution_gate(now=NOW)[0] == "READY_BOOK_PASS"
+
+
+
+@pytest.mark.parametrize(("field", "bad_value", "expected"), [
+    ("asset_type", "POSITION", "UNSUPPORTED_PROTOCOL_V2"),
+    ("protocol_version", "V2", "UNSUPPORTED_PROTOCOL_V2"),
+    ("asset_type", "UNKNOWN", "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("asset_type", None, "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("protocol_version", None, "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("execution_protocol_eligible", False, "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("execution_protocol_eligible", "true", "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("ctf_token_id", "999", "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("asset_id", 101, "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("exchange_address", None, "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("exchange_address", "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa", "EXECUTION_PROTOCOL_UNVERIFIED"),
+])
+def test_protocol_gate_rejects_open_before_all_network_calls(
+    monkeypatch, tmp_path, field, bad_value, expected
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    payload = json.loads(paths["focus"].read_text(encoding="utf-8"))
+    payload["focus"][field] = bad_value
+    save_json_atomic(paths["focus"], payload)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Unsafe protocol MUST reject before remote lookup")
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=forbidden,
+        market_info_loader=forbidden,
+        identity_loader=forbidden,
+        settlement_checker=forbidden,
+    )
+    assert state["positions"] == []
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == expected
+
+
+def test_v3_position_bytes32_condition_is_blocked_before_identity_lookup(
+    monkeypatch, tmp_path
+):
+    # Deliberately forged bytes32 form bypasses the old bytes31-only heuristic.
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    payload = json.loads(paths["focus"].read_text(encoding="utf-8"))
+    payload["focus"]["asset_type"] = "POSITION"
+    payload["focus"]["protocol_version"] = "V2"
+    payload["focus"]["position_id"] = "101"
+    payload["focus"]["ctf_token_id"] = None
+    assert len(payload["focus"]["condition_id"]) == 66
+    save_json_atomic(paths["focus"], payload)
+
+    calls = []
+
+    def forbidden(*_args, **_kwargs):
+        calls.append("network")
+        raise AssertionError("V3 must not invoke any external lookup")
+
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=forbidden,
+        market_info_loader=forbidden,
+        identity_loader=forbidden,
+        settlement_checker=forbidden,
+    )
+    assert state["positions"] == []
+    assert events[0]["reason_code"] == "UNSUPPORTED_PROTOCOL_V2"
+    assert calls == []

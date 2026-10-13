@@ -1,0 +1,90 @@
+name: GENERAL1-G Joint Offline Safety
+on:
+  push:
+    branches: [integration/general1g-safety-offline-20261013]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Collector offline
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_collector_sqlite.py tests/test_collector_db_preflight.py tests/test_v2_coverage_probe.py tests/test_v2_coverage_1b_audit.py 2>&1 | tee collector.log
+      - name: Flow offline
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_flow_unit2.py tests/test_flow_evidence_interface.py 2>&1 | tee flow.log
+      - name: Diamond offline
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_diamond_unit3.py tests/test_diamond_generation.py 2>&1 | tee diamond.log
+      - name: Risk offline
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_risk_engine.py tests/test_risk_generation.py tests/test_risk_focus_contract.py 2>&1 | tee risk.log
+      - name: Focus offline
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_focus_engine.py tests/test_focus_runner.py tests/test_focus_learning.py tests/test_v3_execution_protocol_gate.py tests/test_protocol_identity.py 2>&1 | tee focus.log
+      - name: Book offline
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_book_engine.py tests/test_book_worker.py tests/test_book_learning.py 2>&1 | tee book.log
+      - name: Paper offline
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_paper_engine.py tests/test_paper_worker.py tests/test_paper_settlement.py tests/test_paper_settlement_preflight.py tests/test_paper_learning.py 2>&1 | tee paper.log
+      - name: Joint cross-worker and runtime regression
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_ready_population.py tests/test_runtime_supervisor.py tests/test_machine_v3.py tests/test_telegram_focus_book.py tests/test_regressions.py 2>&1 | tee integration.log
+      - name: Full offline project suite
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee full.log
+      - name: Full offline runtime self-test
+        shell: bash
+        run: |
+          set -o pipefail
+          python run_machine.py --self-test 2>&1 | tee self_test.log
+      - name: Handoff artifact with checksums and patch
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p handoff
+          git rev-parse HEAD > handoff/commit.txt
+          git rev-parse origin/main > handoff/main.txt
+          git diff origin/main...HEAD > handoff/changes.diff
+          mkdir -p handoff/sources
+          for source in scripts/paper_worker.py scripts/protocol_identity.py scripts/flow_tracker.py scripts/diamond_filter_v3.py scripts/risk_engine.py scripts/focus_engine.py scripts/focus_runner.py scripts/book_engine.py scripts/paper_engine.py scripts/v2_coverage_probe.py; do cp "$source" handoff/sources/; done
+          mkdir -p handoff/tests
+          for source in tests/test_paper_worker.py tests/test_focus_engine.py tests/test_focus_runner.py tests/test_protocol_identity.py tests/test_v3_execution_protocol_gate.py; do cp "$source" handoff/tests/; done
+          cp -f collector.log flow.log diamond.log risk.log focus.log book.log paper.log integration.log full.log self_test.log handoff/ 2>/dev/null || true
+          (cd handoff && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: general1g-joint-offline-handoff
+          path: handoff/
+          if-no-files-found: error
