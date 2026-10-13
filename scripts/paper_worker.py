@@ -1050,8 +1050,15 @@ def self_test():
 
             evidence_id = "0x" + "ab" * 32 + ":1"
             focus = {
-                "token_id": "token-a",
-                "condition_id": "condition-a",
+                "token_id": "123456789012345678901234567890",
+                "condition_id": "0xabababababababababababababababababababababababababababababababab",
+                "asset_type": "CTF_TOKEN",
+                "protocol_version": "LEGACY_CTF",
+                "exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
+                "asset_id": "123456789012345678901234567890",
+                "ctf_token_id": "123456789012345678901234567890",
+                "position_id": None,
+                "execution_protocol_eligible": True,
                 "outcome": "Yes",
                 "question": "Market A",
                 "direction": "BUY",
@@ -1081,8 +1088,8 @@ def self_test():
                     "book_ok": True,
                     "source_generation_id": "GEN-X",
                     "source_evidence_id": evidence_id,
-                    "token_id": "token-a",
-                    "condition_id": "condition-a",
+                    "token_id": "123456789012345678901234567890",
+                    "condition_id": "0xabababababababababababababababababababababababababababababababab",
                 },
             )
 
@@ -1096,8 +1103,8 @@ def self_test():
                     "action": "OPEN",
                     "amount_usd": 25,
                     "chat_id": "123",
-                    "token_id": "token-a",
-                    "condition_id": "condition-a",
+                    "token_id": "123456789012345678901234567890",
+                    "condition_id": "0xabababababababababababababababababababababababababababababababab",
                     "source_generation_id": "GEN-X",
                     "source_evidence_id": evidence_id,
                     "focus_locked_at": now.isoformat(),
@@ -1105,10 +1112,10 @@ def self_test():
             )
 
             def fake_book(token_id):
-                assert token_id == "token-a"
+                assert token_id == "123456789012345678901234567890"
                 return {
-                    "market": "condition-a",
-                    "asset_id": "token-a",
+                    "market": "0xabababababababababababababababababababababababababababababababab",
+                    "asset_id": "123456789012345678901234567890",
                     "timestamp": "1",
                     "hash": "book-x",
                     "bids": [{"price": "0.49", "size": "1000"}],
@@ -1116,9 +1123,9 @@ def self_test():
                 }
 
             def fake_market(condition_id):
-                assert condition_id == "condition-a"
+                assert condition_id == "0xabababababababababababababababababababababababababababababababab"
                 return {
-                    "t": [{"t": "token-a"}],
+                    "t": [{"t": "123456789012345678901234567890"}],
                     "fd": {"r": 0.05, "e": 1},
                 }
 
