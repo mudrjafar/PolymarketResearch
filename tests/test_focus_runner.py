@@ -38,7 +38,7 @@ def candidate(token_id, block, log_index, at, *, tx_byte="a", risk_ok=True, code
         "position_id": None,
         "execution_protocol_eligible": True,
         "token_id": token_id,
-        "condition_id": f"condition-{token_id}",
+        "condition_id": "0x" + "ab" * 32,
         "outcome": "Yes",
         "question": f"Market {token_id}",
         "direction": "BUY",
@@ -72,8 +72,8 @@ def test_runner_preserves_authoritative_risk_order_without_score(monkeypatch, tm
         risk_payload(
             "X",
             [
-                candidate("B", 100, 1, NOW, tx_byte="b"),
-                candidate("A", 101, 1, NOW, tx_byte="a"),
+                candidate("102", 100, 1, NOW, tx_byte="b"),
+                candidate("101", 101, 1, NOW, tx_byte="a"),
             ],
         ),
     )
@@ -81,19 +81,19 @@ def test_runner_preserves_authoritative_risk_order_without_score(monkeypatch, tm
     state, events, status = runner.run_once(now=NOW)
 
     assert status == "OK"
-    assert state["focus"]["token_id"] == "B"
+    assert state["focus"]["token_id"] == "102"
     assert "score" not in state["focus"]
     assert "score_at_lock" not in state["focus"]
     assert events[-1]["type"] == "LOCKED"
 
     stored = read_json(paths["state"])
     assert stored["last_source_generation_id"] == "X"
-    assert stored["engine_state"]["focus"]["token_id"] == "B"
+    assert stored["engine_state"]["focus"]["token_id"] == "102"
 
     view = read_json(paths["view"])
     assert view["source_generation_id"] == "X"
     assert view["state"] == "LOCKED"
-    assert view["token_id"] == "B"
+    assert view["token_id"] == "102"
 
     event = json.loads(paths["events"].read_text(encoding="utf-8").splitlines()[-1])
     assert event["source_generation_id"] == "X"
@@ -104,7 +104,7 @@ def test_missing_risk_is_input_failure_not_valid_empty_generation(monkeypatch, t
     paths = configure_paths(monkeypatch, tmp_path)
     save_json_atomic(
         paths["risk"],
-        risk_payload("X", [candidate("A", 100, 1, NOW)]),
+        risk_payload("X", [candidate("101", 100, 1, NOW)]),
     )
     runner.run_once(now=NOW)
     before = paths["state"].read_bytes()
@@ -114,7 +114,7 @@ def test_missing_risk_is_input_failure_not_valid_empty_generation(monkeypatch, t
 
     assert status == "MISSING"
     assert events == []
-    assert state["focus"]["token_id"] == "A"
+    assert state["focus"]["token_id"] == "101"
     assert paths["state"].read_bytes() == before
     assert read_json(paths["view"])["input_status"] == "MISSING"
 
@@ -123,7 +123,7 @@ def test_stale_risk_does_not_advance_focus(monkeypatch, tmp_path):
     paths = configure_paths(monkeypatch, tmp_path)
     save_json_atomic(
         paths["risk"],
-        risk_payload("X", [candidate("A", 100, 1, NOW)]),
+        risk_payload("X", [candidate("101", 100, 1, NOW)]),
     )
     runner.run_once(now=NOW)
     before = paths["state"].read_bytes()
@@ -133,7 +133,7 @@ def test_stale_risk_does_not_advance_focus(monkeypatch, tmp_path):
         paths["risk"],
         risk_payload(
             "Y",
-            [candidate("A", 101, 1, stale_at)],
+            [candidate("101", 101, 1, stale_at)],
             generated_at=stale_at,
         ),
     )
@@ -150,7 +150,7 @@ def test_valid_empty_generation_is_distinct_from_missing_input(monkeypatch, tmp_
     paths = configure_paths(monkeypatch, tmp_path)
     save_json_atomic(
         paths["risk"],
-        risk_payload("X", [candidate("A", 100, 1, NOW)]),
+        risk_payload("X", [candidate("101", 100, 1, NOW)]),
     )
     runner.run_once(now=NOW)
 
@@ -171,7 +171,7 @@ def test_corrupt_persisted_focus_state_fails_closed(monkeypatch, tmp_path):
     paths["state"].write_text("{not-json", encoding="utf-8")
     save_json_atomic(
         paths["risk"],
-        risk_payload("X", [candidate("A", 100, 1, NOW)]),
+        risk_payload("X", [candidate("101", 100, 1, NOW)]),
     )
 
     with pytest.raises(runner.FocusStateError):
@@ -195,9 +195,9 @@ def test_main_runtime_keeps_risk_and_focus_as_separate_ordered_workers():
 
 def test_runner_v3_only_never_locks(monkeypatch, tmp_path):
     paths = configure_paths(monkeypatch, tmp_path)
-    row = candidate("v3-position", 100, 1, NOW)
+    row = candidate("107", 100, 1, NOW)
     row.update(asset_type="POSITION", protocol_version="V2",
-               ctf_token_id=None, position_id="v3-position",
+               ctf_token_id=None, position_id="107",
                execution_protocol_eligible=False)
     save_json_atomic(paths["risk"], risk_payload("V3", [row]))
     state, events, status = runner.run_once(now=NOW)
@@ -208,23 +208,23 @@ def test_runner_v3_only_never_locks(monkeypatch, tmp_path):
 
 def test_runner_v3_ranked_before_legacy_locks_legacy(monkeypatch, tmp_path):
     paths = configure_paths(monkeypatch, tmp_path)
-    row = candidate("v3-position", 100, 1, NOW)
+    row = candidate("107", 100, 1, NOW)
     row.update(asset_type="POSITION", protocol_version="V2",
-               ctf_token_id=None, position_id="v3-position",
+               ctf_token_id=None, position_id="107",
                execution_protocol_eligible=False)
     save_json_atomic(paths["risk"], risk_payload("RANKED", [
-        row, candidate("legacy", 101, 1, NOW)
+        row, candidate("105", 101, 1, NOW)
     ]))
     state, events, status = runner.run_once(now=NOW)
     assert status == "OK"
-    assert state["focus"]["token_id"] == "legacy"
+    assert state["focus"]["token_id"] == "105"
     assert events[-1]["type"] == "LOCKED"
 
 
 def test_runner_releases_old_ambiguous_lock_even_without_risk(monkeypatch, tmp_path):
     paths = configure_paths(monkeypatch, tmp_path)
     save_json_atomic(paths["risk"], risk_payload(
-        "X", [candidate("old", 100, 1, NOW)]
+        "X", [candidate("106", 100, 1, NOW)]
     ))
     runner.run_once(now=NOW)
     snapshot = read_json(paths["state"])
