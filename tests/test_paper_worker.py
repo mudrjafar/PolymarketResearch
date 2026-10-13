@@ -985,3 +985,74 @@ def test_valid_legacy_string_binding_still_passes_paper_snapshot_gate(monkeypatc
     paths = configure(monkeypatch, tmp_path)
     write_gate(paths)
     assert paper_worker.read_execution_gate(now=NOW)[0] == "READY_BOOK_PASS"
+
+
+
+@pytest.mark.parametrize(("field", "bad_value", "expected"), [
+    ("asset_type", "POSITION", "UNSUPPORTED_PROTOCOL_V2"),
+    ("protocol_version", "V2", "UNSUPPORTED_PROTOCOL_V2"),
+    ("asset_type", "UNKNOWN", "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("asset_type", None, "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("protocol_version", None, "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("execution_protocol_eligible", False, "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("execution_protocol_eligible", "true", "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("ctf_token_id", "999", "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("asset_id", 101, "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("exchange_address", None, "EXECUTION_PROTOCOL_UNVERIFIED"),
+    ("exchange_address", "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa", "EXECUTION_PROTOCOL_UNVERIFIED"),
+])
+def test_protocol_gate_rejects_open_before_all_network_calls(
+    monkeypatch, tmp_path, field, bad_value, expected
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    payload = json.loads(paths["focus"].read_text(encoding="utf-8"))
+    payload["focus"][field] = bad_value
+    save_json_atomic(paths["focus"], payload)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Unsafe protocol MUST reject before remote lookup")
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=forbidden,
+        market_info_loader=forbidden,
+        identity_loader=forbidden,
+        settlement_checker=forbidden,
+    )
+    assert state["positions"] == []
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == expected
+
+
+def test_v3_position_bytes32_condition_is_blocked_before_identity_lookup(
+    monkeypatch, tmp_path
+):
+    # Deliberately forged bytes32 form bypasses the old bytes31-only heuristic.
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    payload = json.loads(paths["focus"].read_text(encoding="utf-8"))
+    payload["focus"]["asset_type"] = "POSITION"
+    payload["focus"]["protocol_version"] = "V2"
+    payload["focus"]["position_id"] = "101"
+    payload["focus"]["ctf_token_id"] = None
+    assert len(payload["focus"]["condition_id"]) == 66
+    save_json_atomic(paths["focus"], payload)
+
+    calls = []
+
+    def forbidden(*_args, **_kwargs):
+        calls.append("network")
+        raise AssertionError("V3 must not invoke any external lookup")
+
+    state, events = paper_worker.run_once(
+        now=NOW,
+        book_loader=forbidden,
+        market_info_loader=forbidden,
+        identity_loader=forbidden,
+        settlement_checker=forbidden,
+    )
+    assert state["positions"] == []
+    assert events[0]["reason_code"] == "UNSUPPORTED_PROTOCOL_V2"
+    assert calls == []
