@@ -134,3 +134,73 @@ def test_settlement_math_rejects_invalid_payouts():
 
     with pytest.raises(ValueError, match="PAYOUT_STRUCTURE_INVALID"):
         paper_engine.calculate_settlement(40, 25, 0, 0)
+
+
+@pytest.mark.parametrize(("field", "value", "expected"), [
+    ("asset_id", None, "BOOK_ASSET_ID_MISSING"),
+    ("asset_id", "", "BOOK_ASSET_ID_MISSING"),
+    ("market", None, "BOOK_MARKET_ID_MISSING"),
+    ("market", "", "BOOK_MARKET_ID_MISSING"),
+    ("asset_id", "wrong", "TOKEN_ID_MISMATCH"),
+    ("market", "wrong", "CONDITION_ID_MISMATCH"),
+])
+def test_paper_book_identity_fails_closed_for_missing_or_mismatched_fields(field, value, expected):
+    raw = book()
+    raw[field] = value
+    ok, reason = paper_engine.validate_book_identity(raw, "token-a", "condition-a")
+    assert not ok
+    assert reason == expected
+
+
+@pytest.mark.parametrize(("field", "expected"), [
+    ("asset_id", "BOOK_ASSET_ID_MISSING"),
+    ("market", "BOOK_MARKET_ID_MISSING"),
+])
+def test_paper_book_identity_requires_fields_to_exist(field, expected):
+    raw = book()
+    raw.pop(field)
+    assert paper_engine.validate_book_identity(raw, "token-a", "condition-a") == (False, expected)
+
+
+@pytest.mark.parametrize(("token_id", "condition_id", "expected"), [
+    ("", "condition-a", "TOKEN_ID_MISSING"),
+    ("token-a", "", "CONDITION_ID_MISSING"),
+])
+def test_paper_book_identity_requires_focus_binding(token_id, condition_id, expected):
+    assert paper_engine.validate_book_identity(book(), token_id, condition_id) == (False, expected)
+
+
+
+@pytest.mark.parametrize(("field", "value", "reason"), [
+    ("asset_id", 123, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", 0, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", True, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", [], "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", {"id": "token-a"}, "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("market", 123, "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", False, "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", [], "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", {"id": "condition-a"}, "BOOK_MARKET_ID_INVALID_TYPE"),
+])
+def test_non_string_clob_json_id_fails_paper_binding(field, value, reason):
+    raw = book()
+    raw[field] = value
+    assert paper_engine.validate_book_identity(raw, "token-a", "condition-a") == (False, reason)
+
+
+def test_numeric_source_and_numeric_clob_identity_never_match():
+    raw = book()
+    raw["asset_id"] = 12345
+    assert paper_engine.validate_book_identity(raw, 12345, "condition-a")[0] is False
+    raw = book()
+    raw["market"] = 12345
+    assert paper_engine.validate_book_identity(raw, "token-a", 12345)[0] is False
+
+
+def test_legacy_ctf_decimal_token_and_hex_condition_still_match():
+    token = "123456789012345678901234567890"
+    condition = "0x" + "ab" * 32
+    raw = book()
+    raw["asset_id"] = token
+    raw["market"] = "0x" + "AB" * 32
+    assert paper_engine.validate_book_identity(raw, token, condition) == (True, "OK")
