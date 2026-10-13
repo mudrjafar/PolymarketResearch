@@ -1,0 +1,54 @@
+name: GENERAL1-E V3 Focus Offline
+on:
+  push:
+    branches: [fix/general1e-v3-execution-focus-gate-20261012]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install offline requirements
+        run: python -m pip install -r requirements.txt
+      - name: Targeted protocol and Paper regression
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_focus_engine.py tests/test_focus_runner.py tests/test_risk_engine.py tests/test_flow_unit2.py tests/test_v3_execution_protocol_gate.py tests/test_paper_worker.py tests/test_focus_learning.py tests/test_flow_evidence_interface.py tests/test_protocol_identity.py 2>&1 | tee targeted.log
+      - name: Full offline suite
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee full.log
+      - name: Offline runtime self-test
+        shell: bash
+        run: |
+          set -o pipefail
+          python run_machine.py --self-test 2>&1 | tee self_test.log
+      - name: Handoff diff, sources, logs and checksums
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p handoff/source/scripts handoff/source/tests
+          for x in scripts/flow_tracker.py scripts/diamond_filter_v3.py scripts/risk_engine.py scripts/focus_engine.py scripts/focus_runner.py scripts/protocol_identity.py; do cp "$x" handoff/source/scripts/; done
+          for x in tests/test_focus_engine.py tests/test_focus_runner.py tests/test_risk_engine.py tests/test_v3_execution_protocol_gate.py tests/test_focus_learning.py tests/test_flow_evidence_interface.py tests/test_protocol_identity.py; do cp "$x" handoff/source/tests/; done
+          git rev-parse HEAD > handoff/commit.txt
+          git diff origin/main...HEAD > handoff/changes.diff
+          cp -f targeted.log full.log self_test.log handoff/ 2>/dev/null || true
+          (cd handoff && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: general1e-v3-focus-handoff
+          path: handoff/
+          if-no-files-found: error

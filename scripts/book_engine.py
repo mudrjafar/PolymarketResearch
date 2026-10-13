@@ -103,17 +103,32 @@ def analyze_book(book, focus, target_notionals=TARGET_NOTIONALS_USD):
             "quotes": [],
         }
 
-    token_id = str(focus.get("token_id") or "").strip()
-    condition_id = str(focus.get("condition_id") or "").strip()
+    focus_token = focus.get("token_id")
+    focus_condition = focus.get("condition_id")
+    token_id = focus_token.strip() if isinstance(focus_token, str) else ""
+    condition_id = focus_condition.strip() if isinstance(focus_condition, str) else ""
 
-    asset_id = str(book.get("asset_id") or "").strip()
-    market = str(book.get("market") or "").strip()
+    # Do not turn JSON numbers, booleans, lists, or objects into exchange IDs.
+    raw_asset_id = book.get("asset_id")
+    raw_market = book.get("market")
+    asset_id = raw_asset_id.strip() if isinstance(raw_asset_id, str) else ""
+    market = raw_market.strip() if isinstance(raw_market, str) else ""
 
     if not token_id:
         reasons.append("TOKEN_ID_MISSING")
-    if asset_id and token_id and asset_id != token_id:
+    if not condition_id:
+        reasons.append("CONDITION_ID_MISSING")
+    if raw_asset_id is not None and not isinstance(raw_asset_id, str):
+        reasons.append("BOOK_ASSET_ID_INVALID_TYPE")
+    elif not asset_id:
+        reasons.append("BOOK_ASSET_ID_MISSING")
+    elif token_id and asset_id != token_id:
         reasons.append("TOKEN_ID_MISMATCH")
-    if market and condition_id and market.lower() != condition_id.lower():
+    if raw_market is not None and not isinstance(raw_market, str):
+        reasons.append("BOOK_MARKET_ID_INVALID_TYPE")
+    elif not market:
+        reasons.append("BOOK_MARKET_ID_MISSING")
+    elif condition_id and market.lower() != condition_id.lower():
         reasons.append("CONDITION_ID_MISMATCH")
 
     bids, bid_error = _parse_levels(book.get("bids"), reverse=True)

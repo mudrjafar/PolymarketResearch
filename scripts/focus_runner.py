@@ -93,13 +93,28 @@ def read_risk_snapshot(now=None):
     return "OK", payload
 
 
-def _state_wrapper(state, source_generation_id, now):
+def _state_wrapper(
+    state, source_generation_id, now, *,
+    source_generated_at=None, strategy_versions=None,
+):
     return {
         "schema_version": RUNNER_SCHEMA_VERSION,
         "updated_at": now.isoformat(),
         "last_source_generation_id": source_generation_id,
+        "last_source_generated_at": source_generated_at,
+        "last_strategy_versions": (
+            dict(strategy_versions) if isinstance(strategy_versions, dict) else None
+        ),
         "engine_state": state,
     }
+
+
+def _stored_provenance():
+    # Caller has already checked durable Focus state via load_engine_state().
+    if not STATE_FILE.exists():
+        return {}
+    previous = _read_json(STATE_FILE)
+    return previous if isinstance(previous, dict) else {}
 
 
 def _view(state, input_status, payload, now):
@@ -254,11 +269,55 @@ def run_once(now=None):
         raise ValueError("now must be timezone-aware")
 
     state = load_engine_state()
+    previous_provenance = _stored_provenance()
     input_status, payload = read_risk_snapshot(now=now)
 
-    # Input failure is not equivalent to a valid empty Risk generation.
-    # Preserve Focus authority unchanged until a valid current snapshot exists.
+    # Input failure is not a valid empty Risk generation. Preserve
+    # a healthy Legacy focus, but immediately release old V3/ambiguous locks
+    # even if Risk is missing: an unusable position must not monopolize Focus.
     if input_status != "OK":
+        active = state.get("focus") if isinstance(state, dict) else None
+        if isinstance(active, dict) and not focus_engine.execution_protocol_eligible(active):
+            state, events = focus_engine.step(state, [], now=now)
+            if events:
+                # This is an invalidation of the *previous* Focus authority,
+                # not a newly accepted Risk generation. Never write None over
+                # its known lineage merely because today's Risk file failed.
+                generation = previous_provenance.get("last_source_generation_id")
+                if not isinstance(generation, str) or not generation.strip():
+                    generation = None
+                original_generated_at = previous_provenance.get("last_source_generated_at")
+                versions = previous_provenance.get("last_strategy_versions")
+                # Old durable wrappers may predate cached provenance. Only a
+                # stale but structurally bound Risk snapshot may recover it.
+                if isinstance(payload, dict) and payload.get("source_generation_id") == generation:
+                    if not isinstance(versions, dict):
+                        versions = payload.get("strategy_versions")
+                    if not original_generated_at:
+                        original_generated_at = payload.get("source_generated_at")
+                learning_possible = bool(generation) and isinstance(versions, dict)
+                if not learning_possible:
+                    for event in events:
+                        event["learning_projection_status"] = "UNAVAILABLE_PROVENANCE"
+                    if isinstance(state.get("last_invalidated"), dict):
+                        state["last_invalidated"]["learning_projection_status"] = "UNAVAILABLE_PROVENANCE"
+                save_json_atomic(
+                    STATE_FILE, _state_wrapper(
+                        state, generation, now,
+                        source_generated_at=original_generated_at,
+                        strategy_versions=versions,
+                    ),
+                )
+                _append_events(events, generation)
+                if learning_possible:
+                    _publish_learning_events(
+                        events, state,
+                        {"source_generation_id": generation,
+                         "source_generated_at": original_generated_at,
+                         "strategy_versions": versions, "results": []},
+                    )
+            save_json_atomic(FOCUS_FILE, _view(state, input_status, payload, now))
+            return state, events, input_status
         save_json_atomic(FOCUS_FILE, _view(state, input_status, payload, now))
         return state, [], input_status
 
@@ -275,7 +334,11 @@ def run_once(now=None):
     # downstream projections of the already-committed state transition.
     save_json_atomic(
         STATE_FILE,
-        _state_wrapper(new_state, generation_id, now),
+        _state_wrapper(
+            new_state, generation_id, now,
+            source_generated_at=payload.get("source_generated_at"),
+            strategy_versions=payload.get("strategy_versions"),
+        ),
     )
     _append_events(events, generation_id)
     _publish_learning_events(events, new_state, payload)
@@ -314,8 +377,15 @@ def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
 def _self_test_candidate(token_id, tx_byte):
     now = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
     return {
+        "asset_type": "CTF_TOKEN",
+        "protocol_version": "LEGACY_CTF",
+        "exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
+        "asset_id": token_id,
+        "ctf_token_id": token_id,
+        "position_id": None,
+        "execution_protocol_eligible": True,
         "token_id": token_id,
-        "condition_id": f"condition-{token_id}",
+        "condition_id": "0x" + "ab" * 32,
         "outcome": "Yes",
         "question": f"Market {token_id}",
         "direction": "BUY",
@@ -350,8 +420,8 @@ def self_test():
                     "source_generated_at": now.isoformat(),
                     "generated_at": now.isoformat(),
                     "results": [
-                        _self_test_candidate("B", "b"),
-                        _self_test_candidate("A", "a"),
+                        _self_test_candidate("102", "b"),
+                        _self_test_candidate("101", "a"),
                     ],
                 },
             )
@@ -359,7 +429,7 @@ def self_test():
             state, events, status = run_once(now=now)
 
             assert status == "OK"
-            assert state["focus"]["token_id"] == "B"
+            assert state["focus"]["token_id"] == "102"
             assert "score" not in state["focus"]
             assert events[-1]["type"] == "LOCKED"
             assert STATE_FILE.exists()

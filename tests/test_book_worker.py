@@ -237,3 +237,26 @@ def test_book_worker_queues_only_ready_assessments(monkeypatch, tmp_path):
     assert queued["source_evidence_id"].endswith(":1")
     assert queued["book_ok"] is True
     assert kwargs["data_dir"] == paths["book"].parent
+
+
+def test_missing_clob_market_identity_never_persists_a_book_pass(monkeypatch, tmp_path):
+    paths = configure_paths(monkeypatch, tmp_path)
+    save_json_atomic(paths["focus"], focus_payload())
+    raw = valid_book()
+    raw.pop("market")
+    result = worker.run_once(now=NOW, book_loader=lambda _: raw)
+    assert result["status"] == "OK"
+    assert result["book_ok"] is False
+    assert "BOOK_MARKET_ID_MISSING" in result["reason_codes"]
+    assert read_json(paths["book"])["book_ok"] is False
+
+
+def test_missing_clob_asset_identity_never_persists_a_book_pass(monkeypatch, tmp_path):
+    paths = configure_paths(monkeypatch, tmp_path)
+    save_json_atomic(paths["focus"], focus_payload())
+    raw = valid_book()
+    raw.pop("asset_id")
+    result = worker.run_once(now=NOW, book_loader=lambda _: raw)
+    assert result["book_ok"] is False
+    assert "BOOK_ASSET_ID_MISSING" in result["reason_codes"]
+    assert read_json(paths["book"])["book_ok"] is False

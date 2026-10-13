@@ -10,6 +10,7 @@ submits a real order.
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -23,6 +24,7 @@ sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import fresh, save_json_atomic
 from scripts import book_engine, book_worker, paper_engine, paper_settlement
+from scripts.protocol_identity import legacy_ctf_identity
 
 try:
     from scripts.learning_queue import enqueue_paper_open_snapshot
@@ -114,6 +116,12 @@ def _snapshot(path, now):
     return "OK", payload
 
 
+def _bound_snapshot_id(value):
+    # Cross-worker authority is a JSON string contract: never coerce a
+    # boolean, number, list or object into a seemingly matching identifier.
+    return isinstance(value, str) and bool(value) and value == value.strip()
+
+
 def read_execution_gate(now=None):
     now = now or datetime.now(timezone.utc)
     focus_status, focus_payload = _snapshot(FOCUS_FILE, now)
@@ -136,22 +144,25 @@ def read_execution_gate(now=None):
     if book_payload.get("book_ok") is not True:
         return "BOOK_BLOCK", focus_payload, book_payload
 
-    token_id = str(focus.get("token_id") or "").strip()
-    condition_id = str(focus.get("condition_id") or "").strip()
-    evidence_id = str(focus.get("last_evidence_id") or "").strip()
-    generation_id = str(focus_payload.get("source_generation_id") or "").strip()
-
-    if not all((token_id, condition_id, evidence_id, generation_id)):
-        return "FOCUS_BINDING_INCOMPLETE", focus_payload, book_payload
-
-    if str(book_payload.get("token_id") or "").strip() != token_id:
-        return "TOKEN_ID_MISMATCH", focus_payload, book_payload
-    if str(book_payload.get("condition_id") or "").strip() != condition_id:
-        return "CONDITION_ID_MISMATCH", focus_payload, book_payload
-    if str(book_payload.get("source_evidence_id") or "").strip() != evidence_id:
-        return "EVIDENCE_ID_MISMATCH", focus_payload, book_payload
-    if str(book_payload.get("source_generation_id") or "").strip() != generation_id:
-        return "GENERATION_ID_MISMATCH", focus_payload, book_payload
+    bindings = (
+        ("token_id", focus.get("token_id"), book_payload.get("token_id"),
+         "TOKEN_ID_MISMATCH"),
+        ("condition_id", focus.get("condition_id"), book_payload.get("condition_id"),
+         "CONDITION_ID_MISMATCH"),
+        ("source_evidence_id", focus.get("last_evidence_id"),
+         book_payload.get("source_evidence_id"), "EVIDENCE_ID_MISMATCH"),
+        ("source_generation_id", focus_payload.get("source_generation_id"),
+         book_payload.get("source_generation_id"), "GENERATION_ID_MISMATCH"),
+    )
+    for _field, focus_value, _book_value, _reason in bindings:
+        if not _bound_snapshot_id(focus_value):
+            return "FOCUS_BINDING_INCOMPLETE", focus_payload, book_payload
+    for _field, _focus_value, book_value, _reason in bindings:
+        if not _bound_snapshot_id(book_value):
+            return "BOOK_BINDING_INVALID", focus_payload, book_payload
+    for _field, focus_value, book_value, reason in bindings:
+        if focus_value != book_value:
+            return reason, focus_payload, book_payload
 
     return "READY_BOOK_PASS", focus_payload, book_payload
 
@@ -234,7 +245,10 @@ def _matches_open_request(request, focus_payload):
     }
 
     for field, value in expected.items():
-        if str(request.get(field) or "").strip() != str(value or "").strip():
+        requested = request.get(field)
+        if not _bound_snapshot_id(value) or not _bound_snapshot_id(requested):
+            return False, f"REQUEST_{field.upper()}_MISMATCH"
+        if requested != value:
             return False, f"REQUEST_{field.upper()}_MISMATCH"
 
     return True, "OK"
@@ -597,6 +611,18 @@ def _process_open(
     focus = focus_payload["focus"]
     token_id = str(focus["token_id"]).strip()
     condition_id = str(focus["condition_id"]).strip()
+
+    # Exchange V3 position conditions are bytes31. Paper settlement still
+    # supports ONLY legacy CTF bytes32 conditions; reject before RPC/CLOB.
+    # Do not reconstruct a V3 payout or reinterpret a position as a CTF token.
+    if re.fullmatch(r"0x[0-9a-fA-F]{62}", condition_id) is not None:
+        return _reject(request_id, now, "UNSUPPORTED_PROTOCOL_V2")
+
+    # Paper independently validates execution protocol before any external
+    # identity, book, fee, or settlement lookup. Focus READY alone is not
+    # an authority to reinterpret a V3 PositionId as a legacy CTF token.
+    if not legacy_ctf_identity(focus) or focus.get("execution_protocol_eligible") is not True:
+        return _reject(request_id, now, "EXECUTION_PROTOCOL_UNSUPPORTED")
 
     for position in state["positions"]:
         if (
@@ -1024,8 +1050,15 @@ def self_test():
 
             evidence_id = "0x" + "ab" * 32 + ":1"
             focus = {
-                "token_id": "token-a",
-                "condition_id": "condition-a",
+                "token_id": "123456789012345678901234567890",
+                "condition_id": "0xabababababababababababababababababababababababababababababababab",
+                "asset_type": "CTF_TOKEN",
+                "protocol_version": "LEGACY_CTF",
+                "exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
+                "asset_id": "123456789012345678901234567890",
+                "ctf_token_id": "123456789012345678901234567890",
+                "position_id": None,
+                "execution_protocol_eligible": True,
                 "outcome": "Yes",
                 "question": "Market A",
                 "direction": "BUY",
@@ -1055,8 +1088,8 @@ def self_test():
                     "book_ok": True,
                     "source_generation_id": "GEN-X",
                     "source_evidence_id": evidence_id,
-                    "token_id": "token-a",
-                    "condition_id": "condition-a",
+                    "token_id": "123456789012345678901234567890",
+                    "condition_id": "0xabababababababababababababababababababababababababababababababab",
                 },
             )
 
@@ -1070,8 +1103,8 @@ def self_test():
                     "action": "OPEN",
                     "amount_usd": 25,
                     "chat_id": "123",
-                    "token_id": "token-a",
-                    "condition_id": "condition-a",
+                    "token_id": "123456789012345678901234567890",
+                    "condition_id": "0xabababababababababababababababababababababababababababababababab",
                     "source_generation_id": "GEN-X",
                     "source_evidence_id": evidence_id,
                     "focus_locked_at": now.isoformat(),
@@ -1079,10 +1112,10 @@ def self_test():
             )
 
             def fake_book(token_id):
-                assert token_id == "token-a"
+                assert token_id == "123456789012345678901234567890"
                 return {
-                    "market": "condition-a",
-                    "asset_id": "token-a",
+                    "market": "0xabababababababababababababababababababababababababababababababab",
+                    "asset_id": "123456789012345678901234567890",
                     "timestamp": "1",
                     "hash": "book-x",
                     "bids": [{"price": "0.49", "size": "1000"}],
@@ -1090,9 +1123,9 @@ def self_test():
                 }
 
             def fake_market(condition_id):
-                assert condition_id == "condition-a"
+                assert condition_id == "0xabababababababababababababababababababababababababababababababab"
                 return {
-                    "t": [{"t": "token-a"}],
+                    "t": [{"t": "123456789012345678901234567890"}],
                     "fd": {"r": 0.05, "e": 1},
                 }
 
