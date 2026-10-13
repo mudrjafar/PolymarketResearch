@@ -9,6 +9,12 @@ step(state, candidates, now) -> (new_state, events)
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
+if __package__:
+    from .protocol_identity import legacy_ctf_identity
+else:
+    # Direct script self-test: python scripts/focus_engine.py
+    from protocol_identity import legacy_ctf_identity
+
 
 STATE_VERSION = 3
 
@@ -167,8 +173,25 @@ def label(focus):
     return f"WAIT {progress}/{REQUIRED_EVIDENCE}{suffix}"
 
 
+def execution_protocol_eligible(candidate):
+    """Only frozen, matching Legacy CTF identity may occupy Execution Focus."""
+    if not isinstance(candidate, dict):
+        return False
+    return (
+        candidate.get("execution_protocol_eligible") is True
+        and legacy_ctf_identity(candidate)
+    )
+
+
 def _snapshot(candidate):
     return {
+        "asset_type": candidate.get("asset_type"),
+        "protocol_version": candidate.get("protocol_version"),
+        "exchange_address": candidate.get("exchange_address"),
+        "asset_id": candidate.get("asset_id"),
+        "ctf_token_id": candidate.get("ctf_token_id"),
+        "position_id": candidate.get("position_id"),
+        "execution_protocol_eligible": candidate.get("execution_protocol_eligible") is True,
         "token_id": _text(candidate.get("token_id")),
         "condition_id": _text(candidate.get("condition_id")),
         "outcome": _text(candidate.get("outcome")),
@@ -233,6 +256,9 @@ def _eligible(candidate, state):
         return False
 
     if candidate.get("risk_ok") is not True:
+        return False
+
+    if not execution_protocol_eligible(candidate):
         return False
 
     if not _text(candidate.get("evidence_id")):
@@ -432,6 +458,15 @@ def step(state, candidates, now=None):
     state.setdefault("cooldowns", {})
     state.setdefault("last_invalidated", None)
 
+    # Existing V3/ambiguous locks (including locks persisted by older code)
+    # are released without consuming evidence or letting a challenger take
+    # over this tick. Do not wait for timeout or two soft failures.
+    if isinstance(state.get("focus"), dict) and not execution_protocol_eligible(state["focus"]):
+        _invalidate(
+            state, state["focus"], ["EXECUTION_IDENTITY_UNVERIFIED"], now, events,
+        )
+        return state, events
+
     candidates = [
         candidate
         for candidate in (candidates or [])
@@ -550,6 +585,14 @@ def step(state, candidates, now=None):
         return state, events
 
     focus["absent_since"] = None
+
+    # A formerly verified token whose fresh provenance no longer matches
+    # Legacy CTF is a hard safety break regardless of blockchain cursor.
+    if not execution_protocol_eligible(current):
+        _invalidate(
+            state, focus, ["EXECUTION_IDENTITY_UNVERIFIED"], now, events,
+        )
+        return state, events
 
     codes = set(
         current.get("reason_codes")
@@ -806,8 +849,15 @@ def _candidate(
     codes=None,
 ):
     return {
+        "asset_type": "CTF_TOKEN",
+        "protocol_version": "LEGACY_CTF",
+        "exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
+        "asset_id": token,
+        "ctf_token_id": token,
+        "position_id": None,
+        "execution_protocol_eligible": True,
         "token_id": token,
-        "condition_id": f"condition-{token}",
+        "condition_id": "0x" + "ab" * 32,
         "outcome": "Yes",
         "question": f"Market {token}",
         "direction": "BUY",
@@ -852,7 +902,7 @@ def self_test():
         new_state(),
         [
             _candidate(
-                "A",
+                "101",
                 100,
                 1,
                 t0,
@@ -862,7 +912,7 @@ def self_test():
         t0,
     )
 
-    assert state["focus"]["token_id"] == "A"
+    assert state["focus"]["token_id"] == "101"
     assert label(state["focus"]) == "LOCKED"
     assert events[-1]["type"] == "LOCKED"
 
@@ -874,7 +924,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 100,
                 1,
                 t0,
@@ -894,7 +944,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 99,
                 99,
                 t0 - timedelta(seconds=10),
@@ -915,7 +965,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 101,
                 1,
                 t0 + timedelta(seconds=30),
@@ -936,7 +986,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 102,
                 1,
                 t0 + timedelta(seconds=60),
@@ -955,7 +1005,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 103,
                 1,
                 t0 + timedelta(seconds=120),
@@ -974,7 +1024,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 104,
                 1,
                 t0 + timedelta(seconds=180),
@@ -994,14 +1044,14 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 104,
                 1,
                 t0 + timedelta(seconds=180),
                 score=90,
             ),
             _candidate(
-                "B",
+                "102",
                 200,
                 1,
                 t0 + timedelta(seconds=180),
@@ -1011,8 +1061,8 @@ def self_test():
         t0 + timedelta(seconds=190),
     )
 
-    assert state["focus"]["token_id"] == "A"
-    assert state["challenger"]["token_id"] == "B"
+    assert state["focus"]["token_id"] == "101"
+    assert state["challenger"]["token_id"] == "102"
 
     # --------------------------------------------------------
     # 9. Mixed neutral + divergence = NEUTRAL
@@ -1023,7 +1073,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 105,
                 1,
                 t0 + timedelta(seconds=240),
@@ -1049,7 +1099,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 105,
                 1,
                 t0 + timedelta(seconds=240),
@@ -1070,7 +1120,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 106,
                 1,
                 t0 + timedelta(seconds=300),
@@ -1093,7 +1143,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 107,
                 1,
                 t0 + timedelta(seconds=360),
@@ -1113,7 +1163,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 108,
                 1,
                 t0 + timedelta(seconds=420),
@@ -1132,7 +1182,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 109,
                 1,
                 t0 + timedelta(seconds=480),
@@ -1142,7 +1192,7 @@ def self_test():
                 ],
             ),
             _candidate(
-                "B",
+                "102",
                 201,
                 1,
                 t0 + timedelta(seconds=480),
@@ -1154,7 +1204,7 @@ def self_test():
 
     assert state["focus"] is None
     assert events[-1]["type"] == "INVALIDATED"
-    assert "A" in state["cooldowns"]
+    assert "101" in state["cooldowns"]
 
     # B must NOT take over during same invalidation tick.
     assert state["focus"] is None
@@ -1167,7 +1217,7 @@ def self_test():
         state,
         [
             _candidate(
-                "B",
+                "102",
                 201,
                 1,
                 t0 + timedelta(seconds=480),
@@ -1177,7 +1227,7 @@ def self_test():
         t0 + timedelta(seconds=495),
     )
 
-    assert state["focus"]["token_id"] == "B"
+    assert state["focus"]["token_id"] == "102"
 
     # --------------------------------------------------------
     # 15. Hard block immediately invalidates.
@@ -1188,7 +1238,7 @@ def self_test():
         state,
         [
             _candidate(
-                "B",
+                "102",
                 201,
                 1,
                 t0 + timedelta(seconds=480),
@@ -1215,7 +1265,7 @@ def self_test():
         new_state(),
         [
             _candidate(
-                "C",
+                "103",
                 300,
                 1,
                 t0,
@@ -1228,7 +1278,7 @@ def self_test():
         timeout_state,
         [
             _candidate(
-                "C",
+                "103",
                 300,
                 1,
                 t0,
@@ -1251,7 +1301,7 @@ def self_test():
         timeout_state,
         [
             _candidate(
-                "C",
+                "103",
                 300,
                 1,
                 t0,
@@ -1266,7 +1316,7 @@ def self_test():
         timeout_state,
         [
             _candidate(
-                "C",
+                "103",
                 300,
                 1,
                 t0,
@@ -1289,7 +1339,7 @@ def self_test():
         {
             "version": 1,
             "focus": {
-                "token_id": "OLD"
+                "token_id": "104"
             },
         },
         [],
