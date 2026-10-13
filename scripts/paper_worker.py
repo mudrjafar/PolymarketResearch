@@ -10,6 +10,7 @@ submits a real order.
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -114,6 +115,12 @@ def _snapshot(path, now):
     return "OK", payload
 
 
+def _bound_snapshot_id(value):
+    # Cross-worker authority is a JSON string contract: never coerce a
+    # boolean, number, list or object into a seemingly matching identifier.
+    return isinstance(value, str) and bool(value) and value == value.strip()
+
+
 def read_execution_gate(now=None):
     now = now or datetime.now(timezone.utc)
     focus_status, focus_payload = _snapshot(FOCUS_FILE, now)
@@ -136,22 +143,25 @@ def read_execution_gate(now=None):
     if book_payload.get("book_ok") is not True:
         return "BOOK_BLOCK", focus_payload, book_payload
 
-    token_id = str(focus.get("token_id") or "").strip()
-    condition_id = str(focus.get("condition_id") or "").strip()
-    evidence_id = str(focus.get("last_evidence_id") or "").strip()
-    generation_id = str(focus_payload.get("source_generation_id") or "").strip()
-
-    if not all((token_id, condition_id, evidence_id, generation_id)):
-        return "FOCUS_BINDING_INCOMPLETE", focus_payload, book_payload
-
-    if str(book_payload.get("token_id") or "").strip() != token_id:
-        return "TOKEN_ID_MISMATCH", focus_payload, book_payload
-    if str(book_payload.get("condition_id") or "").strip() != condition_id:
-        return "CONDITION_ID_MISMATCH", focus_payload, book_payload
-    if str(book_payload.get("source_evidence_id") or "").strip() != evidence_id:
-        return "EVIDENCE_ID_MISMATCH", focus_payload, book_payload
-    if str(book_payload.get("source_generation_id") or "").strip() != generation_id:
-        return "GENERATION_ID_MISMATCH", focus_payload, book_payload
+    bindings = (
+        ("token_id", focus.get("token_id"), book_payload.get("token_id"),
+         "TOKEN_ID_MISMATCH"),
+        ("condition_id", focus.get("condition_id"), book_payload.get("condition_id"),
+         "CONDITION_ID_MISMATCH"),
+        ("source_evidence_id", focus.get("last_evidence_id"),
+         book_payload.get("source_evidence_id"), "EVIDENCE_ID_MISMATCH"),
+        ("source_generation_id", focus_payload.get("source_generation_id"),
+         book_payload.get("source_generation_id"), "GENERATION_ID_MISMATCH"),
+    )
+    for _field, focus_value, _book_value, _reason in bindings:
+        if not _bound_snapshot_id(focus_value):
+            return "FOCUS_BINDING_INCOMPLETE", focus_payload, book_payload
+    for _field, _focus_value, book_value, _reason in bindings:
+        if not _bound_snapshot_id(book_value):
+            return "BOOK_BINDING_INVALID", focus_payload, book_payload
+    for _field, focus_value, book_value, reason in bindings:
+        if focus_value != book_value:
+            return reason, focus_payload, book_payload
 
     return "READY_BOOK_PASS", focus_payload, book_payload
 
@@ -234,7 +244,10 @@ def _matches_open_request(request, focus_payload):
     }
 
     for field, value in expected.items():
-        if str(request.get(field) or "").strip() != str(value or "").strip():
+        requested = request.get(field)
+        if not _bound_snapshot_id(value) or not _bound_snapshot_id(requested):
+            return False, f"REQUEST_{field.upper()}_MISMATCH"
+        if requested != value:
             return False, f"REQUEST_{field.upper()}_MISMATCH"
 
     return True, "OK"
@@ -597,6 +610,12 @@ def _process_open(
     focus = focus_payload["focus"]
     token_id = str(focus["token_id"]).strip()
     condition_id = str(focus["condition_id"]).strip()
+
+    # Exchange V3 position conditions are bytes31. Paper settlement still
+    # supports ONLY legacy CTF bytes32 conditions; reject before RPC/CLOB.
+    # Do not reconstruct a V3 payout or reinterpret a position as a CTF token.
+    if re.fullmatch(r"0x[0-9a-fA-F]{62}", condition_id) is not None:
+        return _reject(request_id, now, "UNSUPPORTED_PROTOCOL_V2")
 
     for position in state["positions"]:
         if (
