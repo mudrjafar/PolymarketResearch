@@ -1126,6 +1126,26 @@ def persist_flow_states():
         print(f"[WARNING] Could not save flow state: {exc}")
 
 
+def consistent_protocol_identity(trades):
+    """Keep Collector provenance only when every trade for this token agrees.
+
+    Missing, malformed or conflicting fields remain UNKNOWN for downstream
+    execution gating; observation and existing Flow mathematics are unchanged.
+    """
+    fields = (
+        "asset_type", "protocol_version", "asset_id",
+        "ctf_token_id", "position_id", "exchange_address",
+    )
+    if not trades:
+        return {field: None for field in fields}
+    result = {}
+    for field in fields:
+        values = [trade.get(field) for trade in trades]
+        value = values[-1]
+        result[field] = value if all(item == value for item in values) else None
+    return result
+
+
 def save_flow_state(
     token_id,
     condition_id,
@@ -1161,6 +1181,13 @@ def save_flow_state(
         "evidence_at": state_data.get("last_confirmation_at"),
         "source_updated_at": updated_at,
         "market": market,
+        # Immutable-origin protocol binding for downstream research/execution.
+        "asset_type": market.get("asset_type"),
+        "protocol_version": market.get("protocol_version"),
+        "asset_id": market.get("asset_id"),
+        "ctf_token_id": market.get("ctf_token_id"),
+        "position_id": market.get("position_id"),
+        "exchange_address": market.get("exchange_address"),
         "flow_1m": flow_1m,
         "flow_5m": flow_5m,
         "flow_15m": flow_15m,
@@ -1410,6 +1437,8 @@ def main():
                 key=trade_order_key,
             )
 
+            protocol_identity = consistent_protocol_identity(market_trades)
+
             condition_id = str(latest_trade.get("condition_id"))
 
             question = latest_trade.get(
@@ -1604,6 +1633,7 @@ def main():
                     ),
                     "token_id": latest_trade.get("token_id"),
                     "market_id": latest_trade.get("market_id"),
+                    **protocol_identity,
                     "active": latest_trade.get("active"),
                     "closed": latest_trade.get("closed"),
                     "accepting_orders": latest_trade.get(
