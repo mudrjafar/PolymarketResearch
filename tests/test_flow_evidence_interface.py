@@ -40,8 +40,8 @@ from scripts.risk_engine import focus_candidate_result
 from scripts.focus_engine import label, new_state, step
 
 
-TOKEN_YES = "yes-token"
-TOKEN_NO = "no-token"
+TOKEN_YES = "111"
+TOKEN_NO = "112"
 
 EVIDENCE_FIELDS = ("evidence_id", "evidence_cursor", "evidence_at")
 
@@ -125,7 +125,7 @@ class Pipeline:
         uid = n + (500 if token == TOKEN_NO else 0)
         return {
             "collector_version": 4,
-            "condition_id": "same-condition",
+            "condition_id": "0xabababababababababababababababababababababababababababababababab",
             "token_id": token,
             "asset_type": "CTF_TOKEN",
             "protocol_version": "LEGACY_CTF",
@@ -204,7 +204,7 @@ def test_flow_state_contract_keys_and_types_are_frozen(pipeline):
     assert CONTRACT_KEYS <= set(entry)
     assert entry["schema_version"] == flow.FLOW_SCHEMA_VERSION == 4
     assert entry["token_id"] == TOKEN_YES
-    assert entry["condition_id"] == "same-condition"
+    assert entry["condition_id"] == "0xabababababababababababababababababababababababababababababababab"
     assert entry["outcome"] == "Yes"
 
     assert isinstance(entry["evidence_id"], str)
