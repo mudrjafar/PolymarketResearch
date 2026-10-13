@@ -24,6 +24,7 @@ sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import fresh, save_json_atomic
 from scripts import book_engine, book_worker, paper_engine, paper_settlement
+from scripts.protocol_identity import legacy_ctf_identity
 
 try:
     from scripts.learning_queue import enqueue_paper_open_snapshot
@@ -608,14 +609,24 @@ def _process_open(
         return _reject(request_id, now, reason)
 
     focus = focus_payload["focus"]
-    token_id = str(focus["token_id"]).strip()
-    condition_id = str(focus["condition_id"]).strip()
+    token_id = focus["token_id"]
+    condition_id = focus["condition_id"]
 
-    # Exchange V3 position conditions are bytes31. Paper settlement still
-    # supports ONLY legacy CTF bytes32 conditions; reject before RPC/CLOB.
-    # Do not reconstruct a V3 payout or reinterpret a position as a CTF token.
-    if re.fullmatch(r"0x[0-9a-fA-F]{62}", condition_id) is not None:
+    # Independent Paper OPEN trust boundary. V3 PositionIds must never be
+    # silently reinterpreted as Legacy CTF, even with forged bytes32
+    # condition IDs. Every negative result must occur before identity/RPC,
+    # CLOB, market fees and settlement lookups.
+    if (
+        focus.get("asset_type") == "POSITION"
+        or focus.get("protocol_version") == "V2"
+        or re.fullmatch(r"0x[0-9a-fA-F]{62}", condition_id) is not None
+    ):
         return _reject(request_id, now, "UNSUPPORTED_PROTOCOL_V2")
+    if (
+        focus.get("execution_protocol_eligible") is not True
+        or not legacy_ctf_identity(focus)
+    ):
+        return _reject(request_id, now, "EXECUTION_PROTOCOL_UNVERIFIED")
 
     for position in state["positions"]:
         if (
