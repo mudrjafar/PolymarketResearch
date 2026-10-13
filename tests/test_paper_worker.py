@@ -43,8 +43,15 @@ def write_gate(
 ):
     evidence = evidence or ("0x" + "ab" * 32 + ":7")
     focus = {
-        "token_id": "token-a",
-        "condition_id": "condition-a",
+        "token_id": "123456789012345678901234567890",
+        "condition_id": "0xabababababababababababababababababababababababababababababababab",
+        "asset_type": "CTF_TOKEN",
+        "protocol_version": "LEGACY_CTF",
+        "exchange_address": "0xE111180000d2663C0091e4f400237545B87B996B",
+        "asset_id": "123456789012345678901234567890",
+        "ctf_token_id": "123456789012345678901234567890",
+        "position_id": None,
+        "execution_protocol_eligible": True,
         "outcome": outcome,
         "question": "Market A",
         "direction": "BUY",
@@ -75,8 +82,8 @@ def write_gate(
             "reason_codes": [],
             "source_generation_id": generation,
             "source_evidence_id": evidence,
-            "token_id": "token-a",
-            "condition_id": "condition-a",
+            "token_id": "123456789012345678901234567890",
+            "condition_id": "0xabababababababababababababababababababababababababababababababab",
         },
     )
     return focus
@@ -84,8 +91,8 @@ def write_gate(
 
 def raw_book(*, bid="0.49", ask="0.50", bid_size="1000", ask_size="1000"):
     return {
-        "market": "condition-a",
-        "asset_id": "token-a",
+        "market": "0xabababababababababababababababababababababababababababababababab",
+        "asset_id": "123456789012345678901234567890",
         "timestamp": "123",
         "hash": "book-x",
         "bids": [{"price": bid, "size": bid_size}],
@@ -95,7 +102,7 @@ def raw_book(*, bid="0.49", ask="0.50", bid_size="1000", ask_size="1000"):
 
 def market_info():
     return {
-        "t": [{"t": "token-a"}],
+        "t": [{"t": "123456789012345678901234567890"}],
         "fd": {"r": 0.05, "e": 1},
     }
 
@@ -111,8 +118,8 @@ def write_open_request(paths, *, request_id="REQ-open", generation="GEN-X", evid
             "action": "OPEN",
             "amount_usd": 25,
             "chat_id": "123",
-            "token_id": "token-a",
-            "condition_id": "condition-a",
+            "token_id": "123456789012345678901234567890",
+            "condition_id": "0xabababababababababababababababababababababababababababababababab",
             "source_generation_id": generation,
             "source_evidence_id": evidence,
             "focus_locked_at": NOW.isoformat(),
@@ -255,8 +262,8 @@ def test_open_rejects_resolved_unknown_or_unavailable_settlement(
     assert len(rejected) == 1
     assert rejected[0]["reason_code"] == expected_reason
     assert len(checked) == 1
-    assert checked[0]["condition_id"] == "condition-a"
-    assert checked[0]["token_id"] == "token-a"
+    assert checked[0]["condition_id"] == "0xabababababababababababababababababababababababababababababababab"
+    assert checked[0]["token_id"] == "123456789012345678901234567890"
     assert checked[0]["outcome_index"] == 0
 
 
@@ -847,10 +854,10 @@ def test_v3_position_paper_open_blocks_before_network_or_legacy_ctf_identity(
 @pytest.mark.parametrize(("field", "malformed", "reason"), [
     ("asset_id", 123, "BOOK_ASSET_ID_INVALID_TYPE"),
     ("asset_id", True, "BOOK_ASSET_ID_INVALID_TYPE"),
-    ("asset_id", ["token-a"], "BOOK_ASSET_ID_INVALID_TYPE"),
+    ("asset_id", ["123456789012345678901234567890"], "BOOK_ASSET_ID_INVALID_TYPE"),
     ("market", 123, "BOOK_MARKET_ID_INVALID_TYPE"),
     ("market", False, "BOOK_MARKET_ID_INVALID_TYPE"),
-    ("market", {"id": "condition-a"}, "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", {"id": "0xabababababababababababababababababababababababababababababababab"}, "BOOK_MARKET_ID_INVALID_TYPE"),
 ])
 def test_open_rejects_nonstring_latest_clob_identity_before_fees(
     monkeypatch, tmp_path, field, malformed, reason
@@ -879,7 +886,7 @@ def test_open_rejects_nonstring_latest_clob_identity_before_fees(
     ("asset_id", 123, "BOOK_ASSET_ID_INVALID_TYPE"),
     ("asset_id", True, "BOOK_ASSET_ID_INVALID_TYPE"),
     ("market", 123, "BOOK_MARKET_ID_INVALID_TYPE"),
-    ("market", ["condition-a"], "BOOK_MARKET_ID_INVALID_TYPE"),
+    ("market", ["0xabababababababababababababababababababababababababababababababab"], "BOOK_MARKET_ID_INVALID_TYPE"),
 ])
 def test_close_and_mark_reject_nonstring_clob_identity_and_keep_open(
     monkeypatch, tmp_path, field, malformed, reason
@@ -912,7 +919,7 @@ def test_close_and_mark_reject_nonstring_clob_identity_and_keep_open(
 
 
 @pytest.mark.parametrize(("field", "value"), [
-    ("token_id", 123), ("token_id", True), ("token_id", ["token-a"]),
+    ("token_id", 123), ("token_id", True), ("token_id", ["123456789012345678901234567890"]),
     ("condition_id", 123), ("condition_id", False),
     ("source_evidence_id", 7), ("source_evidence_id", True),
     ("source_generation_id", 44), ("source_generation_id", False),
@@ -951,7 +958,7 @@ def test_snapshot_gate_never_coerces_nonstring_id(
     assert events[0]["reason_code"] == gate
 
 
-@pytest.mark.parametrize("bad", [None, "", "  ", " token-a ", 5, False, []])
+@pytest.mark.parametrize("bad", [None, "", "  ", " 123456789012345678901234567890 ", 5, False, []])
 def test_open_request_identity_never_coerces_even_when_gate_valid(
     monkeypatch, tmp_path, bad
 ):
