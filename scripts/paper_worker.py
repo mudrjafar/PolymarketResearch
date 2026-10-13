@@ -24,6 +24,7 @@ sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import fresh, save_json_atomic
 from scripts import book_engine, book_worker, paper_engine, paper_settlement
+from scripts.protocol_identity import legacy_ctf_identity
 
 try:
     from scripts.learning_queue import enqueue_paper_open_snapshot
@@ -616,6 +617,12 @@ def _process_open(
     # Do not reconstruct a V3 payout or reinterpret a position as a CTF token.
     if re.fullmatch(r"0x[0-9a-fA-F]{62}", condition_id) is not None:
         return _reject(request_id, now, "UNSUPPORTED_PROTOCOL_V2")
+
+    # Paper independently validates execution protocol before any external
+    # identity, book, fee, or settlement lookup. Focus READY alone is not
+    # an authority to reinterpret a V3 PositionId as a legacy CTF token.
+    if not legacy_ctf_identity(focus) or focus.get("execution_protocol_eligible") is not True:
+        return _reject(request_id, now, "EXECUTION_PROTOCOL_UNSUPPORTED")
 
     for position in state["positions"]:
         if (
