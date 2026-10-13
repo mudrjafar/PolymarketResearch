@@ -857,7 +857,7 @@ def _candidate(
         "position_id": None,
         "execution_protocol_eligible": True,
         "token_id": token,
-        "condition_id": f"condition-{token}",
+        "condition_id": "0x" + "ab" * 32,
         "outcome": "Yes",
         "question": f"Market {token}",
         "direction": "BUY",
@@ -902,7 +902,7 @@ def self_test():
         new_state(),
         [
             _candidate(
-                "A",
+                "101",
                 100,
                 1,
                 t0,
@@ -912,7 +912,7 @@ def self_test():
         t0,
     )
 
-    assert state["focus"]["token_id"] == "A"
+    assert state["focus"]["token_id"] == "101"
     assert label(state["focus"]) == "LOCKED"
     assert events[-1]["type"] == "LOCKED"
 
@@ -924,7 +924,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 100,
                 1,
                 t0,
@@ -944,7 +944,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 99,
                 99,
                 t0 - timedelta(seconds=10),
@@ -965,7 +965,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 101,
                 1,
                 t0 + timedelta(seconds=30),
@@ -986,7 +986,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 102,
                 1,
                 t0 + timedelta(seconds=60),
@@ -1005,7 +1005,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 103,
                 1,
                 t0 + timedelta(seconds=120),
@@ -1024,7 +1024,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 104,
                 1,
                 t0 + timedelta(seconds=180),
@@ -1044,14 +1044,14 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 104,
                 1,
                 t0 + timedelta(seconds=180),
                 score=90,
             ),
             _candidate(
-                "B",
+                "102",
                 200,
                 1,
                 t0 + timedelta(seconds=180),
@@ -1061,8 +1061,8 @@ def self_test():
         t0 + timedelta(seconds=190),
     )
 
-    assert state["focus"]["token_id"] == "A"
-    assert state["challenger"]["token_id"] == "B"
+    assert state["focus"]["token_id"] == "101"
+    assert state["challenger"]["token_id"] == "102"
 
     # --------------------------------------------------------
     # 9. Mixed neutral + divergence = NEUTRAL
@@ -1073,7 +1073,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 105,
                 1,
                 t0 + timedelta(seconds=240),
@@ -1099,7 +1099,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 105,
                 1,
                 t0 + timedelta(seconds=240),
@@ -1120,7 +1120,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 106,
                 1,
                 t0 + timedelta(seconds=300),
@@ -1143,7 +1143,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 107,
                 1,
                 t0 + timedelta(seconds=360),
@@ -1163,7 +1163,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 108,
                 1,
                 t0 + timedelta(seconds=420),
@@ -1182,7 +1182,7 @@ def self_test():
         state,
         [
             _candidate(
-                "A",
+                "101",
                 109,
                 1,
                 t0 + timedelta(seconds=480),
@@ -1192,7 +1192,7 @@ def self_test():
                 ],
             ),
             _candidate(
-                "B",
+                "102",
                 201,
                 1,
                 t0 + timedelta(seconds=480),
@@ -1204,7 +1204,7 @@ def self_test():
 
     assert state["focus"] is None
     assert events[-1]["type"] == "INVALIDATED"
-    assert "A" in state["cooldowns"]
+    assert "101" in state["cooldowns"]
 
     # B must NOT take over during same invalidation tick.
     assert state["focus"] is None
@@ -1217,7 +1217,7 @@ def self_test():
         state,
         [
             _candidate(
-                "B",
+                "102",
                 201,
                 1,
                 t0 + timedelta(seconds=480),
@@ -1227,7 +1227,7 @@ def self_test():
         t0 + timedelta(seconds=495),
     )
 
-    assert state["focus"]["token_id"] == "B"
+    assert state["focus"]["token_id"] == "102"
 
     # --------------------------------------------------------
     # 15. Hard block immediately invalidates.
@@ -1238,7 +1238,7 @@ def self_test():
         state,
         [
             _candidate(
-                "B",
+                "102",
                 201,
                 1,
                 t0 + timedelta(seconds=480),
@@ -1265,7 +1265,7 @@ def self_test():
         new_state(),
         [
             _candidate(
-                "C",
+                "103",
                 300,
                 1,
                 t0,
@@ -1278,7 +1278,7 @@ def self_test():
         timeout_state,
         [
             _candidate(
-                "C",
+                "103",
                 300,
                 1,
                 t0,
@@ -1301,7 +1301,7 @@ def self_test():
         timeout_state,
         [
             _candidate(
-                "C",
+                "103",
                 300,
                 1,
                 t0,
@@ -1316,7 +1316,7 @@ def self_test():
         timeout_state,
         [
             _candidate(
-                "C",
+                "103",
                 300,
                 1,
                 t0,
@@ -1339,7 +1339,7 @@ def self_test():
         {
             "version": 1,
             "focus": {
-                "token_id": "OLD"
+                "token_id": "104"
             },
         },
         [],
