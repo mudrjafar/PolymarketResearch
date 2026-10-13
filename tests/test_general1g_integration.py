@@ -7,7 +7,7 @@ import pytest
 
 from machine_common import save_json_atomic
 from scripts import paper_worker
-from tests.test_paper_worker import configure, write_gate, write_open_request
+from test_paper_worker import configure, write_gate, write_open_request
 
 
 NOW = datetime.now(timezone.utc)
