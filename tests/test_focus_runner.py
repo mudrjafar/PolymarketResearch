@@ -240,3 +240,93 @@ def test_runner_releases_old_ambiguous_lock_even_without_risk(monkeypatch, tmp_p
     assert state["focus"] is None
     assert [e["type"] for e in events] == ["INVALIDATED"]
     assert read_json(paths["view"])["input_status"] == "MISSING"
+
+
+
+@pytest.mark.parametrize("failure_mode", ["MISSING", "STALE", "CORRUPT"])
+def test_old_v3_focus_invalidates_with_original_generation_and_learning_once(
+    monkeypatch, tmp_path, failure_mode
+):
+    paths = configure_paths(monkeypatch, tmp_path)
+    enqueue = []
+    monkeypatch.setattr(runner, "_LEARNING_INIT_ERROR", None, raising=False)
+    monkeypatch.setattr(
+        runner, "enqueue_focus_event",
+        lambda event, *, data_dir, strategy_versions: enqueue.append(
+            (dict(event), dict(strategy_versions))
+        ),
+    )
+    original_risk = risk_payload("GEN-ORIGINAL", [candidate("101", 100, 1, NOW)])
+    original_risk["strategy_versions"] = {"git_commit_sha": "a" * 40}
+    save_json_atomic(paths["risk"], original_risk)
+    locked, events, status = runner.run_once(now=NOW)
+    assert locked["focus"]["token_id"] == "101"
+    assert status == "OK"
+    assert len(enqueue) == 1
+    assert read_json(paths["state"])["last_source_generation_id"] == "GEN-ORIGINAL"
+
+    wrapper = read_json(paths["state"])
+    wrapper["engine_state"]["focus"].update(
+        asset_type="POSITION", protocol_version="V2",
+        position_id="101", ctf_token_id=None,
+        execution_protocol_eligible=False,
+    )
+    save_json_atomic(paths["state"], wrapper)
+    later = NOW + timedelta(seconds=30)
+    if failure_mode == "MISSING":
+        paths["risk"].unlink()
+    elif failure_mode == "CORRUPT":
+        paths["risk"].write_text("{bad-json", encoding="utf-8")
+    else:
+        stale = risk_payload(
+            "GEN-CHANGED", [candidate("102", 101, 1, NOW)],
+            generated_at=NOW - timedelta(minutes=10),
+        )
+        stale["strategy_versions"] = {"git_commit_sha": "b" * 40}
+        save_json_atomic(paths["risk"], stale)
+
+    new_state, events, status = runner.run_once(now=later)
+    assert status == failure_mode
+    assert new_state["focus"] is None
+    assert new_state["challenger"] is None
+    assert [e["type"] for e in events] == ["INVALIDATED"]
+    assert read_json(paths["state"])["last_source_generation_id"] == "GEN-ORIGINAL"
+    event = json.loads(paths["events"].read_text(encoding="utf-8").splitlines()[-1])
+    assert event["source_generation_id"] == "GEN-ORIGINAL"
+    assert len(enqueue) == 2
+    assert enqueue[-1][0]["source_generation_id"] == "GEN-ORIGINAL"
+    assert enqueue[-1][1]["git_commit_sha"] == "a" * 40
+
+    # Restart against the still missing/stale/corrupt Risk input.
+    new_state, second_events, status = runner.run_once(now=later + timedelta(seconds=3))
+    assert status == failure_mode
+    assert new_state["focus"] is None
+    assert second_events == []
+    assert len(enqueue) == 2
+
+
+def test_pre_metadata_focus_releases_without_inventing_learning_provenance(
+    monkeypatch, tmp_path
+):
+    paths = configure_paths(monkeypatch, tmp_path)
+    emitted = []
+    monkeypatch.setattr(runner, "_LEARNING_INIT_ERROR", None, raising=False)
+    monkeypatch.setattr(
+        runner, "enqueue_focus_event",
+        lambda event, *, data_dir, strategy_versions: emitted.append(event),
+    )
+    save_json_atomic(paths["risk"], risk_payload(
+        "LEGACY-GEN", [candidate("101", 100, 1, NOW)]
+    ))
+    runner.run_once(now=NOW)
+    wrapper = read_json(paths["state"])
+    for key in ("last_strategy_versions", "last_source_generated_at"):
+        wrapper.pop(key, None)
+    wrapper["engine_state"]["focus"].pop("asset_type")
+    save_json_atomic(paths["state"], wrapper)
+    paths["risk"].unlink()
+    state, events, status = runner.run_once(now=NOW + timedelta(seconds=10))
+    assert state["focus"] is None
+    assert events[0]["learning_projection_status"] == "UNAVAILABLE_PROVENANCE"
+    assert read_json(paths["state"])["last_source_generation_id"] == "LEGACY-GEN"
+    assert len(emitted) == 0
