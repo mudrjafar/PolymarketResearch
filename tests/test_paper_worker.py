@@ -908,3 +908,73 @@ def test_close_and_mark_reject_nonstring_clob_identity_and_keep_open(
     assert state["positions"][0]["status"] == "OPEN"
     assert state["positions"][0]["mark_status"] == reason
     assert state["positions"][0]["mark"] is None or state["positions"][0]["mark_status"] != "OK"
+
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("token_id", 123), ("token_id", True), ("token_id", ["token-a"]),
+    ("condition_id", 123), ("condition_id", False),
+    ("source_evidence_id", 7), ("source_evidence_id", True),
+    ("source_generation_id", 44), ("source_generation_id", False),
+])
+@pytest.mark.parametrize("side", ["focus", "book", "both"])
+def test_snapshot_gate_never_coerces_nonstring_id(
+    monkeypatch, tmp_path, field, value, side
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    focus_payload = json.loads(paths["focus"].read_text(encoding="utf-8"))
+    book_payload = json.loads(paths["book"].read_text(encoding="utf-8"))
+    focus_key = {
+        "source_evidence_id": "last_evidence_id",
+        "source_generation_id": "source_generation_id",
+    }.get(field, field)
+    if side in ("focus", "both"):
+        target = focus_payload if field == "source_generation_id" else focus_payload["focus"]
+        target[focus_key] = value
+    if side in ("book", "both"):
+        book_payload[field] = value
+    save_json_atomic(paths["focus"], focus_payload)
+    save_json_atomic(paths["book"], book_payload)
+    gate, _, _ = paper_worker.read_execution_gate(now=NOW)
+    assert gate == ("FOCUS_BINDING_INCOMPLETE" if side != "book" else "BOOK_BINDING_INVALID")
+    write_open_request(paths)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Malformed authority must not reach any remote lookup")
+    state, events = paper_worker.run_once(
+        now=NOW, book_loader=forbidden, market_info_loader=forbidden,
+        identity_loader=forbidden, settlement_checker=forbidden,
+    )
+    assert state["positions"] == []
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == gate
+
+
+@pytest.mark.parametrize("bad", [None, "", "  ", " token-a ", 5, False, []])
+def test_open_request_identity_never_coerces_even_when_gate_valid(
+    monkeypatch, tmp_path, bad
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    request_path = paths["requests"] / "REQ-open.json"
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    request["token_id"] = bad
+    save_json_atomic(request_path, request)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Malformed request must reject before external lookup")
+    state, events = paper_worker.run_once(
+        now=NOW, book_loader=forbidden, market_info_loader=forbidden,
+        identity_loader=forbidden, settlement_checker=forbidden,
+    )
+    assert state["positions"] == []
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == "REQUEST_TOKEN_ID_MISMATCH"
+
+
+def test_valid_legacy_string_binding_still_passes_paper_snapshot_gate(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    assert paper_worker.read_execution_gate(now=NOW)[0] == "READY_BOOK_PASS"
