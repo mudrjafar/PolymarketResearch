@@ -93,13 +93,28 @@ def read_risk_snapshot(now=None):
     return "OK", payload
 
 
-def _state_wrapper(state, source_generation_id, now):
+def _state_wrapper(
+    state, source_generation_id, now, *,
+    source_generated_at=None, strategy_versions=None,
+):
     return {
         "schema_version": RUNNER_SCHEMA_VERSION,
         "updated_at": now.isoformat(),
         "last_source_generation_id": source_generation_id,
+        "last_source_generated_at": source_generated_at,
+        "last_strategy_versions": (
+            dict(strategy_versions) if isinstance(strategy_versions, dict) else None
+        ),
         "engine_state": state,
     }
+
+
+def _stored_provenance():
+    # Caller has already checked durable Focus state via load_engine_state().
+    if not STATE_FILE.exists():
+        return {}
+    previous = _read_json(STATE_FILE)
+    return previous if isinstance(previous, dict) else {}
 
 
 def _view(state, input_status, payload, now):
@@ -254,6 +269,7 @@ def run_once(now=None):
         raise ValueError("now must be timezone-aware")
 
     state = load_engine_state()
+    previous_provenance = _stored_provenance()
     input_status, payload = read_risk_snapshot(now=now)
 
     # Input failure is not a valid empty Risk generation. Preserve
@@ -264,8 +280,42 @@ def run_once(now=None):
         if isinstance(active, dict) and not focus_engine.execution_protocol_eligible(active):
             state, events = focus_engine.step(state, [], now=now)
             if events:
-                save_json_atomic(STATE_FILE, _state_wrapper(state, None, now))
-                _append_events(events, None)
+                # This is an invalidation of the *previous* Focus authority,
+                # not a newly accepted Risk generation. Never write None over
+                # its known lineage merely because today's Risk file failed.
+                generation = previous_provenance.get("last_source_generation_id")
+                if not isinstance(generation, str) or not generation.strip():
+                    generation = None
+                original_generated_at = previous_provenance.get("last_source_generated_at")
+                versions = previous_provenance.get("last_strategy_versions")
+                # Old durable wrappers may predate cached provenance. Only a
+                # stale but structurally bound Risk snapshot may recover it.
+                if isinstance(payload, dict) and payload.get("source_generation_id") == generation:
+                    if not isinstance(versions, dict):
+                        versions = payload.get("strategy_versions")
+                    if not original_generated_at:
+                        original_generated_at = payload.get("source_generated_at")
+                learning_possible = bool(generation) and isinstance(versions, dict)
+                if not learning_possible:
+                    for event in events:
+                        event["learning_projection_status"] = "UNAVAILABLE_PROVENANCE"
+                    if isinstance(state.get("last_invalidated"), dict):
+                        state["last_invalidated"]["learning_projection_status"] = "UNAVAILABLE_PROVENANCE"
+                save_json_atomic(
+                    STATE_FILE, _state_wrapper(
+                        state, generation, now,
+                        source_generated_at=original_generated_at,
+                        strategy_versions=versions,
+                    ),
+                )
+                _append_events(events, generation)
+                if learning_possible:
+                    _publish_learning_events(
+                        events, state,
+                        {"source_generation_id": generation,
+                         "source_generated_at": original_generated_at,
+                         "strategy_versions": versions, "results": []},
+                    )
             save_json_atomic(FOCUS_FILE, _view(state, input_status, payload, now))
             return state, events, input_status
         save_json_atomic(FOCUS_FILE, _view(state, input_status, payload, now))
@@ -284,7 +334,11 @@ def run_once(now=None):
     # downstream projections of the already-committed state transition.
     save_json_atomic(
         STATE_FILE,
-        _state_wrapper(new_state, generation_id, now),
+        _state_wrapper(
+            new_state, generation_id, now,
+            source_generated_at=payload.get("source_generated_at"),
+            strategy_versions=payload.get("strategy_versions"),
+        ),
     )
     _append_events(events, generation_id)
     _publish_learning_events(events, new_state, payload)
