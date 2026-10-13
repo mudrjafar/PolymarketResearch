@@ -31,7 +31,7 @@ def _flow_to_focus(monkeypatch, token, kind):
     monkeypatch.setattr(flow, "flow_states", {})
     identity = _identity(token, kind)
     flow.save_flow_state(
-        token_id=token, condition_id="condition-" + token,
+        token_id=token, condition_id="0x" + "ab" * 32,
         market={"token_id": token, "outcome": "Yes", "question": "Fixture",
                 "last_trade_at": NOW.isoformat(), "price": 0.42,
                 "active": True, "closed": False, "accepting_orders": True,
@@ -66,11 +66,11 @@ def _flow_to_focus(monkeypatch, token, kind):
 
 @pytest.mark.parametrize("kind", ["LEGACY", "POSITION"])
 def test_protocol_identity_reaches_focus_without_reconstructing_it(monkeypatch, kind):
-    row = _flow_to_focus(monkeypatch, "token-a", kind)
+    row = _flow_to_focus(monkeypatch, "108", kind)
     assert row["execution_protocol_eligible"] is (kind == "LEGACY")
     state, events = focus_engine.step(focus_engine.new_state(), [row], NOW)
     if kind == "LEGACY":
-        assert state["focus"]["token_id"] == "token-a"
+        assert state["focus"]["token_id"] == "108"
         assert events[-1]["type"] == "LOCKED"
     else:
         assert state["focus"] is None
@@ -78,15 +78,15 @@ def test_protocol_identity_reaches_focus_without_reconstructing_it(monkeypatch, 
 
 
 def test_v3_before_legacy_preserves_ranking_but_only_legacy_locks(monkeypatch):
-    v3 = _flow_to_focus(monkeypatch, "v3-token", "POSITION")
-    legacy = _flow_to_focus(monkeypatch, "ctf-token", "LEGACY")
+    v3 = _flow_to_focus(monkeypatch, "110", "POSITION")
+    legacy = _flow_to_focus(monkeypatch, "109", "LEGACY")
     state, events = focus_engine.step(focus_engine.new_state(), [v3, legacy], NOW)
-    assert state["focus"]["token_id"] == "ctf-token"
+    assert state["focus"]["token_id"] == "109"
     assert events[-1]["type"] == "LOCKED"
 
 
 def test_flow_conflicting_trade_provenance_is_explicitly_unknown():
-    token = "token-a"
+    token = "108"
     a = {"token_id": token, **_identity(token, "LEGACY")}
     b = {"token_id": token, **_identity(token, "POSITION")}
     result = flow.consistent_protocol_identity([a, b])
@@ -96,10 +96,10 @@ def test_flow_conflicting_trade_provenance_is_explicitly_unknown():
 
 
 def test_diamond_disagreement_with_flow_market_cannot_create_execution_eligibility(monkeypatch):
-    row = _flow_to_focus(monkeypatch, "ctf", "LEGACY")
+    row = _flow_to_focus(monkeypatch, "113", "LEGACY")
     assert row["execution_protocol_eligible"] is True
 
-    token = "ctf"
+    token = "113"
     original = flow.flow_states[token]
     mismatched = dict(original)
     mismatched["asset_type"] = "POSITION"
