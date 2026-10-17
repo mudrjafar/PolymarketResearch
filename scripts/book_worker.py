@@ -241,9 +241,11 @@ def self_test():
             FOCUS_FILE = DATA_DIR / "focused_market.json"
             BOOK_FILE = DATA_DIR / "book_assessment.json"
 
+            self_test_token_id = "123"
+            self_test_condition_id = "0x" + "aa" * 32
             focus = {
-                "token_id": "token-a",
-                "condition_id": "condition-a",
+                "token_id": self_test_token_id,
+                "condition_id": self_test_condition_id,
                 "outcome": "Yes",
                 "question": "Market A",
                 "direction": "BUY",
@@ -265,10 +267,10 @@ def self_test():
             )
 
             def fake_loader(token_id):
-                assert token_id == "token-a"
+                assert token_id == self_test_token_id
                 return {
-                    "market": "condition-a",
-                    "asset_id": "token-a",
+                    "market": self_test_condition_id,
+                    "asset_id": self_test_token_id,
                     "timestamp": "1",
                     "hash": "abc",
                     "bids": [{"price": "0.49", "size": "1000"}],
@@ -285,7 +287,7 @@ def self_test():
             result = run_once(now=now, book_loader=fake_loader)
             assert result["status"] == "OK"
             assert result["book_ok"] is True
-            assert result["token_id"] == "token-a"
+            assert result["token_id"] == self_test_token_id
             assert len(result["quotes"]) == 3
             assert BOOK_FILE.exists()
 

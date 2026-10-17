@@ -24,6 +24,8 @@ from scripts.v3_identity import (
     condition_matches_position,
     decode_position_id,
     expected_outcome_label,
+    runtime_position_market_entries,
+    ACTIVE_GAMMA_PAGE_CAP,
 )
 
 RPC_URL = os.getenv("POLYMARKET_RPC_URL", "").strip()
@@ -173,7 +175,7 @@ def get_active_markets():
     after_cursor=None
 
     try:
-        for _page in range(100):
+        for _page in range(ACTIVE_GAMMA_PAGE_CAP):
             params={
                 "limit": MARKET_LIMIT,
                 "active": True,
@@ -470,19 +472,6 @@ def build_token_map(markets):
     return token_map
 
 
-def _complete_legacy_token_pair(token_ids, outcomes):
-    if len(token_ids) != 2 or len(outcomes) != 2:
-        return False
-    labels = [str(value or "").strip().casefold() for value in outcomes]
-    if labels != ["yes", "no"]:
-        return False
-    return all(
-        str(value or "").strip().isascii()
-        and str(value or "").strip().isdecimal()
-        for value in token_ids
-    )
-
-
 def _position_market_entries(market):
     """Return eligible V3 binary/NegRisk outcome entries, otherwise none.
 
@@ -490,69 +479,7 @@ def _position_market_entries(market):
     treated as legacy CTF even if Gamma also exposes positionIds (e.g. combo
     metadata). That prevents position IDs from silently replacing CTF assets.
     """
-    if not isinstance(market, dict):
-        return []
-
-    token_ids=parse_json_field(market.get("clobTokenIds"), [])
-    position_ids=parse_json_field(market.get("positionIds"), [])
-    outcomes=parse_json_field(market.get("outcomes"), [])
-    prices=parse_json_field(market.get("outcomePrices"), [])
-
-    if _complete_legacy_token_pair(token_ids, outcomes):
-        return []
-    if len(position_ids) != 2 or len(outcomes) != 2:
-        return []
-
-    labels=[str(value or "").strip() for value in outcomes]
-    if [value.casefold() for value in labels] != ["yes", "no"]:
-        return []
-
-    entries=[]
-    for i, raw_position in enumerate(position_ids):
-        try:
-            position=decode_position_id(raw_position)
-        except V3IdentityError:
-            return []
-
-        if position["classification"] != "SUPPORTED":
-            return []
-        if position["outcome_index"] != i:
-            return []
-        if labels[i].casefold() != expected_outcome_label(position["outcome_index"]):
-            return []
-        if not condition_matches_position(
-            market.get("conditionId"),
-            position["condition_id"],
-        ):
-            return []
-
-        entries.append((
-            position["position_id"],
-            {
-                "market_id": market.get("id"),
-                "condition_id": position["condition_id"],
-                "question": market.get("question"),
-                "outcome": labels[i],
-                "price": prices[i] if i < len(prices) else None,
-                "volume24hr": market.get("volume24hr"),
-                "volume": market.get("volume"),
-                "end_date": market.get("endDate"),
-                "start_date": market.get("startDate"),
-                "closed": market.get("closed"),
-                "active": market.get("active"),
-                "accepting_orders": market.get("acceptingOrders"),
-                "asset_type": "POSITION",
-                "position_id": position["position_id"],
-                "protocol_version": "V2",
-                "position_module": position["module"],
-                "position_module_id": position["module_id"],
-                "position_condition_index": position["condition_index"],
-                "position_outcome_index": position["outcome_index"],
-                "position_arity": position["arity"],
-            },
-        ))
-
-    return entries
+    return runtime_position_market_entries(market)
 
 
 def build_position_map(markets):

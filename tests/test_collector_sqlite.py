@@ -919,7 +919,7 @@ def v3_position(module_id=1, *, arity=0, condition_index=0, outcome_index=0,
         (module_id << 248)
         | (123 << 120)
         | (arity << 104)
-        | (7 << 40)
+        | (0 << 40)
         | (resolution_chain << 24)
         | (condition_index << 8)
         | outcome_index

@@ -314,6 +314,8 @@ def assess(row, flow_state, now=None):
         "question": row.get("question"),
         "condition_id": condition_id,
         "token_id": token_id,
+        "asset_type": row.get("asset_type", "CTF_TOKEN"),
+        "protocol_version": row.get("protocol_version", "LEGACY_CTF"),
         "outcome": outcome,
         "direction": direction,
         "price": price,

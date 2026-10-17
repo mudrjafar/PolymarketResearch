@@ -248,6 +248,22 @@ SETTLEMENT_IDENTITY_FIELDS = (
     "position_collateral",
     "outcome_index",
 )
+V2_SETTLEMENT_IDENTITY_FIELDS = (
+    "settlement_protocol",
+    "settlement_family",
+    "settlement_contract",
+    "position_collateral",
+    "outcome_index",
+    "position_module_id",
+)
+
+
+def _settlement_fields_for_protocol(protocol):
+    if protocol == paper_settlement.PROTOCOL_LEGACY_CTF:
+        return SETTLEMENT_IDENTITY_FIELDS
+    if protocol == paper_settlement.PROTOCOL_V2_POSITION:
+        return V2_SETTLEMENT_IDENTITY_FIELDS
+    return None
 
 
 def _paper_event(event_type, now, **extra):
@@ -263,22 +279,23 @@ def _paper_event(event_type, now, **extra):
 def _apply_settlement_identity(position, identity):
     if not isinstance(identity, dict):
         raise paper_settlement.SettlementIdentityError("IDENTITY_PAYLOAD_INVALID")
-    for field in SETTLEMENT_IDENTITY_FIELDS:
+    fields = _settlement_fields_for_protocol(identity.get("settlement_protocol"))
+    if fields is None:
+        raise paper_settlement.SettlementIdentityError("IDENTITY_PROTOCOL_UNSUPPORTED")
+    for field in fields:
         if field not in identity or identity.get(field) is None:
             raise paper_settlement.SettlementIdentityError(
                 f"IDENTITY_{field.upper()}_MISSING"
             )
-    for field in SETTLEMENT_IDENTITY_FIELDS:
+    for field in fields:
         position[field] = identity[field]
 
 
 def _ensure_settlement_identity(position, identity_loader):
-    if all(position.get(field) is not None for field in SETTLEMENT_IDENTITY_FIELDS):
+    fields = _settlement_fields_for_protocol(position.get("settlement_protocol"))
+    if fields and all(position.get(field) is not None for field in fields):
         try:
-            paper_settlement.validate_outcome_identity(
-                position.get("outcome"),
-                position.get("outcome_index"),
-            )
+            paper_settlement._frozen_identity(position)
             return True, None, None
         except paper_settlement.SettlementIdentityError as exc:
             return False, paper_settlement.IDENTITY_MISMATCH, str(exc)
@@ -287,16 +304,15 @@ def _ensure_settlement_identity(position, identity_loader):
         identity = identity_loader(
             position.get("condition_id"),
             position.get("token_id"),
+            asset_type=position.get("asset_type", "CTF_TOKEN"),
+            protocol_version=position.get("protocol_version", "LEGACY_CTF"),
         )
         paper_settlement.validate_outcome_identity(
             position.get("outcome"),
             identity.get("outcome_index"),
         )
         _apply_settlement_identity(position, identity)
-        paper_settlement.validate_outcome_identity(
-            position.get("outcome"),
-            position.get("outcome_index"),
-        )
+        paper_settlement._frozen_identity(position)
         return True, None, None
     except paper_settlement.SettlementIdentityError as exc:
         return False, paper_settlement.IDENTITY_MISMATCH, str(exc)
@@ -431,10 +447,12 @@ def _position_mark(position, raw_book, now):
         raw_book,
         position.get("token_id"),
         position.get("condition_id"),
+        asset_type=position.get("asset_type", "CTF_TOKEN"),
+        protocol_version=position.get("protocol_version", "LEGACY_CTF"),
     )
     if not ok:
-        position["mark_status"] = reason
-        position["mark_checked_at"] = now.isoformat()
+        # Keep the existing position and mark untouched when this freshly
+        # loaded book does not prove the asset/condition it belongs to.
         return
 
     try:
@@ -606,7 +624,14 @@ def _process_open(
             return _reject(request_id, now, "POSITION_ALREADY_OPEN")
 
     try:
-        settlement_identity = identity_loader(condition_id, token_id)
+        asset_type = focus.get("asset_type", "CTF_TOKEN")
+        protocol_version = focus.get("protocol_version", "LEGACY_CTF")
+        settlement_identity = identity_loader(
+            condition_id,
+            token_id,
+            asset_type=asset_type,
+            protocol_version=protocol_version,
+        )
         paper_settlement.validate_outcome_identity(
             focus.get("outcome"),
             settlement_identity.get("outcome_index"),
@@ -614,9 +639,12 @@ def _process_open(
         identity_probe = {
             "condition_id": condition_id,
             "token_id": token_id,
+            "asset_type": asset_type,
+            "protocol_version": protocol_version,
             "outcome": focus.get("outcome"),
         }
         _apply_settlement_identity(identity_probe, settlement_identity)
+        paper_settlement._frozen_identity(identity_probe)
     except paper_settlement.SettlementIdentityError as exc:
         return _reject(
             request_id,
@@ -717,6 +745,8 @@ def _process_open(
         "chat_id": str(request.get("chat_id") or ""),
         "token_id": token_id,
         "condition_id": condition_id,
+        "asset_type": asset_type,
+        "protocol_version": protocol_version,
         "outcome": focus.get("outcome"),
         "question": focus.get("question"),
         "direction": "BUY",
@@ -802,6 +832,8 @@ def _process_close(state, request_id, request, now, book_loader):
         raw_book,
         token_id,
         position.get("condition_id"),
+        asset_type=position.get("asset_type", "CTF_TOKEN"),
+        protocol_version=position.get("protocol_version", "LEGACY_CTF"),
     )
     if not ok:
         return _reject(request_id, now, reason)
@@ -1022,10 +1054,12 @@ def self_test():
             EVENTS_FILE = DATA_DIR / "paper_events.jsonl"
             REQUEST_DIR.mkdir(parents=True)
 
+            self_test_token_id = "123"
+            self_test_condition_id = "0x" + "aa" * 32
             evidence_id = "0x" + "ab" * 32 + ":1"
             focus = {
-                "token_id": "token-a",
-                "condition_id": "condition-a",
+                "token_id": self_test_token_id,
+                "condition_id": self_test_condition_id,
                 "outcome": "Yes",
                 "question": "Market A",
                 "direction": "BUY",
@@ -1055,8 +1089,8 @@ def self_test():
                     "book_ok": True,
                     "source_generation_id": "GEN-X",
                     "source_evidence_id": evidence_id,
-                    "token_id": "token-a",
-                    "condition_id": "condition-a",
+                    "token_id": self_test_token_id,
+                    "condition_id": self_test_condition_id,
                 },
             )
 
@@ -1070,8 +1104,8 @@ def self_test():
                     "action": "OPEN",
                     "amount_usd": 25,
                     "chat_id": "123",
-                    "token_id": "token-a",
-                    "condition_id": "condition-a",
+                    "token_id": self_test_token_id,
+                    "condition_id": self_test_condition_id,
                     "source_generation_id": "GEN-X",
                     "source_evidence_id": evidence_id,
                     "focus_locked_at": now.isoformat(),
@@ -1079,10 +1113,10 @@ def self_test():
             )
 
             def fake_book(token_id):
-                assert token_id == "token-a"
+                assert token_id == self_test_token_id
                 return {
-                    "market": "condition-a",
-                    "asset_id": "token-a",
+                    "market": self_test_condition_id,
+                    "asset_id": self_test_token_id,
                     "timestamp": "1",
                     "hash": "book-x",
                     "bids": [{"price": "0.49", "size": "1000"}],
@@ -1090,13 +1124,13 @@ def self_test():
                 }
 
             def fake_market(condition_id):
-                assert condition_id == "condition-a"
+                assert condition_id == self_test_condition_id
                 return {
-                    "t": [{"t": "token-a"}],
+                    "t": [{"t": self_test_token_id}],
                     "fd": {"r": 0.05, "e": 1},
                 }
 
-            def fake_identity(condition_id, token_id):
+            def fake_identity(condition_id, token_id, **kwargs):
                 return {
                     "settlement_protocol": paper_settlement.PROTOCOL_LEGACY_CTF,
                     "settlement_family": paper_settlement.FAMILY_STANDARD,

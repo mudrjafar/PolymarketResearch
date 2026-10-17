@@ -1,7 +1,7 @@
 """Read-only coverage probe for Polymarket's V2 Exchange V3 deployment.
 
 This utility reads finalized Polygon logs and, optionally, asks the public Gamma
-API whether sampled position IDs have an exact CLOB token identity match. It
+API whether sampled position IDs resolve through the Collector's market rules. It
 does not write runtime data, update Collector state, or feed any decision worker.
 """
 
@@ -18,6 +18,21 @@ from typing import Any
 
 import requests
 from eth_abi import decode, encode
+
+try:  # Support both `python scripts/...py` and package-based tests.
+    from .v3_identity import (
+        MODULE_NAMES as RUNTIME_MODULE_NAMES,
+        V3IdentityError,
+        decode_position_id,
+        runtime_position_market_entries,
+    )
+except ImportError:  # pragma: no cover - used by direct script execution
+    from v3_identity import (
+        MODULE_NAMES as RUNTIME_MODULE_NAMES,
+        V3IdentityError,
+        decode_position_id,
+        runtime_position_market_entries,
+    )
 
 
 POLYGON_CHAIN_ID = 137
@@ -41,7 +56,7 @@ POSITION_LAYOUT = {
     "condition_index": "bits 8-23",
     "outcome_index": "bits 0-7",
 }
-MODULE_NAMES = {1: "BINARY", 2: "NEG_RISK", 3: "COMBINATORIAL"}
+MODULE_NAMES = RUNTIME_MODULE_NAMES
 
 
 class ProbeError(RuntimeError):
@@ -62,37 +77,13 @@ class ProbeError(RuntimeError):
 
 
 def parse_position_id(value: int) -> dict[str, Any]:
-    """Decode the documented PositionId bit fields without guessing identity."""
-    if not isinstance(value, int) or value < 0 or value >= 1 << 256:
-        raise ValueError("position id is outside uint256")
-    module_id = (value >> 248) & 0xFF
-    result = {
-        "position_id": str(value),
-        "module_id": module_id,
-        "module": MODULE_NAMES.get(module_id, "UNKNOWN_MODULE"),
-        "base_hash": f"0x{((value >> 120) & ((1 << 128) - 1)):032x}",
-        "arity": (value >> 104) & 0xFFFF,
-        "reserved": f"0x{((value >> 40) & ((1 << 64) - 1)):016x}",
-        "resolution_chain": (value >> 24) & 0xFFFF,
-        "condition_index": (value >> 8) & 0xFFFF,
-        "outcome_index": value & 0xFF,
-    }
-    if module_id == 1:
-        valid = result["arity"] == 0 and result["condition_index"] == 0 and result["outcome_index"] in (0, 1)
-    elif module_id == 2:
-        valid = result["arity"] > 0 and result["condition_index"] <= result["arity"] and result["outcome_index"] in (0, 1)
-    elif module_id == 3:
-        # Combinatorial identity semantics are deliberately not inferred here.
-        valid = True
-    else:
-        valid = False
-    if not valid or module_id not in MODULE_NAMES:
-        result["classification"] = "FAIL_CLOSED"
-    elif module_id == 3:
-        result["classification"] = "RESEARCH_ONLY"
-    else:
-        result["classification"] = "RECOGNIZED"
-    return result
+    """Compatibility wrapper around the Runtime's single PositionId decoder."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("position id is invalid")
+    try:
+        return decode_position_id(str(value))
+    except V3IdentityError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _canonical_hash(value: Any, label: str) -> str:
@@ -302,35 +293,75 @@ def _scan_logs(
 
 
 def _gamma_exact_match(position_id: str, session: Any = requests) -> dict[str, Any]:
-    """Check Gamma's position-ID identity field; a miss is not proof of absence."""
-    try:
-        response = session.get(
-            f"{GAMMA_API}/markets",
-            params={"position_ids": position_id, "limit": 100},
-            timeout=15,
-        )
-        response.raise_for_status()
-        markets = response.json()
-    except Exception:
-        return {"status": "LOOKUP_ERROR"}
-    if not isinstance(markets, list):
-        return {"status": "INVALID_RESPONSE"}
-    for market in markets:
-        if not isinstance(market, dict):
+    """Use the same targeted Gamma lookup and eligibility checks as Collector."""
+    for closed in (False, True):
+        try:
+            response = session.get(
+                f"{GAMMA_API}/markets",
+                params={"position_ids": [position_id], "closed": closed, "limit": 100},
+                timeout=30,
+            )
+            response.raise_for_status()
+            markets = response.json()
+        except Exception:
+            return {"status": "LOOKUP_ERROR", "closed_filter": closed}
+        if not isinstance(markets, list):
+            return {"status": "INVALID_RESPONSE", "closed_filter": closed}
+        if not markets:
             continue
-        position_ids = market.get("positionIds", [])
-        if isinstance(position_ids, str):
-            try:
-                position_ids = json.loads(position_ids)
-            except (TypeError, ValueError):
-                position_ids = []
-        if isinstance(position_ids, list) and position_id in {str(item) for item in position_ids}:
+
+        exact_market = None
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            position_ids = market.get("positionIds", [])
+            if isinstance(position_ids, str):
+                try:
+                    position_ids = json.loads(position_ids)
+                except (TypeError, ValueError):
+                    position_ids = []
+            if isinstance(position_ids, list) and position_id in {str(item) for item in position_ids}:
+                exact_market = market
+                break
+
+        if exact_market is None:
+            return {"status": "POSITION_ID_QUERY_RETURNED_NO_EXACT_MATCH", "closed_filter": closed}
+
+        runtime_entry = next((
+            entry for candidate_id, entry in runtime_position_market_entries(exact_market)
+            if candidate_id == position_id
+        ), None)
+        if runtime_entry is None:
             return {
-                "status": "EXACT_MATCH",
-                "condition_id": market.get("conditionId"),
-                "question": market.get("question"),
+                "status": "EXACT_POSITION_ID_MATCH_RUNTIME_REJECTED",
+                "condition_id": exact_market.get("conditionId"),
+                "question": exact_market.get("question"),
+                "closed_filter": closed,
+                "collector_runtime_eligible": False,
             }
+        return {
+            "status": "EXACT_MATCH",
+            "condition_id": runtime_entry["condition_id"],
+            "question": runtime_entry["question"],
+            "outcome": runtime_entry["outcome"],
+            "module": runtime_entry["position_module"],
+            "closed_filter": closed,
+            "collector_runtime_eligible": True,
+        }
     return {"status": "NO_POSITION_ID_MATCH_NOT_PROOF_OF_ABSENCE"}
+
+
+def _prioritize_gamma_position_ids(unique_ids: dict[str, dict[str, Any]]) -> list[str]:
+    """Sample runtime-supported positions before research-only IDs."""
+    supported = [
+        position_id for position_id, item in unique_ids.items()
+        if item.get("classification") == "SUPPORTED"
+    ]
+    other = [
+        position_id for position_id, item in unique_ids.items()
+        if item.get("classification") != "SUPPORTED"
+    ]
+    return supported + other
 
 
 def _combinatorial_legs(rpc: JsonRpcReader, position_id: str, block_tag: str = "latest") -> list[str] | None:
@@ -446,7 +477,7 @@ def run_probe(
     unique_ids: dict[str, dict[str, Any]] = {}
     malformed_positions = 0
     for fill in unique_fills:
-        status = fill["module"] if fill["classification"] == "RECOGNIZED" else fill["classification"]
+        status = fill["module"] if fill["classification"] == "SUPPORTED" else fill["classification"]
         by_module[status] += 1
         if fill["classification"] == "FAIL_CLOSED":
             malformed_positions += 1
@@ -454,9 +485,12 @@ def run_probe(
 
     gamma_results = []
     combinatorial_results = []
-    for position_id in list(unique_ids)[:gamma_sample]:
+    gamma_sample_ids = _prioritize_gamma_position_ids(unique_ids)
+    for position_id in gamma_sample_ids[:gamma_sample]:
         gamma_results.append({
             "position_id": position_id,
+            "module": unique_ids[position_id]["module"],
+            "classification": unique_ids[position_id]["classification"],
             **_gamma_exact_match(position_id, session=session),
         })
         identity = unique_ids[position_id]
@@ -537,10 +571,16 @@ def run_probe(
             "unique_position_ids": len(unique_ids),
             "fills_by_module_or_fail_closed": dict(sorted(by_module.items())),
             "fail_closed_position_ids": malformed_positions,
-            "unique_position_id_samples": list(unique_ids.values())[:10],
+            "unique_position_id_samples": [unique_ids[position_id] for position_id in gamma_sample_ids[:10]],
         },
         "gamma_identity_probe": {
             "sampled_position_ids": len(gamma_results),
+            "sampled_supported_position_ids": sum(
+                item["classification"] == "SUPPORTED" for item in gamma_results
+            ),
+            "sampled_research_only_position_ids": sum(
+                item["classification"] == "RESEARCH_ONLY" for item in gamma_results
+            ),
             "result_counts": dict(sorted(gamma_counts.items())),
             "results": gamma_results,
             "interpretation": "No exact Gamma position-ID match is inconclusive; V2 asset identity mapping requires separate validation.",

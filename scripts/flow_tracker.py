@@ -1596,6 +1596,8 @@ def main():
                 market={
                     "question": question,
                     "outcome": outcome,
+                    "asset_type": latest_trade.get("asset_type", "CTF_TOKEN"),
+                    "protocol_version": latest_trade.get("protocol_version", "LEGACY_CTF"),
                     "end_date": end_date,
                     "start_date": latest_trade.get("start_date"),
                     "price": (

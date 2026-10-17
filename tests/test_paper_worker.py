@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from datetime import datetime, timezone
 
 import pytest
@@ -8,6 +9,8 @@ from scripts import paper_settlement, paper_worker
 
 
 NOW = datetime.now(timezone.utc)
+TOKEN_ID = "123"
+CONDITION_ID = "0x" + "aa" * 32
 
 
 def configure(monkeypatch, tmp_path):
@@ -43,8 +46,8 @@ def write_gate(
 ):
     evidence = evidence or ("0x" + "ab" * 32 + ":7")
     focus = {
-        "token_id": "token-a",
-        "condition_id": "condition-a",
+        "token_id": TOKEN_ID,
+        "condition_id": CONDITION_ID,
         "outcome": outcome,
         "question": "Market A",
         "direction": "BUY",
@@ -75,17 +78,17 @@ def write_gate(
             "reason_codes": [],
             "source_generation_id": generation,
             "source_evidence_id": evidence,
-            "token_id": "token-a",
-            "condition_id": "condition-a",
+            "token_id": TOKEN_ID,
+            "condition_id": CONDITION_ID,
         },
     )
     return focus
 
 
-def raw_book(*, bid="0.49", ask="0.50", bid_size="1000", ask_size="1000"):
+def raw_book(*, bid="0.49", ask="0.50", bid_size="1000", ask_size="1000", asset_id=TOKEN_ID, market=CONDITION_ID):
     return {
-        "market": "condition-a",
-        "asset_id": "token-a",
+        "market": market,
+        "asset_id": asset_id,
         "timestamp": "123",
         "hash": "book-x",
         "bids": [{"price": bid, "size": bid_size}],
@@ -95,7 +98,7 @@ def raw_book(*, bid="0.49", ask="0.50", bid_size="1000", ask_size="1000"):
 
 def market_info():
     return {
-        "t": [{"t": "token-a"}],
+        "t": [{"t": TOKEN_ID}],
         "fd": {"r": 0.05, "e": 1},
     }
 
@@ -111,8 +114,8 @@ def write_open_request(paths, *, request_id="REQ-open", generation="GEN-X", evid
             "action": "OPEN",
             "amount_usd": 25,
             "chat_id": "123",
-            "token_id": "token-a",
-            "condition_id": "condition-a",
+            "token_id": TOKEN_ID,
+            "condition_id": CONDITION_ID,
             "source_generation_id": generation,
             "source_evidence_id": evidence,
             "focus_locked_at": NOW.isoformat(),
@@ -141,7 +144,7 @@ def loaders():
     )
 
 
-def fake_identity(condition_id, token_id):
+def fake_identity(condition_id, token_id, **kwargs):
     return {
         "settlement_protocol": paper_settlement.PROTOCOL_LEGACY_CTF,
         "settlement_family": paper_settlement.FAMILY_STANDARD,
@@ -190,6 +193,31 @@ def test_open_requires_exact_ready_book_binding_and_marks_from_bids(monkeypatch,
     assert position["mark_status"] == "OK"
     assert position["mark"]["current_value_usd"] < 25
     assert position["mark"]["pnl_usd"] < 0
+
+
+@pytest.mark.parametrize("bad_identity", [
+    {"asset_id": None, "market": CONDITION_ID},
+    {"asset_id": TOKEN_ID, "market": None},
+    {"asset_id": "", "market": CONDITION_ID},
+    {"asset_id": TOKEN_ID, "market": "not-a-condition"},
+    {"asset_id": "456", "market": CONDITION_ID},
+    {"asset_id": TOKEN_ID, "market": "0x" + "bb" * 32},
+])
+def test_open_rejects_fresh_book_without_matching_identity(monkeypatch, tmp_path, bad_identity):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _token_id: raw_book(**bad_identity),
+        market_info_loader=lambda _condition_id: market_info(),
+    )
+
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"].startswith("BOOK_")
 
 
 def test_focus_wait_rejects_open_without_fetching_execution_book(monkeypatch, tmp_path):
@@ -255,8 +283,8 @@ def test_open_rejects_resolved_unknown_or_unavailable_settlement(
     assert len(rejected) == 1
     assert rejected[0]["reason_code"] == expected_reason
     assert len(checked) == 1
-    assert checked[0]["condition_id"] == "condition-a"
-    assert checked[0]["token_id"] == "token-a"
+    assert checked[0]["condition_id"] == CONDITION_ID
+    assert checked[0]["token_id"] == TOKEN_ID
     assert checked[0]["outcome_index"] == 0
 
 
@@ -369,6 +397,85 @@ def test_insufficient_exit_depth_rejects_close_and_keeps_position_open(monkeypat
     assert rejected[0]["reason_code"] == "EXIT_NOT_FULLY_EXECUTABLE"
     assert state["positions"][0]["status"] == "OPEN"
     assert state["positions"][0]["mark_status"] == "INSUFFICIENT_EXIT_DEPTH"
+
+
+@pytest.mark.parametrize(
+    ("missing", "changes", "reason"),
+    [
+        ("asset_id", {}, "BOOK_ASSET_ID_MISSING"),
+        ("market", {}, "BOOK_MARKET_MISSING"),
+        (None, {"asset_id": "", "market": CONDITION_ID}, "BOOK_ASSET_ID_MISSING"),
+        (None, {"asset_id": "12x", "market": CONDITION_ID}, "BOOK_ASSET_ID_INVALID"),
+        (None, {"asset_id": TOKEN_ID, "market": "not-a-condition"}, "CONDITION_ID_INVALID"),
+        (None, {"asset_id": "456", "market": CONDITION_ID}, "TOKEN_ID_MISMATCH"),
+        (None, {"asset_id": TOKEN_ID, "market": "0x" + "bb" * 32}, "CONDITION_ID_MISMATCH"),
+    ],
+)
+def test_close_rejects_unidentified_or_conflicting_fresh_book_without_changing_position(
+    monkeypatch, tmp_path, missing, changes, reason,
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    state, _ = run_worker(
+        now=NOW,
+        book_loader=lambda _: raw_book(),
+        market_info_loader=lambda _: market_info(),
+    )
+    position_before = deepcopy(state["positions"][0])
+    write_close_request(paths, position_before["paper_id"])
+
+    bad_book = raw_book(**changes)
+    if missing:
+        bad_book.pop(missing)
+    state, events = run_worker(
+        now=NOW,
+        book_loader=lambda _: bad_book,
+        market_info_loader=lambda _: market_info(),
+    )
+
+    close_events = [event for event in events if event["request_id"] == "REQ-close"]
+    assert len(close_events) == 1
+    assert close_events[0]["type"] == "REJECTED"
+    assert close_events[0]["reason_code"] == reason
+    position_after = state["positions"][0]
+    for field in ("status", "closed_at", "close_request_id", "exit", "realized_pnl_usd", "realized_return_pct"):
+        assert position_after.get(field) == position_before.get(field)
+    assert position_after["mark"] == position_before["mark"]
+    assert position_after["mark_status"] == position_before["mark_status"]
+
+
+@pytest.mark.parametrize(
+    "bad_book",
+    [
+        lambda: {"market": CONDITION_ID},
+        lambda: {"asset_id": TOKEN_ID},
+        lambda: {"asset_id": TOKEN_ID, "market": "not-a-condition"},
+        lambda: {"asset_id": "456", "market": CONDITION_ID},
+        lambda: {"asset_id": TOKEN_ID, "market": "0x" + "bb" * 32},
+    ],
+)
+def test_mark_does_not_mutate_position_when_fresh_book_identity_is_unproven(
+    bad_book, tmp_path,
+):
+    position = {
+        "token_id": TOKEN_ID,
+        "condition_id": CONDITION_ID,
+        "asset_type": "CTF_TOKEN",
+        "protocol_version": "LEGACY_CTF",
+        "tokens": 10.0,
+        "investment_usd": 5.0,
+        "mark_status": "PREVIOUS_MARK",
+        "mark_checked_at": "previous-time",
+        "mark": {"pnl_usd": 1.0},
+    }
+    before = deepcopy(position)
+    raw = bad_book()
+    if "market" not in raw and "asset_id" in raw:
+        raw["bids"] = [{"price": "0.49", "size": "1000"}]
+        raw["asks"] = [{"price": "0.50", "size": "1000"}]
+    paper_worker._position_mark(position, raw, NOW)
+    assert position == before
 
 
 def test_corrupt_durable_state_fails_closed(monkeypatch, tmp_path):

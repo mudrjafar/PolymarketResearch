@@ -7,6 +7,8 @@ from scripts import book_worker as worker
 
 
 NOW = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+TOKEN_ID = "123"
+CONDITION_ID = "0x" + "aa" * 32
 
 
 def configure_paths(monkeypatch, tmp_path):
@@ -24,8 +26,8 @@ def configure_paths(monkeypatch, tmp_path):
 
 def focus_payload(*, state="READY", generated_at=NOW, input_status="OK"):
     focus = {
-        "token_id": "token-a",
-        "condition_id": "condition-a",
+        "token_id": TOKEN_ID,
+        "condition_id": CONDITION_ID,
         "outcome": "Yes",
         "question": "Market A",
         "direction": "BUY",
@@ -46,8 +48,8 @@ def focus_payload(*, state="READY", generated_at=NOW, input_status="OK"):
 
 def valid_book():
     return {
-        "market": "condition-a",
-        "asset_id": "token-a",
+        "market": CONDITION_ID,
+        "asset_id": TOKEN_ID,
         "timestamp": "123",
         "hash": "hash-a",
         "bids": [{"price": "0.49", "size": "1000"}],
@@ -78,12 +80,12 @@ def test_ready_focus_fetches_book_and_binds_identity(monkeypatch, tmp_path):
 
     result = worker.run_once(now=NOW, book_loader=loader)
 
-    assert seen == ["token-a"]
+    assert seen == [TOKEN_ID]
     assert result["status"] == "OK"
     assert result["book_ok"] is True
     assert result["source_generation_id"] == "X"
     assert result["source_evidence_id"].endswith(":1")
-    assert result["token_id"] == "token-a"
+    assert result["token_id"] == TOKEN_ID
     assert read_json(paths["book"])["book_ok"] is True
 
 
@@ -165,7 +167,7 @@ def test_identity_mismatch_from_clob_fails_book(monkeypatch, tmp_path):
     save_json_atomic(paths["focus"], focus_payload())
 
     bad = valid_book()
-    bad["asset_id"] = "wrong-token"
+    bad["asset_id"] = "456"
 
     result = worker.run_once(now=NOW, book_loader=lambda _token: bad)
 

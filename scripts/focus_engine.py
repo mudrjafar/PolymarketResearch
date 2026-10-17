@@ -171,6 +171,8 @@ def _snapshot(candidate):
     return {
         "token_id": _text(candidate.get("token_id")),
         "condition_id": _text(candidate.get("condition_id")),
+        "asset_type": candidate.get("asset_type", "CTF_TOKEN"),
+        "protocol_version": candidate.get("protocol_version", "LEGACY_CTF"),
         "outcome": _text(candidate.get("outcome")),
         "question": candidate.get("question"),
         "direction": _text(candidate.get("direction")).upper(),
@@ -184,6 +186,8 @@ def _event(kind, focus, now, **extra):
         "at": now.isoformat(),
         "token_id": focus.get("token_id"),
         "condition_id": focus.get("condition_id"),
+        "asset_type": focus.get("asset_type", "CTF_TOKEN"),
+        "protocol_version": focus.get("protocol_version", "LEGACY_CTF"),
         "question": focus.get("question"),
         "outcome": focus.get("outcome"),
         "price": focus.get("price"),

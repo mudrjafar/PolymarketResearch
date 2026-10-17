@@ -1,15 +1,20 @@
+import pytest
+
 from scripts.book_engine import analyze_book
+
+TOKEN_ID = "123"
+CONDITION_ID = "0x" + "aa" * 32
 
 
 def focus(price=0.50):
     return {
-        "token_id": "token-a",
-        "condition_id": "condition-a",
+        "token_id": TOKEN_ID,
+        "condition_id": CONDITION_ID,
         "price": price,
     }
 
 
-def book(*, bids=None, asks=None, asset_id="token-a", market="condition-a"):
+def book(*, bids=None, asks=None, asset_id=TOKEN_ID, market=CONDITION_ID):
     return {
         "market": market,
         "asset_id": asset_id,
@@ -89,13 +94,35 @@ def test_crossed_book_fails_closed():
 
 def test_identity_mismatch_fails_closed():
     result = analyze_book(
-        book(asset_id="other-token", market="other-condition"),
+        book(asset_id="456", market="0x" + "bb" * 32),
         focus(),
     )
 
     assert result["book_ok"] is False
     assert "TOKEN_ID_MISMATCH" in result["reason_codes"]
     assert "CONDITION_ID_MISMATCH" in result["reason_codes"]
+
+
+@pytest.mark.parametrize(("field", "reason"), [
+    ("asset_id", "BOOK_ASSET_ID_MISSING"),
+    ("market", "BOOK_MARKET_MISSING"),
+])
+def test_missing_book_identity_fails_closed(field, reason):
+    result = analyze_book(book(**{field: None}), focus())
+    assert result["book_ok"] is False
+    assert reason in result["reason_codes"]
+
+
+@pytest.mark.parametrize(("field", "value", "reason"), [
+    ("asset_id", "  ", "BOOK_ASSET_ID_INVALID"),
+    ("market", "not-a-condition", "CONDITION_ID_INVALID"),
+    ("asset_id", "124", "TOKEN_ID_MISMATCH"),
+    ("market", "0x" + "ab" * 32, "CONDITION_ID_MISMATCH"),
+])
+def test_invalid_or_conflicting_book_identity_fails_closed(field, value, reason):
+    result = analyze_book(book(**{field: value}), focus())
+    assert result["book_ok"] is False
+    assert reason in result["reason_codes"]
 
 
 def test_malformed_level_is_not_coerced_to_zero():

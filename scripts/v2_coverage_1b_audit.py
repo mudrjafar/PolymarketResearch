@@ -13,33 +13,95 @@ import argparse
 from datetime import datetime, timezone
 import json
 import sys
+import time
 from typing import Any
 
 import requests
 
+try:
+    from .v3_identity import V3IdentityError, condition_matches_position
+except ImportError:  # pragma: no cover - direct script execution
+    from v3_identity import V3IdentityError, condition_matches_position
+
 CLOB_API = "https://clob.polymarket.com"
 COMBO_API = "https://combos-rfq-api.polymarket.com"
 COMBO_PAGE_SIZE = 100
+GAMMA_TIMEOUT_SECONDS = 20
+GAMMA_MAX_RETRIES = 3
+
+
+def _gamma_get_with_retry(session: Any, url: str, *, params: dict[str, Any]) -> tuple[Any, int]:
+    """Retry transient Gamma transport and server errors without hiding hard failures."""
+    retries = 0
+    while True:
+        try:
+            response = session.get(url, params=params, timeout=GAMMA_TIMEOUT_SECONDS)
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status not in (408, 425, 429) and not (isinstance(status, int) and status >= 500):
+                    exc.gamma_retries = retries
+                    raise
+                if retries >= GAMMA_MAX_RETRIES:
+                    exc.gamma_retries = retries
+                    raise
+                retries += 1
+                print(
+                    f"[V2 audit] Gamma HTTP {status}; retry {retries}/{GAMMA_MAX_RETRIES}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(min(2 ** (retries - 1), 8))
+                continue
+            return response, retries
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            if retries >= GAMMA_MAX_RETRIES:
+                exc.gamma_retries = retries
+                raise
+            retries += 1
+            print(
+                f"[V2 audit] Gamma {type(exc).__name__}; retry {retries}/{GAMMA_MAX_RETRIES}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(min(2 ** (retries - 1), 8))
 
 try:  # Support both `python scripts/...py` and package-based tests.
     from .v2_coverage_probe import (
         GAMMA_API,
+        EXCHANGE_V3_ADDRESS,
         JsonRpcReader,
         POLYGON_CHAIN_ID,
         ProbeError,
         _hex_block,
         _rpc_url_from_config,
+        _scan_logs,
         decode_order_filled,
+    )
+    from .v3_identity import (
+        ACTIVE_GAMMA_PAGE_CAP,
+        V3IdentityError,
+        decode_position_id,
+        runtime_position_market_entries,
     )
 except ImportError:  # pragma: no cover - used by direct script execution
     from v2_coverage_probe import (
         GAMMA_API,
+        EXCHANGE_V3_ADDRESS,
         JsonRpcReader,
         POLYGON_CHAIN_ID,
         ProbeError,
         _hex_block,
         _rpc_url_from_config,
+        _scan_logs,
         decode_order_filled,
+    )
+    from v3_identity import (
+        ACTIVE_GAMMA_PAGE_CAP,
+        V3IdentityError,
+        decode_position_id,
+        runtime_position_market_entries,
     )
 
 
@@ -67,30 +129,23 @@ def _same_event(expected: dict[str, Any], observed: dict[str, Any]) -> bool:
 
 
 def decode_v2_position_id(position_id: str) -> dict[str, Any]:
-    """Decode the V2 module and outcome bytes from a decimal PositionId."""
-    if not isinstance(position_id, str) or not position_id.isascii() or not position_id.isdecimal():
+    """Present the Runtime decoder's decision in the audit's legacy schema."""
+    try:
+        identity = decode_position_id(position_id)
+    except (V3IdentityError, TypeError, ValueError):
         return {"position_id": position_id, "status": "INVALID_POSITION_ID_ENCODING"}
-    value = int(position_id)
-    if value < 0 or value >= 1 << 256:
-        return {"position_id": position_id, "status": "INVALID_POSITION_ID_ENCODING"}
-    encoded = f"{value:064x}"
-    module_id = int(encoded[:2], 16)
-    outcome_index = int(encoded[-2:], 16)
-    if module_id not in {1, 2, 3} or outcome_index not in {0, 1}:
+    if identity["classification"] == "FAIL_CLOSED":
         return {
-            "position_id": position_id,
+            "position_id": identity["position_id"],
             "status": "UNRECOGNIZED_V2_POSITION_ID_LAYOUT",
-            "module_id": module_id,
-            "outcome_index": outcome_index,
+            **identity,
         }
+    module = {"BINARY": "CTF", "NEG_RISK": "NEG_RISK", "COMBINATORIAL": "COMBO"}.get(identity["module"])
     return {
-        "position_id": position_id,
+        **identity,
         "status": "V2_POSITION_ID_DECODED",
-        "module_id": module_id,
-        "module": {1: "CTF", 2: "NEG_RISK", 3: "COMBO"}[module_id],
-        "condition_id": "0x" + encoded[:-2],
-        "outcome_index": outcome_index,
-        "outcome": "YES" if outcome_index == 0 else "NO",
+        "module": module,
+        "outcome": "YES" if identity["outcome_index"] == 0 else "NO",
     }
 
 
@@ -300,59 +355,85 @@ def audit_receipt_event(rpc: JsonRpcReader, expected: dict[str, Any]) -> dict[st
 
 
 def audit_gamma_position(position_id: str, session: Any = requests) -> dict[str, Any]:
-    """Require one exact Gamma PositionId match; keep CTF token IDs separate."""
-    try:
-        response = session.get(
-            f"{GAMMA_API}/markets",
-            params={"position_ids": position_id, "limit": 100},
-            timeout=15,
-        )
-        response.raise_for_status()
-        markets = response.json()
-    except Exception:
-        return {"position_id": position_id, "status": "GAMMA_LOOKUP_ERROR"}
-    if not isinstance(markets, list):
-        return {"position_id": position_id, "status": "GAMMA_INVALID_RESPONSE"}
+    """Use Collector's exact PositionId query and report its runtime gate."""
+    for closed in (False, True):
+        try:
+            response = session.get(
+                f"{GAMMA_API}/markets",
+                params={"position_ids": [position_id], "closed": closed, "limit": 100},
+                timeout=30,
+            )
+            response.raise_for_status()
+            markets = response.json()
+        except Exception:
+            return {"position_id": position_id, "status": "GAMMA_LOOKUP_ERROR", "closed_filter": closed}
+        if not isinstance(markets, list):
+            return {"position_id": position_id, "status": "GAMMA_INVALID_RESPONSE", "closed_filter": closed}
+        if not markets:
+            continue
 
-    exact: list[tuple[dict[str, Any], int]] = []
-    for market in markets:
-        if not isinstance(market, dict):
-            continue
-        position_ids = _json_array(market.get("positionIds"))
-        if position_ids is None:
-            continue
-        for index, value in enumerate(position_ids):
-            if str(value) == position_id:
-                exact.append((market, index))
-    if not exact:
+        exact: list[tuple[dict[str, Any], int]] = []
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            position_ids = _json_array(market.get("positionIds"))
+            if position_ids is None:
+                continue
+            for index, value in enumerate(position_ids):
+                if str(value) == position_id:
+                    exact.append((market, index))
+        if not exact:
+            return {
+                "position_id": position_id,
+                "status": "NO_EXACT_POSITION_ID_MATCH_INCONCLUSIVE",
+                "closed_filter": closed,
+                "clob_token_ids_treated_as_position_ids": False,
+            }
+        if len(exact) != 1:
+            return {
+                "position_id": position_id,
+                "status": "POSITION_ID_MATCH_NOT_UNIQUE",
+                "match_count": len(exact),
+                "closed_filter": closed,
+            }
+
+        market, index = exact[0]
+        outcomes = _json_array(market.get("outcomes"))
+        clob_token_ids = _json_array(market.get("clobTokenIds"))
+        outcome = outcomes[index] if outcomes is not None and len(outcomes) == len(_json_array(market.get("positionIds")) or []) else None
+        runtime_entry = next((
+            entry for candidate_id, entry in runtime_position_market_entries(market)
+            if candidate_id == position_id
+        ), None)
         return {
             "position_id": position_id,
-            "status": "NO_EXACT_POSITION_ID_MATCH_INCONCLUSIVE",
+            "status": "EXACT_POSITION_ID_MATCH",
+            "condition_id": market.get("conditionId"),
+            "slug": market.get("slug"),
+            "question": market.get("question"),
+            "position_id_index": index,
+            "outcome_at_index": runtime_entry["outcome"] if runtime_entry else outcome,
+            "outcome_alignment_status": "ALIGNED" if runtime_entry else ("UNVERIFIED" if outcome is None else "RUNTIME_REJECTED"),
+            "collector_runtime_eligible": runtime_entry is not None,
+            "collector_runtime_module": runtime_entry["position_module"] if runtime_entry else None,
+            "closed_filter": closed,
+            "clob_token_ids": [str(value) for value in clob_token_ids] if clob_token_ids is not None else None,
             "clob_token_ids_treated_as_position_ids": False,
+            "clob_protocol_identity": "positionID",
         }
-    if len(exact) != 1:
-        return {"position_id": position_id, "status": "POSITION_ID_MATCH_NOT_UNIQUE", "match_count": len(exact)}
-
-    market, index = exact[0]
-    outcomes = _json_array(market.get("outcomes"))
-    clob_token_ids = _json_array(market.get("clobTokenIds"))
-    outcome = outcomes[index] if outcomes is not None and len(outcomes) == len(_json_array(market.get("positionIds")) or []) else None
     return {
         "position_id": position_id,
-        "status": "EXACT_POSITION_ID_MATCH",
-        "condition_id": market.get("conditionId"),
-        "slug": market.get("slug"),
-        "question": market.get("question"),
-        "position_id_index": index,
-        "outcome_at_index": outcome,
-        "outcome_alignment_status": "ALIGNED" if outcome is not None else "UNVERIFIED",
-        "clob_token_ids": [str(value) for value in clob_token_ids] if clob_token_ids is not None else None,
+        "status": "NO_EXACT_POSITION_ID_MATCH_INCONCLUSIVE",
         "clob_token_ids_treated_as_position_ids": False,
-        "clob_protocol_identity": "positionID",
     }
 
 
-def audit_clob_asset(position_id: str, session: Any = requests) -> dict[str, Any]:
+def audit_clob_asset(
+    position_id: str,
+    session: Any = requests,
+    *,
+    expected_market: str | None = None,
+) -> dict[str, Any]:
     """Read a public CLOB book and verify its returned asset_id exactly.
 
     The unified official Python SDK accepts V2 position IDs as ``asset_id``
@@ -401,11 +482,259 @@ def audit_clob_asset(position_id: str, session: Any = requests) -> dict[str, Any
             "returned_asset_id": returned_asset_id,
             "status": "CLOB_ASSET_ID_MISMATCH",
         }
+    returned_market = book.get("market")
+    if expected_market is not None:
+        if not isinstance(returned_market, str) or not returned_market.strip():
+            return {
+                "position_id": position_id,
+                "returned_asset_id": returned_asset_id,
+                "expected_market": expected_market,
+                "status": "CLOB_MARKET_MISSING",
+            }
+        try:
+            matches_market = condition_matches_position(returned_market, expected_market)
+        except V3IdentityError:
+            return {
+                "position_id": position_id,
+                "returned_asset_id": returned_asset_id,
+                "expected_market": expected_market,
+                "returned_market": returned_market,
+                "status": "CLOB_MARKET_INVALID",
+            }
+        if not matches_market:
+            return {
+                "position_id": position_id,
+                "returned_asset_id": returned_asset_id,
+                "expected_market": expected_market,
+                "returned_market": returned_market,
+                "status": "CLOB_MARKET_MISMATCH",
+            }
     return {
         "position_id": position_id,
         "returned_asset_id": returned_asset_id,
-        "market": book.get("market"),
+        "market": returned_market,
         "status": "EXACT_CLOB_ASSET_ID_MATCH",
+    }
+
+
+def discover_active_v3_candidates(
+    rpc: JsonRpcReader,
+    *,
+    session: Any = requests,
+    max_pages: int = 100,
+    lookback_blocks: int = 10_000,
+) -> dict[str, Any]:
+    """Find active Gamma V3 IDs, verify CLOB identity, then corroborate fills.
+
+    Any pagination cap, API miss, or log-range miss is explicitly inconclusive.
+    Only the Runtime decoder decides whether a PositionId is eligible.
+    """
+    requested_max_pages = max_pages
+    max_pages = min(max_pages, ACTIVE_GAMMA_PAGE_CAP)
+    if requested_max_pages > ACTIVE_GAMMA_PAGE_CAP:
+        print(
+            f"[V2 audit] Capping Gamma scan at the Collector limit "
+            f"({ACTIVE_GAMMA_PAGE_CAP} pages; requested {requested_max_pages})",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    candidates: dict[str, dict[str, Any]] = {}
+    cursor = None
+    seen_cursors = set()
+    pages = 0
+    complete = True
+    gamma_error = None
+    retries_total = 0
+    try:
+        for _ in range(max_pages):
+            params = {"limit": 100, "active": True, "closed": False}
+            if cursor:
+                params["after_cursor"] = cursor
+            if pages == 0 or pages % 10 == 0:
+                print(
+                    f"[V2 audit] Requesting Gamma page {pages + 1}/{max_pages}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            response, retries = _gamma_get_with_retry(session, f"{GAMMA_API}/markets/keyset", params=params)
+            retries_total += retries
+            payload = response.json()
+            if isinstance(payload, dict):
+                markets = payload.get("markets", [])
+                next_cursor = payload.get("next_cursor") or payload.get("nextCursor")
+            elif isinstance(payload, list):
+                markets, next_cursor = payload, None
+            else:
+                return {"status": "GAMMA_INVALID_RESPONSE_INCONCLUSIVE", "pages_scanned": pages, "candidates": []}
+            pages += 1
+            if not isinstance(markets, list):
+                return {"status": "GAMMA_INVALID_RESPONSE_INCONCLUSIVE", "pages_scanned": pages, "candidates": []}
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                if market.get("active") is not True or market.get("closed") is not False:
+                    continue
+                for position_id, runtime_entry in runtime_position_market_entries(market):
+                    candidates.setdefault(position_id, {
+                        "position_id": position_id,
+                        "module": runtime_entry["position_module"],
+                        "condition_id": runtime_entry["condition_id"],
+                        "outcome_index": runtime_entry["position_outcome_index"],
+                        "outcome": runtime_entry["outcome"].upper(),
+                        "gamma_condition_id": market.get("conditionId", market.get("condition_id")),
+                        "market_id": market.get("id"),
+                        "slug": market.get("slug"),
+                        "active": market.get("active"),
+                        "closed": market.get("closed"),
+                        "collector_runtime_eligible": True,
+                        "gamma_identity_status": "EXACT_RUNTIME_PAIR_CONDITION_AND_OUTCOME_MATCH",
+                    })
+            if pages % 25 == 0:
+                print(
+                    f"[V2 audit] Gamma pages scanned: {pages}/{max_pages}; "
+                    f"exact identity candidates: {len(candidates)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if not next_cursor:
+                cursor = None
+                break
+            if next_cursor in seen_cursors:
+                complete = False
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        else:
+            if cursor:
+                complete = False
+    except Exception as exc:
+        complete = False
+        response = getattr(exc, "response", None)
+        failed_page_retries = getattr(exc, "gamma_retries", 0)
+        retries_total += failed_page_retries
+        gamma_error = {
+            "phase": "gamma_page_fetch",
+            "failed_page": pages + 1,
+            "error_type": type(exc).__name__,
+            "http_status": getattr(response, "status_code", None),
+            "retries_on_failed_page": failed_page_retries,
+        }
+
+    if not candidates:
+        return {
+            "status": "GAMMA_LOOKUP_ERROR_INCONCLUSIVE" if gamma_error else "NO_CANDIDATE_PROVEN_INCONCLUSIVE",
+            "read_only": True,
+            "gamma_pages_scanned": pages,
+            "gamma_page_limit": max_pages,
+            "gamma_pages_requested": requested_max_pages,
+            "gamma_scan_complete": complete,
+            "gamma_candidates": 0,
+            "collector_runtime_eligible_candidates": 0,
+            "gamma_error": gamma_error,
+            "gamma_retries": retries_total,
+            "clob_candidate_checks": [],
+            "clob_verified_candidates": [],
+            "onchain_scan_skipped": True,
+            "onchain_scan_skip_reason": "No runtime-eligible Gamma PositionIds were found to corroborate.",
+            "event_matches": [],
+            "confirmed_candidates": [],
+            "interpretation": (
+                "No candidate passed the Collector's Gamma identity rules in the scanned pages. "
+                "No CLOB or on-chain request was needed; missing candidates do not prove none exist."
+            ),
+        }
+
+    clob_verified = []
+    clob_checks = []
+    print(
+        f"[V2 audit] Gamma scan done; checking {len(candidates)} runtime-eligible candidate(s) in CLOB",
+        file=sys.stderr,
+        flush=True,
+    )
+    for candidate in candidates.values():
+        clob = audit_clob_asset(
+            candidate["position_id"],
+            session=session,
+            expected_market=candidate["condition_id"],
+        )
+        clob_checks.append({
+            **candidate,
+            "clob_status": clob.get("status"),
+            "clob_market": clob.get("market", clob.get("returned_market")),
+        })
+        if clob.get("status") == "EXACT_CLOB_ASSET_ID_MATCH":
+            clob_verified.append(clob_checks[-1])
+
+    try:
+        finalized = rpc.call("eth_getBlockByNumber", ["finalized", False])
+        end_block = _hex_block(finalized.get("number"), "finalized block") if isinstance(finalized, dict) else None
+        if end_block is None:
+            raise ProbeError("no finalized block")
+        start_block = max(0, end_block - lookback_blocks + 1)
+        print(
+            f"[V2 audit] Scanning finalized Polygon blocks {start_block}-{end_block} for candidate fills",
+            file=sys.stderr,
+            flush=True,
+        )
+        logs = _scan_logs(rpc, EXCHANGE_V3_ADDRESS, start_block, end_block, 500)
+    except Exception as exc:
+        return {
+            "status": "ONCHAIN_SCAN_ERROR_INCONCLUSIVE",
+            "gamma_pages_scanned": pages,
+            "gamma_scan_complete": complete,
+            "gamma_candidates": len(candidates),
+            "gamma_error": gamma_error,
+            "gamma_retries": retries_total,
+            "clob_candidate_checks": clob_checks,
+            "clob_verified_candidates": clob_verified,
+            "error_type": type(exc).__name__,
+            "event_matches": [],
+            "interpretation": "No candidate was disproved; the finalized event scan was unavailable.",
+        }
+
+    wanted = {item["position_id"]: item for item in clob_verified}
+    event_matches = []
+    for log in logs:
+        try:
+            event = decode_order_filled(log)
+        except (TypeError, ValueError):
+            continue
+        candidate = wanted.get(event["position_id"])
+        if candidate is None:
+            continue
+        provenance = audit_receipt_event(rpc, event)
+        event_matches.append({
+            **candidate,
+            "transaction_hash": event["transaction_hash"],
+            "log_index": event["log_index"],
+            "block_number": event["block_number"],
+            "block_hash": event["block_hash"],
+            "receipt_status": provenance["status"],
+        })
+    confirmed = [item for item in event_matches if item["receipt_status"] == "RECEIPT_AND_CANONICAL_BLOCK_MATCH"]
+    return {
+        "status": (
+            "CONFIRMED_CANDIDATE_FOUND" if confirmed else
+            "GAMMA_LOOKUP_ERROR_INCONCLUSIVE" if gamma_error else
+            "NO_CANDIDATE_PROVEN_INCONCLUSIVE"
+        ),
+        "read_only": True,
+        "gamma_pages_scanned": pages,
+        "gamma_page_limit": max_pages,
+        "gamma_pages_requested": requested_max_pages,
+        "collector_runtime_eligible_candidates": len(candidates),
+        "gamma_scan_complete": complete,
+        "gamma_candidates": len(candidates),
+        "gamma_error": gamma_error,
+        "gamma_retries": retries_total,
+        "clob_candidate_checks": clob_checks,
+        "clob_verified_candidates": clob_verified,
+        "finalized_block": end_block,
+        "event_scan_range": {"start_block": start_block, "end_block": end_block},
+        "event_matches": event_matches,
+        "confirmed_candidates": confirmed,
+        "interpretation": "A missing Gamma or OrderFilled match is not evidence that no eligible market exists.",
     }
 
 
@@ -535,7 +864,13 @@ def run_audit(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only receipt provenance and V2 identity audit")
-    parser.add_argument("--report", required=True, help="saved JSON report emitted by v2_coverage_probe.py")
+    parser.add_argument("--report", help="saved JSON report emitted by v2_coverage_probe.py")
+    parser.add_argument("--discover-active", action="store_true", help="search active Gamma markets for exact V3 candidates, then verify CLOB and finalized fills")
+    parser.add_argument("--lookback-blocks", type=int, default=10_000)
+    parser.add_argument(
+        "--gamma-max-pages", type=int, default=ACTIVE_GAMMA_PAGE_CAP,
+        help=f"maximum Gamma pages (capped at Collector limit: {ACTIVE_GAMMA_PAGE_CAP})",
+    )
     parser.add_argument("--receipt-sample", type=int, default=10)
     parser.add_argument("--gamma-sample", type=int, default=25)
     parser.add_argument(
@@ -547,12 +882,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--env-file", help="optional .env file; only POLYMARKET_RPC_URL is read")
     args = parser.parse_args(argv)
     try:
-        with open(args.report, "r", encoding="utf-8") as handle:
-            source_report = json.load(handle)
         rpc_url = _rpc_url_from_config(args.env_file)
         if not rpc_url:
             print("Missing POLYMARKET_RPC_URL configuration; RPC endpoint was not contacted.", file=sys.stderr)
             return 2
+        if args.discover_active:
+            if args.lookback_blocks < 1 or args.gamma_max_pages < 1:
+                raise ValueError("lookback-blocks and gamma-max-pages must be positive")
+            report = discover_active_v3_candidates(
+                JsonRpcReader(rpc_url), max_pages=args.gamma_max_pages,
+                lookback_blocks=args.lookback_blocks,
+            )
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 0
+        if not args.report:
+            parser.error("--report is required unless --discover-active is used")
+        with open(args.report, "r", encoding="utf-8") as handle:
+            source_report = json.load(handle)
         report = run_audit(
             source_report,
             rpc_url,
@@ -560,6 +906,9 @@ def main(argv: list[str] | None = None) -> int:
             gamma_sample=args.gamma_sample,
             combo_max_pages=args.combo_max_pages,
         )
+    except KeyboardInterrupt:
+        print("V2 coverage 1B audit cancelled; no complete report was produced.", file=sys.stderr)
+        return 130
     except (OSError, UnicodeError, json.JSONDecodeError, ProbeError, ValueError) as exc:
         print(f"V2 coverage 1B audit failed: {exc}", file=sys.stderr)
         return 2

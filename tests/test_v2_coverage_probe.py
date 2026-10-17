@@ -6,12 +6,12 @@ from eth_abi import encode
 from scripts import v2_coverage_probe as probe
 
 
-def make_position(module_id, *, arity=0, condition_index=0, outcome_index=0):
+def make_position(module_id, *, arity=0, condition_index=0, outcome_index=0, reserved=0):
     return (
         (module_id << 248)
         | (123 << 120)
         | (arity << 104)
-        | (7 << 40)
+        | (reserved << 40)
         | (0 << 24)
         | (condition_index << 8)
         | outcome_index
@@ -57,8 +57,21 @@ def test_event_topic_matches_official_v2_signature():
 def test_position_module_classification(module_id, expected):
     identity = probe.parse_position_id(make_position(module_id, arity=2 if module_id == 2 else 0))
     assert identity["module"] == expected
-    expected_classification = {1: "RECOGNIZED", 2: "RECOGNIZED", 3: "RESEARCH_ONLY"}.get(module_id, "FAIL_CLOSED")
+    expected_classification = {1: "SUPPORTED", 2: "SUPPORTED", 3: "RESEARCH_ONLY"}.get(module_id, "FAIL_CLOSED")
     assert identity["classification"] == expected_classification
+
+
+def test_gamma_samples_prioritize_runtime_supported_positions():
+    unique_ids = {
+        "combo-a": {"classification": "RESEARCH_ONLY"},
+        "combo-b": {"classification": "RESEARCH_ONLY"},
+        "binary": {"classification": "SUPPORTED"},
+        "negrisk": {"classification": "SUPPORTED"},
+        "invalid": {"classification": "FAIL_CLOSED"},
+    }
+    assert probe._prioritize_gamma_position_ids(unique_ids) == [
+        "binary", "negrisk", "combo-a", "combo-b", "invalid",
+    ]
 
 
 def test_invalid_module_shape_fails_closed():
@@ -73,7 +86,27 @@ def test_decoder_extracts_position_id_and_raw_amounts():
     assert fill["condition_index"] == 1
     assert fill["outcome_index"] == 1
     assert fill["maker_amount_raw"] == "100"
-    assert fill["classification"] == "RECOGNIZED"
+    assert fill["classification"] == "SUPPORTED"
+
+
+def test_runtime_decoder_rejects_non_polygon_chain_and_invalid_negrisk_arity():
+    bad_chain = make_position(1) | (1 << 24)
+    bad_arity = make_position(2, arity=1)
+    assert probe.parse_position_id(bad_chain)["classification"] == "FAIL_CLOSED"
+    assert probe.parse_position_id(bad_arity)["classification"] == "FAIL_CLOSED"
+
+
+@pytest.mark.parametrize(("module_id", "arity"), [(1, 0), (2, 2)])
+def test_runtime_decoder_rejects_nonzero_reserved_bits(module_id, arity):
+    canonical = probe.parse_position_id(make_position(module_id, arity=arity))
+    noncanonical = probe.parse_position_id(make_position(module_id, arity=arity, reserved=1))
+    assert canonical["classification"] == "SUPPORTED"
+    assert noncanonical["classification"] == "FAIL_CLOSED"
+
+
+def test_combinatorial_position_ids_are_research_only():
+    identity = probe.parse_position_id(make_position(3))
+    assert identity["classification"] == "RESEARCH_ONLY"
 
 
 def test_decoder_rejects_wrong_topic_and_malformed_data():
@@ -144,26 +177,70 @@ def test_run_probe_is_read_only_and_counts_unknown_positions_fail_closed():
 
 
 def test_gamma_only_accepts_exact_position_id_match():
+    position_id = str(make_position(1))
+    condition = f"0x{(int(position_id) >> 8):062x}"
     class GammaSession:
         def get(self, _url, params, timeout):
-            assert timeout == 15
-            assert params == {"position_ids": "123", "limit": 100}
-            return FakeResponse([{"positionIds": json.dumps([params["position_ids"]]),
-                                 "conditionId": "0xcondition", "question": "Q"}])
+            assert timeout == 30
+            assert params == {"position_ids": [position_id], "closed": False, "limit": 100}
+            return FakeResponse([{
+                "positionIds": json.dumps([position_id, str(make_position(1, outcome_index=1))]),
+                "outcomes": json.dumps(["YES", "NO"]),
+                "conditionId": condition,
+                "question": "Q",
+            }])
 
-    match = probe._gamma_exact_match("123", session=GammaSession())
-    assert match == {"status": "EXACT_MATCH", "condition_id": "0xcondition", "question": "Q"}
+    match = probe._gamma_exact_match(position_id, session=GammaSession())
+    assert match == {
+        "status": "EXACT_MATCH",
+        "condition_id": condition,
+        "question": "Q",
+        "outcome": "YES",
+        "module": "BINARY",
+        "closed_filter": False,
+        "collector_runtime_eligible": True,
+    }
 
 
 def test_gamma_ignores_clob_token_id_match_without_position_id_match():
+    position_id = str(make_position(1))
     class GammaSession:
         def get(self, _url, params, timeout):
-            assert "position_ids" in params
-            return FakeResponse([{"clobTokenIds": json.dumps([params["position_ids"]]),
+            assert params["position_ids"] == [position_id]
+            assert params["closed"] is False
+            return FakeResponse([{"clobTokenIds": json.dumps([position_id]),
                                   "positionIds": json.dumps(["456"])}])
 
-    result = probe._gamma_exact_match("123", session=GammaSession())
-    assert result == {"status": "NO_POSITION_ID_MATCH_NOT_PROOF_OF_ABSENCE"}
+    result = probe._gamma_exact_match(position_id, session=GammaSession())
+    assert result == {"status": "POSITION_ID_QUERY_RETURNED_NO_EXACT_MATCH", "closed_filter": False}
+
+
+def test_gamma_lookup_tries_closed_markets_after_active_lookup_misses():
+    position_id = str(make_position(1))
+    condition = f"0x{(int(position_id) >> 8):062x}"
+
+    class GammaSession:
+        def __init__(self):
+            self.closed_filters = []
+
+        def get(self, _url, params, timeout):
+            assert timeout == 30
+            self.closed_filters.append(params["closed"])
+            if params["closed"] is False:
+                return FakeResponse([])
+            return FakeResponse([{
+                "positionIds": [position_id, str(make_position(1, outcome_index=1))],
+                "outcomes": ["YES", "NO"],
+                "conditionId": condition,
+                "question": "Resolved Q",
+            }])
+
+    session = GammaSession()
+    result = probe._gamma_exact_match(position_id, session=session)
+    assert session.closed_filters == [False, True]
+    assert result["status"] == "EXACT_MATCH"
+    assert result["closed_filter"] is True
+    assert result["collector_runtime_eligible"] is True
 
 
 def test_combinatorial_leg_reader_uses_read_only_get_legs_call():
