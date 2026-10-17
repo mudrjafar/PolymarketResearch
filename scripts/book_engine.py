@@ -4,12 +4,17 @@ No network, no file I/O, no order submission, no wallet access.
 """
 
 import sys
+import re
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import finite_number
+try:
+    from .v3_identity import V3IdentityError, condition_matches_position
+except ImportError:  # pragma: no cover - direct script execution
+    from v3_identity import V3IdentityError, condition_matches_position
 
 TARGET_NOTIONALS_USD = (25.0, 50.0, 100.0)
 
@@ -103,18 +108,49 @@ def analyze_book(book, focus, target_notionals=TARGET_NOTIONALS_USD):
             "quotes": [],
         }
 
-    token_id = str(focus.get("token_id") or "").strip()
-    condition_id = str(focus.get("condition_id") or "").strip()
+    token_id = focus.get("token_id")
+    condition_id = focus.get("condition_id")
+    asset_id = book.get("asset_id")
+    market = book.get("market")
 
-    asset_id = str(book.get("asset_id") or "").strip()
-    market = str(book.get("market") or "").strip()
-
-    if not token_id:
+    if not isinstance(token_id, str) or not token_id:
         reasons.append("TOKEN_ID_MISSING")
-    if asset_id and token_id and asset_id != token_id:
+    elif not token_id.isascii() or not token_id.isdecimal() or str(int(token_id)) != token_id:
+        reasons.append("TOKEN_ID_INVALID")
+
+    if not isinstance(condition_id, str) or not condition_id:
+        reasons.append("CONDITION_ID_MISSING")
+
+    if not isinstance(asset_id, str) or not asset_id:
+        reasons.append("BOOK_ASSET_ID_MISSING")
+    elif not asset_id.isascii() or not asset_id.isdecimal() or str(int(asset_id)) != asset_id:
+        reasons.append("BOOK_ASSET_ID_INVALID")
+    elif isinstance(token_id, str) and asset_id != token_id:
         reasons.append("TOKEN_ID_MISMATCH")
-    if market and condition_id and market.lower() != condition_id.lower():
-        reasons.append("CONDITION_ID_MISMATCH")
+
+    if not isinstance(market, str) or not market:
+        reasons.append("BOOK_MARKET_MISSING")
+    elif isinstance(condition_id, str) and condition_id:
+        asset_type = str(focus.get("asset_type", "CTF_TOKEN") or "").strip().upper()
+        protocol_version = str(focus.get("protocol_version", "LEGACY_CTF") or "").strip().upper()
+        if asset_type == "POSITION" or protocol_version == "V2":
+            if asset_type != "POSITION" or protocol_version != "V2":
+                reasons.append("ASSET_PROTOCOL_MISMATCH")
+            else:
+                try:
+                    matches_market = condition_matches_position(market, condition_id)
+                except V3IdentityError:
+                    matches_market = False
+                if not matches_market:
+                    reasons.append("CONDITION_ID_MISMATCH")
+        else:
+            if asset_type != "CTF_TOKEN" or protocol_version not in {"", "LEGACY_CTF"}:
+                reasons.append("ASSET_PROTOCOL_MISMATCH")
+            elif (re.fullmatch(r"0x[0-9a-fA-F]{64}", condition_id) is None
+                    or re.fullmatch(r"0x[0-9a-fA-F]{64}", market) is None):
+                reasons.append("CONDITION_ID_INVALID")
+            elif market.casefold() != condition_id.casefold():
+                reasons.append("CONDITION_ID_MISMATCH")
 
     bids, bid_error = _parse_levels(book.get("bids"), reverse=True)
     asks, ask_error = _parse_levels(book.get("asks"), reverse=False)
@@ -199,13 +235,13 @@ def analyze_book(book, focus, target_notionals=TARGET_NOTIONALS_USD):
 
 def self_test():
     focus = {
-        "token_id": "token-a",
-        "condition_id": "condition-a",
+        "token_id": "123",
+        "condition_id": "0x" + "aa" * 32,
         "price": 0.50,
     }
     book = {
-        "market": "condition-a",
-        "asset_id": "token-a",
+        "market": "0x" + "aa" * 32,
+        "asset_id": "123",
         "timestamp": "1",
         "hash": "abc",
         "bids": [{"price": "0.49", "size": "1000"}],

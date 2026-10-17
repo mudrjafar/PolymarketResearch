@@ -18,6 +18,11 @@ from typing import Any
 
 import requests
 
+try:
+    from .v3_identity import V3IdentityError, condition_matches_position
+except ImportError:  # pragma: no cover - direct script execution
+    from v3_identity import V3IdentityError, condition_matches_position
+
 CLOB_API = "https://clob.polymarket.com"
 COMBO_API = "https://combos-rfq-api.polymarket.com"
 COMBO_PAGE_SIZE = 100
@@ -423,7 +428,12 @@ def audit_gamma_position(position_id: str, session: Any = requests) -> dict[str,
     }
 
 
-def audit_clob_asset(position_id: str, session: Any = requests) -> dict[str, Any]:
+def audit_clob_asset(
+    position_id: str,
+    session: Any = requests,
+    *,
+    expected_market: str | None = None,
+) -> dict[str, Any]:
     """Read a public CLOB book and verify its returned asset_id exactly.
 
     The unified official Python SDK accepts V2 position IDs as ``asset_id``
@@ -472,10 +482,37 @@ def audit_clob_asset(position_id: str, session: Any = requests) -> dict[str, Any
             "returned_asset_id": returned_asset_id,
             "status": "CLOB_ASSET_ID_MISMATCH",
         }
+    returned_market = book.get("market")
+    if expected_market is not None:
+        if not isinstance(returned_market, str) or not returned_market.strip():
+            return {
+                "position_id": position_id,
+                "returned_asset_id": returned_asset_id,
+                "expected_market": expected_market,
+                "status": "CLOB_MARKET_MISSING",
+            }
+        try:
+            matches_market = condition_matches_position(returned_market, expected_market)
+        except V3IdentityError:
+            return {
+                "position_id": position_id,
+                "returned_asset_id": returned_asset_id,
+                "expected_market": expected_market,
+                "returned_market": returned_market,
+                "status": "CLOB_MARKET_INVALID",
+            }
+        if not matches_market:
+            return {
+                "position_id": position_id,
+                "returned_asset_id": returned_asset_id,
+                "expected_market": expected_market,
+                "returned_market": returned_market,
+                "status": "CLOB_MARKET_MISMATCH",
+            }
     return {
         "position_id": position_id,
         "returned_asset_id": returned_asset_id,
-        "market": book.get("market"),
+        "market": returned_market,
         "status": "EXACT_CLOB_ASSET_ID_MATCH",
     }
 
@@ -616,8 +653,16 @@ def discover_active_v3_candidates(
         flush=True,
     )
     for candidate in candidates.values():
-        clob = audit_clob_asset(candidate["position_id"], session=session)
-        clob_checks.append({**candidate, "clob_status": clob.get("status")})
+        clob = audit_clob_asset(
+            candidate["position_id"],
+            session=session,
+            expected_market=candidate["condition_id"],
+        )
+        clob_checks.append({
+            **candidate,
+            "clob_status": clob.get("status"),
+            "clob_market": clob.get("market", clob.get("returned_market")),
+        })
         if clob.get("status") == "EXACT_CLOB_ASSET_ID_MATCH":
             clob_verified.append(clob_checks[-1])
 

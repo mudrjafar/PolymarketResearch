@@ -240,13 +240,15 @@ def _identity():
     }
 
 
-def v2_position(module_id=1, outcome_index=0, *, arity=None, condition_index=0):
+def v2_position(module_id=1, outcome_index=0, *, arity=None, condition_index=0, reserved=0):
     arity = (2 if module_id == 2 else 0) if arity is None else arity
-    token = (module_id << 248) | (123 << 120) | (arity << 104) | (condition_index << 8) | outcome_index
+    token = (module_id << 248) | (123 << 120) | (arity << 104) | (reserved << 40) | (condition_index << 8) | outcome_index
     condition = f"0x{(token >> 8):062x}"
     return {
         "condition_id": condition,
         "token_id": str(token),
+        "asset_type": "POSITION",
+        "protocol_version": "V2",
         "outcome": "Yes" if outcome_index == 0 else "No",
     }
 
@@ -287,6 +289,12 @@ def test_v2_combo_and_invalid_position_ids_fail_closed():
     with pytest.raises(paper_settlement.SettlementIdentityError, match="V2_POSITION_ID_UNSUPPORTED"):
         paper_settlement.resolve_position_identity(
             invalid["condition_id"], invalid["token_id"],
+            asset_type="POSITION", protocol_version="V2", validate_chain=False,
+        )
+    reserved = v2_position(1, reserved=1)
+    with pytest.raises(paper_settlement.SettlementIdentityError, match="V2_POSITION_ID_UNSUPPORTED"):
+        paper_settlement.resolve_position_identity(
+            reserved["condition_id"], reserved["token_id"],
             asset_type="POSITION", protocol_version="V2", validate_chain=False,
         )
 
@@ -390,6 +398,51 @@ def test_v2_frozen_identity_rejects_condition_outcome_or_module_mismatch():
         paper_settlement._frozen_identity({**candidate, **identity, "outcome_index": 1})
     with pytest.raises(paper_settlement.SettlementIdentityError, match="SETTLEMENT_ADDRESS_MISMATCH"):
         paper_settlement._frozen_identity({**candidate, **identity, "settlement_contract": paper_settlement.CTF_CONTRACT})
+
+
+@pytest.mark.parametrize(("asset_type", "protocol_version"), [
+    ("CTF_TOKEN", "LEGACY_CTF"),
+    ("POSITION", "LEGACY_CTF"),
+    ("CTF_TOKEN", "V2"),
+    (None, "V2"),
+    ("POSITION", None),
+])
+def test_v2_frozen_identity_rejects_conflicting_or_missing_protocol_tags(
+    asset_type, protocol_version,
+):
+    candidate = v2_position(1)
+    identity = v2_identity(candidate, 1)
+    candidate.update(identity)
+    candidate["asset_type"] = asset_type
+    candidate["protocol_version"] = protocol_version
+
+    with pytest.raises(
+        paper_settlement.SettlementIdentityError,
+        match="POSITION_PROTOCOL_METADATA_MISMATCH",
+    ):
+        paper_settlement._frozen_identity(candidate)
+
+
+@pytest.mark.parametrize(("asset_type", "protocol_version"), [
+    ("POSITION", "V2"),
+    ("POSITION", "LEGACY_CTF"),
+    ("CTF_TOKEN", "V2"),
+])
+def test_legacy_frozen_identity_rejects_v2_or_conflicting_tags(asset_type, protocol_version):
+    candidate = {
+        "condition_id": CONDITION,
+        "token_id": "123",
+        "outcome": "Yes",
+        **_identity(),
+        "asset_type": asset_type,
+        "protocol_version": protocol_version,
+    }
+
+    with pytest.raises(
+        paper_settlement.SettlementIdentityError,
+        match="ASSET_PROTOCOL_MISMATCH",
+    ):
+        paper_settlement._frozen_identity(candidate)
 
 
 def test_unresolved_and_resolved_not_final(monkeypatch):

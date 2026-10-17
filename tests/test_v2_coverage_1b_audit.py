@@ -8,7 +8,7 @@ from scripts import v2_coverage_probe as probe
 
 
 def make_position():
-    return (1 << 248) | (123 << 120) | (7 << 40)
+    return (1 << 248) | (123 << 120)
 
 
 def make_log():
@@ -117,6 +117,8 @@ def test_v2_position_id_decoder_rejects_invalid_layout():
 @pytest.mark.parametrize("position_id", [
     str((1 << 248) | (1 << 24)),
     str((2 << 248) | (1 << 104)),
+    str((1 << 248) | (123 << 120) | (1 << 40)),
+    str((2 << 248) | (123 << 120) | (2 << 104) | (1 << 40)),
 ])
 def test_audit_uses_runtime_decoder_fail_closed_rules(position_id):
     decoded = audit.decode_v2_position_id(position_id)
@@ -200,6 +202,40 @@ def test_active_candidate_becomes_confirmed_only_after_receipt_and_block_match()
     assert result["confirmed_candidates"][0]["receipt_status"] == "RECEIPT_AND_CANONICAL_BLOCK_MATCH"
 
 
+def test_active_candidate_is_not_confirmed_when_clob_market_disagrees_with_gamma():
+    position_id = str((1 << 248) | (123 << 120))
+    condition = f"0x{(int(position_id) >> 8):062x}"
+    log = make_log()
+    log["data"] = "0x" + encode(
+        ["uint8", "uint256", "uint256", "uint256", "uint256", "bytes32", "bytes32"],
+        [0, int(position_id), 100, 200, 1, bytes.fromhex("22" * 32), bytes.fromhex("33" * 32)],
+    ).hex()
+    receipt = {
+        "transactionHash": log["transactionHash"],
+        "blockNumber": log["blockNumber"],
+        "blockHash": log["blockHash"],
+        "status": "0x1",
+        "logs": [log],
+    }
+    rpc = FakeRpc(logs=[log], receipt=receipt)
+    session = FakeGamma(
+        {"markets": [{
+            "id": "active-market", "active": True, "closed": False,
+            "conditionId": condition,
+            "positionIds": [position_id, str((1 << 248) | (123 << 120) | 1)],
+            "outcomes": ["YES", "NO"],
+        }], "next_cursor": None},
+        clob_book={"asset_id": position_id, "market": "0x" + "ff" * 31},
+    )
+
+    result = audit.discover_active_v3_candidates(rpc, session=session, lookback_blocks=1)
+
+    assert result["clob_candidate_checks"][0]["clob_status"] == "CLOB_MARKET_MISMATCH"
+    assert result["clob_verified_candidates"] == []
+    assert result["confirmed_candidates"] == []
+    assert result["status"] != "CONFIRMED_CANDIDATE_FOUND"
+
+
 def test_active_discovery_retries_gamma_connection_error(monkeypatch):
     class FlakyGamma(FakeGamma):
         def __init__(self):
@@ -225,7 +261,10 @@ def test_active_discovery_preserves_candidates_when_later_gamma_page_fails(monke
 
     class FailingSecondPage(FakeGamma):
         def __init__(self):
-            super().__init__({"markets": [], "next_cursor": None}, clob_book={"asset_id": position_id})
+            super().__init__(
+                {"markets": [], "next_cursor": None},
+                clob_book={"asset_id": position_id, "market": condition},
+            )
 
         def get(self, url, *, params, timeout):
             self.calls.append((url, params, timeout))
@@ -410,15 +449,53 @@ def test_gamma_duplicate_position_matches_are_ambiguous():
 
 def test_clob_exact_asset_id_book_response_confirms_public_lookup():
     position_id = str(make_position())
+    condition = f"0x{(int(position_id) >> 8):062x}"
     result = audit.audit_clob_asset(position_id, session=FakeGamma([], {
         "asset_id": position_id,
-        "market": "0xcondition",
+        "market": condition,
         "bids": [],
         "asks": [],
     }))
     assert result["status"] == "EXACT_CLOB_ASSET_ID_MATCH"
     assert result["returned_asset_id"] == position_id
-    assert result["market"] == "0xcondition"
+    assert result["market"] == condition
+
+
+def test_clob_confirmation_requires_expected_market_match():
+    position_id = str(make_position())
+    condition = f"0x{(int(position_id) >> 8):062x}"
+    padded_condition = condition + "00"
+    matching = audit.audit_clob_asset(
+        position_id,
+        session=FakeGamma([], {"asset_id": position_id, "market": condition.upper().replace("0X", "0x")}),
+        expected_market=condition,
+    )
+    padded = audit.audit_clob_asset(
+        position_id,
+        session=FakeGamma([], {"asset_id": position_id, "market": padded_condition}),
+        expected_market=condition,
+    )
+    wrong_market = audit.audit_clob_asset(
+        position_id,
+        session=FakeGamma([], {"asset_id": position_id, "market": "0x" + "bb" * 31}),
+        expected_market=condition,
+    )
+    missing_market = audit.audit_clob_asset(
+        position_id,
+        session=FakeGamma([], {"asset_id": position_id}),
+        expected_market=condition,
+    )
+    invalid_market = audit.audit_clob_asset(
+        position_id,
+        session=FakeGamma([], {"asset_id": position_id, "market": "0xnot-hex"}),
+        expected_market=condition,
+    )
+
+    assert matching["status"] == "EXACT_CLOB_ASSET_ID_MATCH"
+    assert padded["status"] == "EXACT_CLOB_ASSET_ID_MATCH"
+    assert wrong_market["status"] == "CLOB_MARKET_MISMATCH"
+    assert missing_market["status"] == "CLOB_MARKET_MISSING"
+    assert invalid_market["status"] == "CLOB_MARKET_INVALID"
 
 
 def test_clob_mismatch_and_lookup_errors_are_not_identity_proof():

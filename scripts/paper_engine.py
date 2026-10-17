@@ -5,6 +5,7 @@ No network, file I/O, Telegram, wallet, signing, or order submission.
 """
 
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -12,6 +13,10 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import finite_number
+try:
+    from .v3_identity import V3IdentityError, condition_matches_position
+except ImportError:  # pragma: no cover - direct script execution
+    from v3_identity import V3IdentityError, condition_matches_position
 
 
 FEE_DECIMALS = 5
@@ -19,6 +24,15 @@ FEE_DECIMALS = 5
 
 def _number(value):
     return finite_number(value, None)
+
+
+def _canonical_uint256_id(value):
+    if not isinstance(value, str) or not value or not value.isascii() or not value.isdecimal():
+        return False
+    if len(value) > 78:
+        return False
+    number = int(value)
+    return number < (1 << 256) and str(number) == value
 
 
 def _parse_levels(raw, *, reverse):
@@ -43,21 +57,57 @@ def _parse_levels(raw, *, reverse):
     return levels, None
 
 
-def validate_book_identity(book, token_id, condition_id):
+def validate_book_identity(
+    book,
+    token_id,
+    condition_id,
+    *,
+    asset_type="CTF_TOKEN",
+    protocol_version="LEGACY_CTF",
+):
     if not isinstance(book, dict):
         return False, "BOOK_PAYLOAD_INVALID"
 
-    token_id = str(token_id or "").strip()
-    condition_id = str(condition_id or "").strip()
-    asset_id = str(book.get("asset_id") or "").strip()
-    market = str(book.get("market") or "").strip()
-
-    if not token_id:
+    if not isinstance(token_id, str) or not token_id:
         return False, "TOKEN_ID_MISSING"
-    if asset_id and asset_id != token_id:
+    if not _canonical_uint256_id(token_id):
+        return False, "TOKEN_ID_INVALID"
+    if not isinstance(condition_id, str) or not condition_id:
+        return False, "CONDITION_ID_MISSING"
+
+    asset_id = book.get("asset_id")
+    market = book.get("market")
+    if not isinstance(asset_id, str) or not asset_id.strip():
+        return False, "BOOK_ASSET_ID_MISSING"
+    if not _canonical_uint256_id(asset_id):
+        return False, "BOOK_ASSET_ID_INVALID"
+    if asset_id != token_id:
         return False, "TOKEN_ID_MISMATCH"
-    if market and condition_id and market.lower() != condition_id.lower():
-        return False, "CONDITION_ID_MISMATCH"
+
+    if not isinstance(market, str) or not market.strip():
+        return False, "BOOK_MARKET_MISSING"
+
+    asset_type = str(asset_type or "").strip().upper()
+    protocol_version = str(protocol_version or "").strip().upper()
+    if asset_type == "POSITION" or protocol_version == "V2":
+        if asset_type != "POSITION" or protocol_version != "V2":
+            return False, "ASSET_PROTOCOL_MISMATCH"
+        try:
+            matches_market = condition_matches_position(market, condition_id)
+        except V3IdentityError:
+            return False, "CONDITION_ID_INVALID"
+        if not matches_market:
+            return False, "CONDITION_ID_MISMATCH"
+    else:
+        if asset_type not in {"", "CTF_TOKEN"} or protocol_version not in {"", "LEGACY_CTF"}:
+            return False, "ASSET_PROTOCOL_MISMATCH"
+        if (
+            re.fullmatch(r"0x[0-9a-fA-F]{64}", condition_id) is None
+            or re.fullmatch(r"0x[0-9a-fA-F]{64}", market) is None
+        ):
+            return False, "CONDITION_ID_INVALID"
+        if market.casefold() != condition_id.casefold():
+            return False, "CONDITION_ID_MISMATCH"
 
     return True, "OK"
 

@@ -54,6 +54,7 @@ def decode_position_id(value):
     if module_id == MODULE_BINARY:
         valid = (
             arity == 0
+            and reserved == 0
             and condition_index == 0
             and outcome_index in (0, 1)
             and resolution_chain == 0
@@ -62,6 +63,7 @@ def decode_position_id(value):
     elif module_id == MODULE_NEGRISK:
         valid = (
             arity >= 2
+            and reserved == 0
             and condition_index <= arity
             and outcome_index in (0, 1)
             and resolution_chain == 0
@@ -88,23 +90,33 @@ def decode_position_id(value):
 
 
 def condition_matches_position(value, expected):
-    """Match canonical bytes31 or its bytes32 right-padded representation."""
+    """Match bytes31 ConditionIds and canonical ABI bytes32 right-padding.
+
+    The V2 Position IDs spec defines ConditionId as bytes31. At a bytes32
+    boundary Solidity's strict decoder requires the discarded low byte to be
+    zero, so only a single trailing ``00`` is accepted as the wider form.
+    """
     raw = str(value or "").strip().lower()
     expected = str(expected or "").strip().lower()
 
-    if len(expected) != 64 or not expected.startswith("0x"):
-        raise V3IdentityError("expected V3 condition_id is invalid")
-    try:
-        int(expected[2:], 16)
-    except ValueError as exc:
-        raise V3IdentityError("expected V3 condition_id is invalid") from exc
+    def normalize(value, label):
+        if not value.startswith("0x") or len(value) not in (64, 66):
+            raise V3IdentityError(f"{label} is invalid")
+        try:
+            int(value[2:], 16)
+        except ValueError as exc:
+            raise V3IdentityError(f"{label} is invalid") from exc
+        if len(value) == 66:
+            if value[-2:] != "00":
+                raise V3IdentityError(f"{label} is not canonical bytes31 padding")
+            return value[:64]
+        return value
+
+    expected = normalize(expected, "expected V3 condition_id")
+    raw = normalize(raw, "V3 condition_id")
 
     if raw == expected:
         return True
-
-    if len(raw) == 66 and raw.startswith("0x") and raw[2:64] == expected[2:] and raw[64:] == "00":
-        return True
-
     return False
 
 
@@ -172,7 +184,13 @@ def runtime_position_market_entries(market):
             return []
         if labels[index].casefold() != expected_outcome_label(position["outcome_index"]):
             return []
-        if not condition_matches_position(market.get("conditionId"), position["condition_id"]):
+        try:
+            condition_match = condition_matches_position(
+                market.get("conditionId"), position["condition_id"],
+            )
+        except V3IdentityError:
+            return []
+        if not condition_match:
             return []
 
         entries.append((

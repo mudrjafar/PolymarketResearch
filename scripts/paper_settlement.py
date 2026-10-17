@@ -498,6 +498,10 @@ def _frozen_identity(position):
 
     protocol = str(position.get("settlement_protocol") or "").strip()
     if protocol == PROTOCOL_V2_POSITION:
+        asset_type = str(position.get("asset_type") or "").strip().upper()
+        protocol_version = str(position.get("protocol_version") or "").strip().upper()
+        if asset_type != "POSITION" or protocol_version != "V2":
+            raise SettlementIdentityError("POSITION_PROTOCOL_METADATA_MISMATCH")
         identity, _ = _v2_identity(position.get("condition_id"), position.get("token_id"))
         module_id = identity["module_id"]
         family = str(position.get("settlement_family") or "").strip()
@@ -525,6 +529,11 @@ def _frozen_identity(position):
         }
     if protocol != PROTOCOL_LEGACY_CTF:
         raise SettlementIdentityError("SETTLEMENT_PROTOCOL_INVALID")
+
+    asset_type = str(position.get("asset_type") or "").strip().upper()
+    protocol_version = str(position.get("protocol_version") or "").strip().upper()
+    if asset_type not in {"", "CTF_TOKEN"} or protocol_version not in {"", "LEGACY_CTF"}:
+        raise SettlementIdentityError("ASSET_PROTOCOL_MISMATCH")
 
     family = str(position.get("settlement_family") or "").strip()
     if family not in SUPPORTED_FAMILIES:

@@ -6,12 +6,12 @@ from eth_abi import encode
 from scripts import v2_coverage_probe as probe
 
 
-def make_position(module_id, *, arity=0, condition_index=0, outcome_index=0):
+def make_position(module_id, *, arity=0, condition_index=0, outcome_index=0, reserved=0):
     return (
         (module_id << 248)
         | (123 << 120)
         | (arity << 104)
-        | (7 << 40)
+        | (reserved << 40)
         | (0 << 24)
         | (condition_index << 8)
         | outcome_index
@@ -94,6 +94,14 @@ def test_runtime_decoder_rejects_non_polygon_chain_and_invalid_negrisk_arity():
     bad_arity = make_position(2, arity=1)
     assert probe.parse_position_id(bad_chain)["classification"] == "FAIL_CLOSED"
     assert probe.parse_position_id(bad_arity)["classification"] == "FAIL_CLOSED"
+
+
+@pytest.mark.parametrize(("module_id", "arity"), [(1, 0), (2, 2)])
+def test_runtime_decoder_rejects_nonzero_reserved_bits(module_id, arity):
+    canonical = probe.parse_position_id(make_position(module_id, arity=arity))
+    noncanonical = probe.parse_position_id(make_position(module_id, arity=arity, reserved=1))
+    assert canonical["classification"] == "SUPPORTED"
+    assert noncanonical["classification"] == "FAIL_CLOSED"
 
 
 def test_combinatorial_position_ids_are_research_only():
