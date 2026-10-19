@@ -1,0 +1,51 @@
+name: GENERAL1-H1 Minimal Collector Offline
+on:
+  push:
+    branches:
+      - feat/general1h-minimal-market-collector-20261018
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements.txt
+      - name: Targeted market-discovery unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_market_discovery.py 2>&1 | tee targeted.log
+      - name: Full offline project
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee full.log
+      - name: Existing runtime self-test
+        shell: bash
+        run: |
+          set -o pipefail
+          python run_machine.py --self-test 2>&1 | tee self_test.log
+      - name: Package real evidence
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p handoff
+          git rev-parse HEAD > handoff/commit.txt
+          git diff HEAD~3..HEAD > handoff/changes.diff
+          cp scripts/market_discovery.py tests/test_market_discovery.py handoff/
+          cp -f targeted.log full.log self_test.log handoff/ 2>/dev/null || true
+          (cd handoff && find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: general1h-market-collector-handoff
+          path: handoff/
+          if-no-files-found: error
