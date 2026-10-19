@@ -1,0 +1,36 @@
+name: GENERAL1 E2E isolated smoke
+on:
+  push:
+    branches:
+      - feat/general1-e2e1-integration-smoke-20261019
+  pull_request:
+    paths:
+      - 'tests/test_general1_e2e_smoke.py'
+      - '.github/workflows/general1-e2e-smoke.yml'
+jobs:
+  integration-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Run real staged E2E and offline project suite
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p handoff
+          python -m pytest tests/test_general1_e2e_smoke.py -v 2>&1 | tee handoff/e2e_smoke_test.log
+          python -m pytest -q 2>&1 | tee handoff/full_project_tests.log
+          python run_machine.py --self-test 2>&1 | tee handoff/machine_selftest.log
+          git rev-parse HEAD > handoff/commit.txt
+          cp tests/test_general1_e2e_smoke.py handoff/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: general1-e2e1-offline-handoff
+          path: handoff/
+          if-no-files-found: warn
