@@ -26,6 +26,58 @@ SHOW = 5
 CONDITION_ID = re.compile(r"0x(?:[0-9a-fA-F]{62}|[0-9a-fA-F]{64})\Z")
 DECIMAL_ID = re.compile(r"[1-9][0-9]*\Z")
 
+# H1.1: only an explicitly recognized non-sport Gamma tag is sufficient.
+# Missing, malformed or unfamiliar categories remain UNKNOWN, never non-sport.
+NON_SPORT_TAGS = frozenset({
+    "politics", "geopolitics", "world", "economics", "economy", "finance",
+    "business", "crypto", "technology", "tech", "science", "climate",
+    "weather", "entertainment", "artificial-intelligence", "ai",
+})
+SPORT_TAGS = frozenset({
+    "sports", "sport", "soccer", "football", "american-football", "nfl",
+    "nba", "wnba", "mlb", "nhl", "baseball", "basketball", "hockey",
+    "college-football", "college-basketball", "ncaa", "tennis", "golf",
+    "pga", "ufc", "mma", "boxing", "f1", "formula-1", "formula1",
+    "cricket", "rugby", "olympics", "esports", "e-sports", "valorant",
+    "counter-strike", "league-of-legends", "dota-2",
+})
+
+
+def sport_policy(raw):
+    """SPORT / NON_SPORT / UNKNOWN from Gamma tags; never guess from title."""
+    if raw.get("gameId") or raw.get("sportsMarketType") or raw.get("sport") or raw.get("isSport") is True:
+        return "SPORT"
+    events = raw.get("events", [])
+    if events is None:
+        events = []
+    if not isinstance(events, list):
+        return "UNKNOWN"
+    group = [raw] + events
+    slugs = set()
+    for item in group:
+        if not isinstance(item, dict):
+            return "UNKNOWN"
+        if item.get("gameId") or item.get("sportsMarketType") or item.get("sport") or item.get("isSport") is True:
+            return "SPORT"
+        tags = item.get("tags")
+        if tags is None:
+            continue
+        if not isinstance(tags, list):
+            return "UNKNOWN"
+        for tag in tags:
+            if not isinstance(tag, dict):
+                return "UNKNOWN"
+            for key in ("slug", "label"):
+                value = tag.get(key)
+                if isinstance(value, str) and value.strip():
+                    slugs.add(value.strip().lower().replace(" ", "-"))
+    if slugs & SPORT_TAGS:
+        return "SPORT"
+    if slugs & NON_SPORT_TAGS:
+        return "NON_SPORT"
+    return "UNKNOWN"
+
+
 
 class DiscoveryError(RuntimeError):
     pass
@@ -69,6 +121,11 @@ def candidate(raw, now):
         return None, "invalid_row"
     if raw.get("active") is not True or raw.get("closed") is not False or raw.get("acceptingOrders") is not True:
         return None, "inactive_or_not_trading"
+    category = sport_policy(raw)
+    if category == "SPORT":
+        return None, "sports_excluded"
+    if category != "NON_SPORT":
+        return None, "unknown_category_excluded"
     end = parse_end(raw.get("endDate"))
     if end is None:
         return None, "invalid_end_date"
@@ -145,6 +202,7 @@ def fetch_market_page(now, getter=None, sleeper=time.sleep):
         "limit": PAGE_SIZE,
         "active": "true",
         "closed": "false",
+        "include_tag": "true",  # include market and event category metadata
         "end_date_min": utc_iso(now),
         "end_date_max": utc_iso(now + timedelta(days=MAX_DAYS)),
     }
@@ -188,6 +246,8 @@ def build_snapshot(now, markets, next_cursor_present):
         "source": "POLYMARKET_GAMMA_KEYSET",
         "scope": "LIMITED_SAMPLE",
         "execution_authority": "NONE",
+        "sports_policy": "SPORTS_EXCLUDED_UNKNOWN_EXCLUDED",
+        "category_authority": "GAMMA_MARKET_OR_EVENT_TAGS",
         "filter": {
             "scheduled_end_after": utc_iso(now),
             "scheduled_end_at_or_before": utc_iso(now + timedelta(days=MAX_DAYS)),
