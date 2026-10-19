@@ -16,6 +16,7 @@ def market(mid="1", hours=48, **changes):
         "question": f"Market {mid}?", "outcomes": '["Yes", "No"]',
         "clobTokenIds": json.dumps([str(1000 + int(mid) * 2), str(1001 + int(mid) * 2)]),
         "active": True, "closed": False, "acceptingOrders": True,
+        "tags": [{"slug": "politics", "label": "Politics"}],
         "endDate": m.utc_iso(NOW + timedelta(hours=hours)),
     }
     row.update(changes)
@@ -209,3 +210,54 @@ def test_partial_market_response_does_not_become_success(tmp_path):
     with pytest.raises(m.DiscoveryError):
         m.run(now=NOW, output=output, getter=lambda *a, **kw: Response(ValueError("bad json")))
     assert output.read_bytes() == b"ORIGINAL"
+
+
+# H1.1 sport and unknown category checks
+
+def test_sport_tag_excluded_even_with_politics_tag():
+    src = market(tags=[{"slug": "sports"}, {"slug": "politics"}])
+    assert m.candidate(src, NOW)[1] == "sports_excluded"
+
+
+def test_soccer_from_event_tags_excluded():
+    src = market(tags=[], events=[{"tags": [{"slug": "soccer"}]}])
+    assert m.candidate(src, NOW)[1] == "sports_excluded"
+
+
+def test_game_id_excluded_even_with_nonsport_tag():
+    assert m.candidate(market(gameId="some-game"), NOW)[1] == "sports_excluded"
+
+
+def test_unknown_tag_fails_closed():
+    assert m.candidate(market(tags=[{"slug": "mystery-taxonomy"}]), NOW)[1] == "unknown_category_excluded"
+    assert m.candidate(market(tags=[]), NOW)[1] == "unknown_category_excluded"
+
+
+def test_missing_tags_fails_closed():
+    src = market()
+    del src["tags"]
+    assert m.candidate(src, NOW)[1] == "unknown_category_excluded"
+
+
+def test_malformed_tags_fails_closed():
+    assert m.candidate(market(tags="sports"), NOW)[1] == "unknown_category_excluded"
+
+
+def test_verified_nonsport_retained():
+    row, error = m.candidate(market(tags=[{"slug": "politics"}]), NOW)
+    assert error is None and row["market_id"] == "1"
+
+
+def test_same_event_sport_excluded_reduces_candidates():
+    rows = [market(str(i), tags=[{"slug": "soccer"}]) for i in range(1, 25)]
+    rows.append(market("25", tags=[{"slug": "politics"}]))
+    snap = m.build_snapshot(NOW, rows, True)
+    assert snap["counts"]["saved"] == 1
+    assert snap["counts"]["excluded"]["sports_excluded"] == 24
+
+
+def test_tag_hydration_requested_in_one_market_page():
+    get, calls = get_for([])
+    m.fetch_market_page(NOW, getter=get)
+    assert len(calls) == 1
+    assert calls[0][1]["include_tag"] == "true"
