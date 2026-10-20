@@ -943,7 +943,11 @@ def lookup_position_market(position_id):
             "Gamma position metadata is not an eligible V2 binary/NegRisk identity"
         )
 
-    raise RuntimeError(
+    # Gamma returned no position for either open or closed market searches.
+    # This is unresolved metadata, not proof of an invalid canonical identity.
+    # Retry the SAME uncommitted block range with the existing bounded backoff;
+    # do not skip the trade or advance the checkpoint.
+    raise RetryableCollectorError(
         "Aggressor position metadata unavailable; batch will be retried"
     )
 
