@@ -131,7 +131,8 @@ def test_summary_contains_only_nonsensitive_collector_fields(tmp_path):
     assert "secret" not in json.dumps(records)
 
 
-def test_runner_fails_closed_before_any_start_when_not_in_dedicated_root(monkeypatch, capsys):
+def test_runner_fails_closed_before_any_start_when_not_in_dedicated_root(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(live, "ROOT", tmp_path / "not_the_live_sandbox")
     monkeypatch.setenv("POLYMARKET_RPC_URL", "https://provider.example/secret")
     result = live.main(["--duration", "60"])
     assert result == 3
