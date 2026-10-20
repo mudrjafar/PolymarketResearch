@@ -1080,6 +1080,85 @@ class CollectorV3CoverageTests(unittest.TestCase):
         self.assertEqual(params['position_ids'], [position_id])
         self.assertNotIn('clob_token_ids', params)
 
+    def test_e2e2_gamma_position_missing_open_and_closed_is_retryable_not_fatal(self):
+        """Two empty Gamma position searches keep the exact V3 identity unresolved."""
+        raw = v3_market()
+        position_id = raw['positionIds'][0]
+
+        class EmptyResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return []
+
+        with patch.object(collector.requests, 'get', return_value=EmptyResponse()) as get:
+            with self.assertRaisesRegex(
+                collector.RetryableCollectorError,
+                'Aggressor position metadata unavailable',
+            ):
+                collector.lookup_position_market(position_id)
+
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(
+            [call.kwargs['params']['closed'] for call in get.call_args_list],
+            [False, True],
+        )
+        self.assertTrue(all(
+            call.kwargs['params']['position_ids'] == [position_id]
+            for call in get.call_args_list
+        ))
+
+    def test_e2e2_position_missing_does_not_commit_advance_or_publish(self):
+        """Retryable identity miss must fail the whole real blockchain batch closed."""
+        raw = v3_market()
+        position_id = raw['positionIds'][0]
+        v3log = event(101, int(position_id), collector.EXCHANGE_V3)
+        before = self.store.checkpoint()['block_number']
+
+        class EmptyResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return []
+
+        with patch.object(collector, 'get_latest_block', return_value=125), \\
+             patch.object(collector, 'get_block_header', side_effect=header), \\
+             patch.object(collector, 'get_order_filled_logs', return_value=[v3log]), \\
+             patch.object(collector.requests, 'get', return_value=EmptyResponse()) as get, \\
+             patch.object(self.store, 'commit_batch', wraps=self.store.commit_batch) as commit, \\
+             patch.object(collector, 'publish_snapshot') as publish:
+            with self.assertRaises(collector.RetryableCollectorError):
+                collector.scan_once(self.store, collector.GammaTokenMap({}))
+
+        self.assertEqual(get.call_count, 2)
+        commit.assert_not_called()
+        publish.assert_not_called()
+        self.assertEqual(self.store.checkpoint()['block_number'], before)
+        self.assertEqual(self.store.recent_trades(0), [])
+
+    def test_e2e2_position_nonempty_ineligible_gamma_identity_remains_fatal(self):
+        """Contradictory Gamma metadata must NEVER fall into missing-data retry."""
+        raw = v3_market()
+        position_id = raw['positionIds'][0]
+        wrong = v3_market()
+        wrong['outcomes'] = ['No', 'Yes']
+
+        class InvalidResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return [wrong]
+
+        with patch.object(collector.requests, 'get', return_value=InvalidResponse()) as get:
+            with self.assertRaises(collector.GammaIdentityConflict) as failure:
+                collector.lookup_position_market(position_id)
+
+        self.assertNotIsInstance(failure.exception, collector.RetryableCollectorError)
+        self.assertEqual(get.call_count, 1)
+
     def test_v3_binary_trade_enters_existing_runtime_contract_with_explicit_asset_kind(self):
         raw=v3_market()
         position_id=raw['positionIds'][0]
