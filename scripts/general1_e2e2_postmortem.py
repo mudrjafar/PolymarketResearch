@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 from scripts import flow_tracker as flow
 
 SENSITIVE_LOG_TYPES = re.compile(
-    r"^\\s*(?:[A-Za-z_]\\w*\\.)*([A-Za-z_]\\w*(?:Error|Exception|Conflict|Timeout|Failure))(?::|$)"
+    r"^\s*(?:[A-Za-z_]\w*\.)*([A-Za-z_]\w*(?:Error|Exception|Conflict|Timeout|Failure))(?::|$)"
 )
 
 
