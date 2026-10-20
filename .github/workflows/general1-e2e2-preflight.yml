@@ -8,7 +8,13 @@ on:
     paths:
       - 'scripts/general1_e2e2_live_probe.py'
       - 'scripts/general1_e2e2_windows.cmd'
+      - 'scripts/general1_e2e2_postmortem.py'
+      - 'scripts/flow_tracker.py'
+      - 'scripts/live_active_trades.py'
       - 'tests/test_general1_e2e2_live_probe.py'
+      - 'tests/test_general1_e2e2_postmortem.py'
+      - 'tests/test_flow_unit2.py'
+      - 'tests/test_collector_sqlite.py'
       - '.github/workflows/general1-e2e2-preflight.yml'
 
 jobs:
@@ -36,9 +42,11 @@ jobs:
           cp scripts/general1_e2e2_windows.cmd handoff/
           cp scripts/general1_e2e2_postmortem.py handoff/
           cp scripts/flow_tracker.py handoff/
+          cp scripts/live_active_trades.py handoff/
           cp tests/test_general1_e2e2_live_probe.py handoff/
           cp tests/test_general1_e2e2_postmortem.py handoff/
           cp tests/test_flow_unit2.py handoff/
+          cp tests/test_collector_sqlite.py handoff/
           cp GENERAL1_E2E2_PRELIVE_REPORT.md handoff/
           cp .github/workflows/general1-e2e2-preflight.yml handoff/
           sha256sum handoff/* > handoff/SHA256SUMS.txt
