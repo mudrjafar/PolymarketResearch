@@ -94,3 +94,55 @@ a critical fault, unsafe condition or data integrity problem.
 After reviewing the generated JSON, GENERAL1-E2E-3 should resolve only measured runtime
 blockers and add a separate, reviewed integration for the sport-excluded candidate watchlist.
 Do not implement strategy changes until live delivery contracts are verified.
+
+## FIRST USER WINDOWS LIVE SESSION — ACTUAL OBSERVED EVIDENCE
+
+Source: user's local `general1_e2e2_live_report.json` (not GitHub CI). The report
+contains no RPC URLs or transaction identifiers and may be shared.
+
+- **RESULT:** PARTIAL; duration **815.03 s**, requested **900 s**, `interrupted=true`.
+- RPC chain id **137**. Head `95883646 → 95884190`.
+- Collector committed **225 blocks**, **5,870 trades** into a database with `quick_check_ok=true`.
+- Collector rate **0.276 blocks/sec** vs chain **0.667 blocks/sec** (41.36% of chain).
+- Lag increased **521 → 630**; `catchup_observed=false`.
+- **866** Gamma lookups, mean success batch **8,791 ms**, max **20,168 ms**.
+- Six **collector** worker restarts, with six consecutive failures and final
+  `DEGRADED` status. All other enabled workers remained RUNNING with zero
+  observed restarts. The summary did not contain crash exception classes.
+- Flow markets 0, Diamond generation exists with analysis count 0, matching
+  Risk generation but Risk decisions 0, `real_trade_to_risk_binding_observed=false`.
+- Focus IDLE, Book NOT_READY, Paper 0 positions.
+
+### Confirmed producer-consumer contract defect (source-level)
+
+`scripts/live_active_trades.py:get_block_header()` emits `block_timestamp` as
+Polygon's **integer Unix seconds**. `normalize_trade()` persists this integer
+in V4 JSON trade rows. But old `scripts/flow_tracker.py:_strict_aware_time()`
+previously attempted `datetime.fromisoformat(str(value))` and rejected
+Unix integers. Every otherwise-valid V4 collector row with an integer timestamp
+was rejected before Flow window eligibility; `load_trades()` filtered these
+rows out. Additionally `last_trade_at` previously copied the raw numeric
+timestamp and would be considered stale/unknown by Diamond's ISO-only
+`machine_common.fresh()`.
+
+**Minimal fix:** accept **integer Unix seconds** for the canonical V4 block
+timestamp (while preserving strictly-aware ISO timestamp compatibility),
+reject bool/negative/out-of-range timestamps; normalize Flow's exported
+`market.last_trade_at` to timezone-aware ISO derived from the block time,
+not `detected_at`. Dedicated unit tests preserve stale/invalid data
+fail-closed behavior. Not yet proven on user hardware.
+
+### Collector crash and performance remain open
+
+Exit code 1 repeated six times. The safe live summary does not contain
+exception types; no root cause should be invented. The branch now includes
+`scripts/general1_e2e2_postmortem.py`, a read-only, credential-redacting
+collector-log classifier and V4 snapshot timestamp/age report. Run it
+locally against the original sandbox. **Do not upload raw collector.log**.
+
+Collector catch-up remains a hard blocker independent of the fixed Flow
+timestamp shape. Do not modify batch size, RPC concurrency, Gamma caching,
+sleep, or retry semantics without separate measurements and authorization.
+
+**Verdict:** GENERAL1-E2E-2 remains PARTIAL. The source-level fix is
+pending local retest; the live collector crash and lag require diagnostics.
