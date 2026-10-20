@@ -137,3 +137,60 @@ def test_runner_fails_closed_before_any_start_when_not_in_dedicated_root(monkeyp
     result = live.main(["--duration", "60"])
     assert result == 3
     assert "secret" not in capsys.readouterr().out
+
+def test_live_wrapper_invokes_supervisor_and_shutdown_with_fakes(tmp_path, monkeypatch):
+    """Full runner control-flow without real processes, network or credentials."""
+    p = sandbox(tmp_path)
+    monkeypatch.setattr(live, "ROOT", p)
+    original_gate = live.isolation_gate
+    monkeypatch.setattr(live, "isolation_gate", lambda root: original_gate(root, parent=tmp_path))
+    monkeypatch.setattr(live.subprocess, "run", lambda *args, **kwargs: None)
+    head = iter((1000, 1010))
+    monkeypatch.setattr(live, "rpc_number", lambda _, method: 137 if method == "eth_chainId" else next(head))
+    monkeypatch.setattr(live.run_machine, "build_services", lambda: [
+        live.ServiceSpec(name, (name,)) for name in sorted(live.CORE)
+    ])
+    monkeypatch.setattr(live, "db_summary", lambda _: {
+        "exists": True, "quick_check_ok": True, "_evidence": [("tok", "cid")],
+        "checkpoint": 1000, "blocks": 10, "trades": 1,
+    })
+    monkeypatch.setattr(live, "diagnostic_records", lambda _: [
+        {"status": "SUCCESS", "blocks": 10, "lag_before": 20, "lag_after": 10},
+    ])
+    monkeypatch.setattr(live, "pipeline_summary", lambda *_: {
+        "real_trade_to_risk_binding_observed": True, "paper_positions": 0,
+    })
+
+    class FakeSupervisor:
+        stopped = False
+        def __init__(self, specs, **kwargs):
+            assert {x.name for x in specs} == set(live.CORE)
+            assert all(x.enabled for x in specs)
+        def start_all(self):
+            pass
+        def poll_once(self):
+            return None
+        def snapshot(self):
+            return {
+                "overall_status": "RUNNING",
+                "services": {name: {
+                    "status": "RUNNING", "restart_count": 0,
+                    "consecutive_failures": 0, "critical": True, "enabled": True,
+                } for name in live.CORE},
+            }
+        def shutdown(self):
+            FakeSupervisor.stopped = True
+
+    monotonic = iter([0, 1, 2, 90, 100, 110])
+    monkeypatch.setattr(live, "RuntimeSupervisor", FakeSupervisor)
+    monkeypatch.setattr(live.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(live.time, "sleep", lambda _: None)
+
+    rc = live.run_live(60, "https://fake-rpc.example")
+    report = json.loads((p / live.REPORT_NAME).read_text(encoding="utf-8"))
+    assert FakeSupervisor.stopped is True
+    assert rc == 0
+    assert report["result"] == "PASS"
+    assert report["historical_databases_touched"] is False
+    assert "fake-rpc.example" not in json.dumps(report)
+    assert (p / "general1_e2e2_status_samples.jsonl").exists()
