@@ -1123,11 +1123,11 @@ class CollectorV3CoverageTests(unittest.TestCase):
             def json(self):
                 return []
 
-        with patch.object(collector, 'get_latest_block', return_value=125), \\
-             patch.object(collector, 'get_block_header', side_effect=header), \\
-             patch.object(collector, 'get_order_filled_logs', return_value=[v3log]), \\
-             patch.object(collector.requests, 'get', return_value=EmptyResponse()) as get, \\
-             patch.object(self.store, 'commit_batch', wraps=self.store.commit_batch) as commit, \\
+        with patch.object(collector, 'get_latest_block', return_value=125), \
+             patch.object(collector, 'get_block_header', side_effect=header), \
+             patch.object(collector, 'get_order_filled_logs', return_value=[v3log]), \
+             patch.object(collector.requests, 'get', return_value=EmptyResponse()) as get, \
+             patch.object(self.store, 'commit_batch', wraps=self.store.commit_batch) as commit, \
              patch.object(collector, 'publish_snapshot') as publish:
             with self.assertRaises(collector.RetryableCollectorError):
                 collector.scan_once(self.store, collector.GammaTokenMap({}))
