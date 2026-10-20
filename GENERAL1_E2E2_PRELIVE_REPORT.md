@@ -146,3 +146,44 @@ sleep, or retry semantics without separate measurements and authorization.
 
 **Verdict:** GENERAL1-E2E-2 remains PARTIAL. The source-level fix is
 pending local retest; the live collector crash and lag require diagnostics.
+
+## E2E-2 COLLECTOR POSITION METADATA CRASH — VERIFIED LOCAL FAILURE
+
+Read-only user diagnostics from the original Windows sandbox established:
+
+- `collector.log`: 1,070,673 bytes, **six** exact `[COLLECTOR] RuntimeError:` reports.
+- Every error: `Aggressor position metadata unavailable; batch will be retried`.
+- `live_trades.jsonl`: **0 bytes** after the run. This alone cannot prove whether
+  the historical DB's block times or the V4 producer-consumer time bug emptied the view.
+- 45 batch commits observed in collector.log; sqlite quick_check was OK.
+
+### Narrow source-level patch
+
+In `scripts/live_active_trades.py:lookup_position_market`, `decode_position_id`
+and `SUPPORTED` classification continue to gate V3. The function still queries
+Gamma exact `position_ids` for open then closed markets and rejects any non-empty
+but ineligible Gamma identity as `GammaIdentityConflict(StorageError)` (fatal).
+
+**Only when BOTH Gamma position searches return empty arrays** (metadata
+unavailable and no contradictory evidence), the function now raises
+`RetryableCollectorError` rather than a generic `RuntimeError`.
+The existing main-loop `except RetryableCollectorError` applies unchanged
+backoff of 1, 2, 5, 10, then 30 seconds. The retry is against the same
+uncommitted block range; no trade is fabricated, dropped or reclassified,
+no checkpoint is advanced, and no autonomous order is placed.
+
+Additional regression tests assert: open+closed search order, exact position
+filter, `RetryableCollectorError` class, no batch commit/snapshot/checkpoint
+advance on a missing supported position, and fatal classification for a
+non-empty but identity-ineligible Gamma result.
+
+**Scope:** Prevents unnecessary exit/restart on recoverable missing metadata,
+NOT a guarantee of progress. If Gamma never returns this position, the
+collector will correctly remain blocked on that batch, so the catch-up test
+may continue to fail. This unresolved Gamma availability / fallback policy
+requires separate evidence and approval. Never assume missing == unsupported.
+
+CI run on `f3115439659a2aa2a89c240caaf08310bea221a7`:
+https://github.com/mudrjafar/PolymarketResearch/actions/runs/39506395713 —
+**472 pytest passed, 48 subtests passed**, machine self-test pass; does not
+constitute a fresh live runtime PASS.
