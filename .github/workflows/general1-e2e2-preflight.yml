@@ -1,0 +1,46 @@
+name: GENERAL1-E2E-2 isolated live-preflight code validation
+
+on:
+  push:
+    branches:
+      - feat/general1-e2e2-isolated-live-runtime-20261020
+  pull_request:
+    paths:
+      - 'scripts/general1_e2e2_live_probe.py'
+      - 'scripts/general1_e2e2_windows.cmd'
+      - 'tests/test_general1_e2e2_live_probe.py'
+      - '.github/workflows/general1-e2e2-preflight.yml'
+
+jobs:
+  offline-contract-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install packages
+        run: python -m pip install -r requirements.txt
+      - name: Run safety tests and full offline regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p handoff
+          python -m pytest tests/test_general1_e2e2_live_probe.py -q 2>&1 | tee handoff/preflight_tests.txt
+          python -m pytest -q 2>&1 | tee handoff/full_tests.txt
+          python run_machine.py --self-test 2>&1 | tee handoff/machine_selftest.txt
+          python -m py_compile scripts/general1_e2e2_live_probe.py
+          git rev-parse HEAD > handoff/head_commit.txt
+          cp scripts/general1_e2e2_live_probe.py handoff/
+          cp scripts/general1_e2e2_windows.cmd handoff/
+          cp tests/test_general1_e2e2_live_probe.py handoff/
+          cp .github/workflows/general1-e2e2-preflight.yml handoff/
+          sha256sum handoff/* > handoff/SHA256SUMS.txt
+      - name: Upload report and scripts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: general1-e2e2-offline-handoff
+          path: handoff/
+          if-no-files-found: warn
