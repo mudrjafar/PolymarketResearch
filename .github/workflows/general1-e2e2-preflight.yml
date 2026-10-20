@@ -30,11 +30,15 @@ jobs:
           python -m pytest tests/test_general1_e2e2_live_probe.py -q 2>&1 | tee handoff/preflight_tests.txt
           python -m pytest -q 2>&1 | tee handoff/full_tests.txt
           python run_machine.py --self-test 2>&1 | tee handoff/machine_selftest.txt
-          python -m py_compile scripts/general1_e2e2_live_probe.py
+          python -m py_compile scripts/general1_e2e2_live_probe.py scripts/general1_e2e2_postmortem.py
           git rev-parse HEAD > handoff/head_commit.txt
           cp scripts/general1_e2e2_live_probe.py handoff/
           cp scripts/general1_e2e2_windows.cmd handoff/
+          cp scripts/general1_e2e2_postmortem.py handoff/
+          cp scripts/flow_tracker.py handoff/
           cp tests/test_general1_e2e2_live_probe.py handoff/
+          cp tests/test_general1_e2e2_postmortem.py handoff/
+          cp tests/test_flow_unit2.py handoff/
           cp GENERAL1_E2E2_PRELIVE_REPORT.md handoff/
           cp .github/workflows/general1-e2e2-preflight.yml handoff/
           sha256sum handoff/* > handoff/SHA256SUMS.txt
