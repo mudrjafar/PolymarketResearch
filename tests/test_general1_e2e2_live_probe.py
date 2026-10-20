@@ -145,7 +145,7 @@ def test_live_wrapper_invokes_supervisor_and_shutdown_with_fakes(tmp_path, monke
     original_gate = live.isolation_gate
     monkeypatch.setattr(live, "isolation_gate", lambda root: original_gate(root, parent=tmp_path))
     monkeypatch.setattr(live.subprocess, "run", lambda *args, **kwargs: None)
-    head = iter((1000, 1010))
+    head = iter((1000, 1005))
     monkeypatch.setattr(live, "rpc_number", lambda _, method: 137 if method == "eth_chainId" else next(head))
     monkeypatch.setattr(live.run_machine, "build_services", lambda: [
         live.ServiceSpec(name, (name,)) for name in sorted(live.CORE)
