@@ -35,6 +35,7 @@ jobs:
           cp scripts/general1_e2e2_live_probe.py handoff/
           cp scripts/general1_e2e2_windows.cmd handoff/
           cp tests/test_general1_e2e2_live_probe.py handoff/
+          cp GENERAL1_E2E2_PRELIVE_REPORT.md handoff/
           cp .github/workflows/general1-e2e2-preflight.yml handoff/
           sha256sum handoff/* > handoff/SHA256SUMS.txt
       - name: Upload report and scripts
