@@ -245,3 +245,88 @@ def test_fresh_chain_evidence_populates_windows_and_preserves_evidence_triple():
         latest["block_timestamp"], timezone.utc
     ).isoformat()
     assert diamond._canonical_block_time(latest["block_timestamp"]) == evidence["evidence_at"]
+
+
+def _recovery_fixture(tmp_path):
+    import sqlite3
+    source = tmp_path / "GENERAL1_FRESHNESS1_LIVE_SANDBOX"
+    (source / ".git").mkdir(parents=True)
+    data = source / "data"
+    data.mkdir()
+    (source / "general1_e2e2_logs").mkdir()
+    db = data / "collector.sqlite3"
+    payload = {
+        "collector_version": 4,
+        "condition_id": "PRIVATE-CONDITION",
+        "token_id": "PRIVATE-TOKEN",
+        "transaction_hash": "0x" + "a" * 64,
+        "log_index": 1,
+        "block_timestamp": 1700000000,
+    }
+    with sqlite3.connect(db) as c:
+        c.executescript("""
+        CREATE TABLE checkpoint(chain_id INTEGER PRIMARY KEY, block_number INTEGER, block_hash TEXT);
+        CREATE TABLE blocks(chain_id INTEGER, block_number INTEGER, block_timestamp INTEGER);
+        CREATE TABLE trades(chain_id INTEGER, block_number INTEGER, log_index INTEGER,
+            payload_json TEXT);
+        CREATE INDEX idx_trades_block ON trades(chain_id,block_number,log_index);
+        """)
+        c.execute("INSERT INTO checkpoint VALUES (137,101,'hash')")
+        c.execute("INSERT INTO blocks VALUES (137,101,1700000000)")
+        c.execute("INSERT INTO trades VALUES (137,101,1,?)", (json.dumps(payload),))
+    (data / "live_trades.jsonl").write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    (source / "general1_e2e2_logs" / "collector.log").write_text(
+        '[LIVE-1C] {"status":"SUCCESS","blocks":5,"lag_before":30,"lag_after":25,"batch_ms":400}\n',
+        encoding="utf-8")
+    return source
+
+
+def test_db_postflight_chain_index_and_correct_readonly_evidence(tmp_path):
+    import sqlite3
+    source = _recovery_fixture(tmp_path)
+    db = source / "data" / "collector.sqlite3"
+    info = observer.db_summary(db)
+    assert info["quick_check_ok"] is True
+    assert info["checkpoint"] == 101
+    assert info["blocks"] == 1
+    assert info["trades"] == 1
+    assert info["_evidence"] == [("PRIVATE-TOKEN", "PRIVATE-CONDITION")]
+    with sqlite3.connect(db) as c:
+        plan = " ".join(str(row) for row in c.execute(
+            "EXPLAIN QUERY PLAN SELECT payload_json FROM trades WHERE chain_id=137 "
+            "ORDER BY block_number DESC, log_index DESC LIMIT 500"))
+    assert "idx_trades_block" in plan
+    assert "USE TEMP B-TREE" not in plan
+
+
+def test_recovery_offline_preserves_data_and_no_fake_live_pass(tmp_path):
+    from scripts import general1_freshness1_recover as recovery
+    source = _recovery_fixture(tmp_path)
+    report = tmp_path / "recovered.json"
+    before = (source / "data" / "collector.sqlite3").read_bytes()
+    result = recovery.recover(source, report, parent=tmp_path)
+    assert result["result"] == "RECOVERED_UNVERIFIED"
+    assert result["original_test_status"] == "UNKNOWN_INTERRUPTED_FINALIZATION"
+    assert result["collector"]["collector_blocks_per_second"] is None
+    assert result["collector"]["blocks_processed"] == 5
+    assert result["database"]["quick_check_ok"] is True
+    assert result["historical_backfill_complete"] is False
+    assert report.is_file()
+    assert (source / "data" / "collector.sqlite3").read_bytes() == before
+    assert "PRIVATE-TOKEN" not in report.read_text(encoding="utf-8")
+    assert "PRIVATE-CONDITION" not in report.read_text(encoding="utf-8")
+    try:
+        recovery.recover(source, report, parent=tmp_path)
+    except recovery.RecoveryGateError:
+        pass
+    else:
+        raise AssertionError("Recovery must refuse overwriting the report")
+
+
+def test_db_postflight_timeout_does_not_raise(tmp_path, monkeypatch):
+    source = _recovery_fixture(tmp_path)
+    # The timeout guard fails closed instead of blocking a final report forever.
+    report = observer.db_summary(source / "data" / "collector.sqlite3", budget_seconds=-1)
+    assert report["exists"] is True
+    assert report["quick_check_ok"] is False
+    assert report["error_type"] == "OperationalError"
