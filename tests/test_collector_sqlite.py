@@ -1327,6 +1327,16 @@ class CollectorV3CoverageTests(unittest.TestCase):
         with self.assertRaises(collector.GammaIdentityConflict):
             collector._v3_data_token_market(no, dict(row, question_index=2))
 
+    def test_e2e2_data_api_fallback_preserves_legacy_trade_payload_keys(self):
+        """The new V3 provenance fields must NOT touch CTF trade contracts."""
+        log = event(101, 123, collector.EXCHANGES[0])
+        trade = collector.decode_order_filled(log)
+        row = collector.normalize_trade(log, trade, market(), header(101))
+        self.assertEqual(row['asset_type'], 'CTF_TOKEN')
+        self.assertEqual(row['condition_id'], h(999))
+        self.assertNotIn('structural_condition_id', row)
+        self.assertNotIn('metadata_source', row)
+
     def test_e2e2_live_identity_probe_codes_and_no_raw_ids(self):
         from scripts import general1_e2e2_v3_data_probe as probe
         raw = v3_market()
