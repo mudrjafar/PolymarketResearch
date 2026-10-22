@@ -1,0 +1,29 @@
+name: GENERAL1-FRESHNESS-1 offline validation
+
+on:
+  push:
+    branches:
+      - feat/general1-freshness-1-neartip-diagnostics-20261023
+  workflow_dispatch:
+
+jobs:
+  safety-and-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install checked-in dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile-only safety check
+        run: |
+          python -m py_compile scripts/general1_e2e2_live_probe.py scripts/general1_freshness1_live_probe.py tests/test_general1_freshness1.py scripts/diamond_filter_v3.py
+      - name: Targeted offline tests - no RPC or worker startup
+        run: |
+          python -m pytest -q tests/test_general1_freshness1.py tests/test_general1_e2e2_live_probe.py tests/test_diamond_unit3.py tests/test_flow_unit2.py tests/test_risk_engine.py
+      - name: Full offline test suite
+        run: python -m pytest -q
+      - name: Full machine self-test without workers
+        run: python run_machine.py --self-test
