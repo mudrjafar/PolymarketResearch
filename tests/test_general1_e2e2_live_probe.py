@@ -1,6 +1,8 @@
 """GENERAL1-E2E-2 safety and reporting tests: no RPC or live worker startup."""
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -65,6 +67,30 @@ def test_rpc_error_never_raises_with_credential_url(monkeypatch):
     with pytest.raises(live.GateError) as exc:
         live.rpc_number("https://provider.example/secret-in-url-token", "eth_chainId")
     assert "secret-in-url-token" not in str(exc.value)
+
+
+
+def test_windows_cp1252_market_title_does_not_crash(tmp_path, monkeypatch):
+    """The actual child Python interpreter must emit Unicode safely."""
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252:strict")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "private-test-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "private-chat-id")
+    rpc = "https://provider.example/secret"
+    child_env = live.worker_process_environment(rpc)
+    assert child_env["PYTHONIOENCODING"] == "utf-8:backslashreplace"
+    assert child_env["POLYMARKET_RPC_URL"] == rpc
+    assert "TELEGRAM_BOT_TOKEN" not in child_env
+    assert "TELEGRAM_CHAT_ID" not in child_env
+
+    child = subprocess.run(
+        [sys.executable, "-c", 'print("MARKET: 市場 🏀"); print(chr(0xD800))'],
+        capture_output=True, env=child_env, timeout=10,
+    )
+    assert child.returncode == 0
+    assert child.stdout.decode("utf-8").splitlines() == [
+        "MARKET: 市場 🏀", r"\\ud800",
+    ]
+
 
 
 def test_metric_rates_are_measured_not_assumed():
