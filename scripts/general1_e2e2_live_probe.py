@@ -269,11 +269,132 @@ def worker_process_environment(rpc):
     return env
 
 
-def run_live(duration, rpc, *, dashboard=False):
+def _percentile(values, q):
+    """Linear-interpolated percentile of bounded, finite numeric samples."""
+    values = sorted(float(v) for v in values if isinstance(v, (int, float))
+                    and not isinstance(v, bool) and 0 <= float(v) < float("inf"))
+    if not values:
+        return None
+    pos = (len(values) - 1) * q
+    lower = int(pos)
+    upper = min(len(values) - 1, lower + 1)
+    return round(values[lower] + (values[upper] - values[lower]) * (pos - lower), 3)
+
+
+def freshness_diagnostics(data, *, now=None):
+    """Counts only, no questions, token IDs, hashes or personal information."""
+    from collections import Counter
+    now = now or datetime.now(timezone.utc)
+    summary = {"snapshot_unique_v4_trades": 0, "invalid_block_timestamps": 0,
+               "future_block_timestamps": 0, "age_seconds_p50": None,
+               "age_seconds_p95": None, "ages_over_120s": 0,
+               "snapshot_window_trades": {"1m": 0, "5m": 0, "15m": 0}}
+    ages = []
+    seen = set()
+    snapshot = data / "live_trades.jsonl"
+    try:
+        with snapshot.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    trade = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(trade, dict) or trade.get("collector_version") != 4:
+                    continue
+                tx, idx = trade.get("transaction_hash"), trade.get("log_index")
+                if not isinstance(tx, str) or len(tx) != 66 or not isinstance(idx, int) or isinstance(idx, bool):
+                    continue
+                key = (tx.lower(), idx)
+                if key in seen:
+                    continue
+                seen.add(key)
+                timestamp = trade.get("block_timestamp")
+                if not isinstance(timestamp, int) or isinstance(timestamp, bool) or timestamp < 0:
+                    summary["invalid_block_timestamps"] += 1
+                    continue
+                try:
+                    age = (now - datetime.fromtimestamp(timestamp, timezone.utc)).total_seconds()
+                except (OSError, OverflowError, ValueError):
+                    summary["invalid_block_timestamps"] += 1
+                    continue
+                if age < -5:
+                    summary["future_block_timestamps"] += 1
+                    continue
+                ages.append(max(0.0, age))
+    except (OSError, UnicodeError):
+        summary["snapshot_status"] = "MISSING_OR_UNREADABLE"
+        return summary
+    summary["snapshot_status"] = "OK"
+    summary["snapshot_unique_v4_trades"] = len(ages)
+    summary["age_seconds_p50"] = _percentile(ages, .50)
+    summary["age_seconds_p95"] = _percentile(ages, .95)
+    summary["ages_over_120s"] = sum(age > 120 for age in ages)
+    for label, seconds in (("1m", 60), ("5m", 300), ("15m", 900)):
+        summary["snapshot_window_trades"][label] = sum(age <= seconds for age in ages)
+    flow = safe_json(data / "flow_state.json", {})
+    analysis = safe_json(data / "diamond_analysis_v3.json", [])
+    risk = safe_json(data / "risk_assessment.json", {})
+    flow = flow if isinstance(flow, dict) else {}
+    analysis = analysis if isinstance(analysis, list) else []
+    rows = risk.get("results", []) if isinstance(risk, dict) else []
+    rows = rows if isinstance(rows, list) else []
+    summary["flow_markets_with_trades"] = {
+        label: sum(isinstance(row, dict) and isinstance(row.get("flow_" + label), dict)
+                   and (row["flow_" + label].get("trade_count") or 0) > 0
+                   for row in flow.values())
+        for label in ("1m", "5m", "15m")
+    }
+    summary["flow_verified"] = sum(isinstance(row, dict) and row.get("verified") is True
+                                   for row in flow.values())
+    summary["diamond_classes"] = dict(Counter(str(row.get("classification", "UNKNOWN"))
+                                    for row in analysis if isinstance(row, dict)))
+    summary["risk_decisions"] = dict(Counter(str(row.get("decision", "UNKNOWN"))
+                                     for row in rows if isinstance(row, dict)))
+    summary["risk_reason_codes_top15"] = [
+        [code, count] for code, count in Counter(str(code)
+        for row in rows if isinstance(row, dict)
+        for code in (row.get("reason_codes") or []) if isinstance(code, str)
+        ).most_common(15)
+    ]
+    return summary
+
+
+def timing_diagnostics(records):
+    """Existing LIVE-1C timing counters; overlapping scopes are NOT additive."""
+    keys = ("batch_ms", "rpc_ms", "get_logs_ms", "timestamp_ms",
+            "gamma_lookup_ms", "gamma_refresh_ms", "decode_ms",
+            "enrichment_ms", "sqlite_ms", "compatibility_ms", "backoff_ms")
+    out = {"note": "Phases may overlap (e.g. RPC inside lookups); do not sum percentages.",
+           "successful_batches": sum(r.get("status") == "SUCCESS" for r in records),
+           "phases_ms": {}}
+    for name in keys:
+        samples = [r[name] for r in records if
+                   (r.get("status") == "SUCCESS" or name == "backoff_ms")
+                   and isinstance(r.get(name), (int, float))
+                   and not isinstance(r[name], bool) and 0 <= float(r[name]) < float("inf")]
+        out["phases_ms"][name] = {
+            "samples": len(samples), "total": round(sum(samples), 3),
+            "mean": round(sum(samples) / len(samples), 3) if samples else None,
+            "p50": _percentile(samples, .5), "p95": _percentile(samples, .95),
+            "max": round(max(samples), 3) if samples else None,
+        }
+    return out
+
+
+def controlled_neartip_environment(rpc):
+    """Near-tip experiment only: no production env/start-block inheritance."""
+    env = worker_process_environment(rpc)
+    env.pop("COLLECTOR_START_BLOCK", None)
+    env["COLLECTOR_INITIAL_LOOKBACK_BLOCKS"] = "30"
+    env["COLLECTOR_CONFIRMATION_BLOCKS"] = "20"
+    return env
+
+
+def run_live(duration, rpc, *, dashboard=False, near_tip=False):
     # A fresh sandbox has no data, so the preparation code cannot archive
     # any pre-existing user files. Never run preparation in a reused sandbox.
     isolation_gate(ROOT)
-    run_env = worker_process_environment(rpc)
+    run_env = controlled_neartip_environment(rpc) if near_tip else worker_process_environment(rpc)
     # Inherited credentials are not needed by any other worker.
     os.environ.pop("TELEGRAM_BOT_TOKEN", None)
     os.environ.pop("TELEGRAM_CHAT_ID", None)
@@ -345,8 +466,11 @@ def run_live(duration, rpc, *, dashboard=False):
     except GateError:
         end_block = None
     db = db_summary(data / "collector.sqlite3")
-    metrics = checkpoint_metrics(diagnostic_records(logs / "collector.log"), start_block, end_block, seconds)
+    records = diagnostic_records(logs / "collector.log")
+    metrics = checkpoint_metrics(records, start_block, end_block, seconds)
     pipeline = pipeline_summary(data, db)
+    freshness = freshness_diagnostics(data)
+    performance = timing_diagnostics(records)
     final_status = statuses[-1] if statuses else {}
     worker_states = final_status.get("services", {})
     critical_running = all(worker_states.get(n, {}).get("status") == "RUNNING" for n in CORE)
@@ -361,7 +485,10 @@ def run_live(duration, rpc, *, dashboard=False):
         result = "PARTIAL"
     # No RPC URLs, tokens, full worker stderr or individual wallets in report.
     report = {
-        "task": "GENERAL1-E2E-2", "result": result,
+        "task": "GENERAL1-FRESHNESS-1" if near_tip else "GENERAL1-E2E-2", "result": result,
+        "experiment": ({"mode": "NEAR_TIP_ONLY", "initial_lookback_blocks": 30,
+                        "confirmation_blocks": 20, "historical_backfill_complete": False}
+                       if near_tip else {"mode": "E2E2_BASELINE"}),
         "generated_at": utc_now(), "duration_seconds": seconds,
         "target_seconds": duration, "interrupted": interrupted,
         "fatal_service": fatal, "chain_id": 137, "chain_head_before": start_block,
@@ -369,6 +496,8 @@ def run_live(duration, rpc, *, dashboard=False):
         "supervisor_status": final_status, "collector": metrics,
         "database": {k: v for k, v in db.items() if not k.startswith("_")},
         "pipeline": pipeline,
+        "freshness": freshness,
+        "phase_timings": performance,
         "historical_databases_touched": False,
         "raw_worker_logs_private": True,
     }
@@ -385,6 +514,7 @@ def main(argv=None):
     parser.add_argument("--source-env", default=None, help="External local .env; only RPC key is read")
     parser.add_argument("--duration", type=int, default=900)
     parser.add_argument("--dashboard", action="store_true")
+    parser.add_argument("--near-tip", action="store_true", help="Sandbox-only 30-block initial lookback; no backfill claim")
     args = parser.parse_args(argv)
     try:
         isolation_gate(ROOT)
@@ -392,7 +522,7 @@ def main(argv=None):
             raise GateError("Duration must be between 60 and 1800 seconds")
         rpc = get_rpc(args.source_env)
         print("[PREFLIGHT] isolated sandbox, RPC configured, no credential output", flush=True)
-        return run_live(args.duration, rpc, dashboard=args.dashboard)
+        return run_live(args.duration, rpc, dashboard=args.dashboard, near_tip=args.near_tip)
     except GateError as exc:
         print(f"[BLOCKED] {exc}", flush=True)
         return 3
