@@ -330,3 +330,21 @@ def test_db_postflight_timeout_does_not_raise(tmp_path, monkeypatch):
     assert report["exists"] is True
     assert report["quick_check_ok"] is False
     assert report["error_type"] == "OperationalError"
+
+
+def test_recovery_script_imports_from_other_cwd_without_rpc(tmp_path):
+    """CLI smoke test: no installed project, network, production data or workers."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    script = Path(__file__).resolve().parents[1] / "scripts" / "general1_freshness1_recover.py"
+    completed = subprocess.run(
+        [sys.executable, "-B", str(script)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 3
+    assert "[BLOCKED]" in completed.stdout
+    assert "ModuleNotFoundError" not in completed.stderr
