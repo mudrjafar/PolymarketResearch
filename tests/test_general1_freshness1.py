@@ -1,6 +1,6 @@
 """GENERAL1-FRESHNESS-1 offline safety and metric tests. No RPC or workers."""
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from scripts import general1_e2e2_live_probe as observer
 from scripts import general1_freshness1_live_probe as freshness
@@ -63,9 +63,7 @@ def test_freshness_metric_chain_age_deduplicates_and_never_uses_detected_at(tmp_
         event("b", 1, 250),
         event("c", 2, 700),
         event("d", 3, -120),  # future, never fresh
-        event("e", 4, 50, block_timestamp=None) if False else {
-            **event("e", 4, 50), "block_timestamp": None
-        },
+        {**event("e", 4, 50), "block_timestamp": None},
     ]
     (tmp_path / "live_trades.jsonl").write_text(
         "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
