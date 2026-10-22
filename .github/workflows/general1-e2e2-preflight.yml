@@ -9,6 +9,7 @@ on:
       - 'scripts/general1_e2e2_live_probe.py'
       - 'scripts/general1_e2e2_windows.cmd'
       - 'scripts/general1_e2e2_postmortem.py'
+      - 'scripts/general1_e2e2_v3_data_probe.py'
       - 'scripts/flow_tracker.py'
       - 'scripts/live_active_trades.py'
       - 'tests/test_general1_e2e2_live_probe.py'
@@ -36,11 +37,12 @@ jobs:
           python -m pytest tests/test_general1_e2e2_live_probe.py -q 2>&1 | tee handoff/preflight_tests.txt
           python -m pytest -q 2>&1 | tee handoff/full_tests.txt
           python run_machine.py --self-test 2>&1 | tee handoff/machine_selftest.txt
-          python -m py_compile scripts/general1_e2e2_live_probe.py scripts/general1_e2e2_postmortem.py
+          python -m py_compile scripts/general1_e2e2_live_probe.py scripts/general1_e2e2_postmortem.py scripts/general1_e2e2_v3_data_probe.py
           git rev-parse HEAD > handoff/head_commit.txt
           cp scripts/general1_e2e2_live_probe.py handoff/
           cp scripts/general1_e2e2_windows.cmd handoff/
           cp scripts/general1_e2e2_postmortem.py handoff/
+          cp scripts/general1_e2e2_v3_data_probe.py handoff/
           cp scripts/flow_tracker.py handoff/
           cp scripts/live_active_trades.py handoff/
           cp tests/test_general1_e2e2_live_probe.py handoff/
