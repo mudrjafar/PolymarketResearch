@@ -114,3 +114,69 @@ def test_existing_timing_phases_are_aggregated_without_double_count_claims():
     assert report["phases_ms"]["rpc_ms"]["p95"] == 1750.0
     assert report["phases_ms"]["backoff_ms"]["total"] == 2000.0
     assert "overlap" in report["note"].lower()
+
+
+def test_checkpoint_age_is_none_when_no_db(tmp_path):
+    assert observer.checkpoint_block_age_seconds(tmp_path / "absent.sqlite3") is None
+
+
+def test_checkpoint_age_uses_canonical_block_time(tmp_path):
+    import sqlite3
+    db = tmp_path / "fresh.sqlite3"
+    with sqlite3.connect(db) as con:
+        con.execute("CREATE TABLE blocks(chain_id INTEGER, block_number INTEGER, block_timestamp INTEGER)")
+        con.execute("INSERT INTO blocks VALUES (137, 100, 1700000000)")
+        con.execute("INSERT INTO blocks VALUES (137, 101, 1700000040)")
+    now = datetime.fromtimestamp(1700000100, timezone.utc)
+    assert observer.checkpoint_block_age_seconds(db, now=now) == 60.0
+
+
+def test_neartip_requires_real_freshness_for_pass(tmp_path, monkeypatch):
+    """Positive core linkage cannot produce PASS if block evidence is stale."""
+    p = tmp_path / observer.EXPECTED_NAME
+    p.mkdir()
+    (p / ".git").mkdir()
+    monkeypatch.setattr(observer, "ROOT", p)
+    monkeypatch.setattr(observer, "isolation_gate", lambda *_: True)
+    monkeypatch.setattr(observer.subprocess, "run", lambda *args, **kwargs: None)
+    ticks = iter((0, 1, 2, 90, 100, 110))
+    monkeypatch.setattr(observer.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(observer.time, "sleep", lambda *_: None)
+    heads = iter((1000, 1010))
+    monkeypatch.setattr(observer, "rpc_number", lambda rpc, method:
+                        137 if method == "eth_chainId" else next(heads))
+    monkeypatch.setattr(observer, "diagnostic_records", lambda *_: [
+        {"status":"SUCCESS", "blocks":100, "lag_before":100, "lag_after":0}])
+    monkeypatch.setattr(observer, "db_summary", lambda *_: {
+        "quick_check_ok":True, "checkpoint":990, "_evidence":[("t","c")]})
+    monkeypatch.setattr(observer, "pipeline_summary", lambda *_: {
+        "real_trade_to_risk_binding_observed":True, "paper_positions":0})
+    monkeypatch.setattr(observer, "freshness_diagnostics", lambda *_: {
+        "snapshot_window_trades":{"1m":0, "5m":0, "15m":3},
+        "flow_markets_with_trades":{"1m":0, "5m":0, "15m":1}})
+    monkeypatch.setattr(observer, "checkpoint_block_age_seconds", lambda *_: 600)
+    monkeypatch.setattr(observer.run_machine, "build_services", lambda: [
+        observer.ServiceSpec(name, (name,), critical=True)
+        for name in sorted(observer.CORE)])
+    class Supervisor:
+        def __init__(self, specs, **kwargs):
+            pass
+        def start_all(self):
+            pass
+        def poll_once(self):
+            return None
+        def snapshot(self):
+            return {"overall_status":"RUNNING",
+                    "services":{name:{
+                        "status":"RUNNING","restart_count":0,"consecutive_failures":0,
+                        "critical":True,"enabled":True}
+                        for name in observer.CORE}}
+        def shutdown(self):
+            pass
+    monkeypatch.setattr(observer, "RuntimeSupervisor", Supervisor)
+    assert observer.run_live(60, "https://provider.example/no-real-rpc", near_tip=True) == 2
+    report = json.loads((p / observer.REPORT_NAME).read_text(encoding="utf-8"))
+    assert report["result"] == "PARTIAL"
+    assert report["experiment"]["historical_backfill_complete"] is False
+    assert report["freshness"]["checkpoint_block_age_seconds_p95"] == 600.0
+    assert report["freshness"]["snapshot_window_trades"]["5m"] == 0
