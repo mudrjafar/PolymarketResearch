@@ -381,6 +381,31 @@ def timing_diagnostics(records):
     return out
 
 
+def checkpoint_block_age_seconds(db, *, now=None):
+    """Read-only canonical checkpoint age; zero trades does not imply a fresh block."""
+    db = Path(db)
+    if not db.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            row = conn.execute(
+                "SELECT block_timestamp FROM blocks WHERE chain_id=137 "
+                "ORDER BY block_number DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None or not isinstance(row[0], int) or isinstance(row[0], bool):
+            return None
+        at = datetime.fromtimestamp(row[0], timezone.utc)
+        now = now or datetime.now(timezone.utc)
+        age = (now - at).total_seconds()
+        return round(age, 3) if age >= -5 else None
+    except (sqlite3.Error, OSError, ValueError, OverflowError):
+        return None
+
+
 def controlled_neartip_environment(rpc):
     """Near-tip experiment only: no production env/start-block inheritance."""
     env = worker_process_environment(rpc)
@@ -434,6 +459,7 @@ def run_live(duration, rpc, *, dashboard=False, near_tip=False):
         popen_factory=popen,
     )
     statuses = []
+    checkpoint_ages = []
     start_time = time.monotonic()
     interrupted = False
     fatal = None
@@ -445,6 +471,9 @@ def run_live(duration, rpc, *, dashboard=False, near_tip=False):
             elapsed = time.monotonic() - start_time
             if elapsed - last_sample >= 15:
                 statuses.append(compact_status(supervisor))
+                age = checkpoint_block_age_seconds(data / "collector.sqlite3")
+                if age is not None:
+                    checkpoint_ages.append(age)
                 last_sample = elapsed
                 if int(elapsed) % 60 < 15:
                     print(f"[LIVE] elapsed={int(elapsed)}s status={statuses[-1]['overall_status']}", flush=True)
@@ -470,16 +499,30 @@ def run_live(duration, rpc, *, dashboard=False, near_tip=False):
     metrics = checkpoint_metrics(records, start_block, end_block, seconds)
     pipeline = pipeline_summary(data, db)
     freshness = freshness_diagnostics(data)
+    freshness["checkpoint_block_age_seconds_p50"] = _percentile(checkpoint_ages, .50)
+    freshness["checkpoint_block_age_seconds_p95"] = _percentile(checkpoint_ages, .95)
+    freshness["checkpoint_age_sample_count"] = len(checkpoint_ages)
+    freshness["checkpoint_block_age_seconds_end"] = checkpoint_block_age_seconds(data / "collector.sqlite3")
+    if end_block is not None and isinstance(db.get("checkpoint"), int):
+        freshness["chain_head_gap_blocks_end"] = max(0, end_block - db["checkpoint"])
+        freshness["safe_tip_gap_blocks_end"] = max(0, end_block - 20 - db["checkpoint"]) if near_tip else None
     performance = timing_diagnostics(records)
     final_status = statuses[-1] if statuses else {}
     worker_states = final_status.get("services", {})
     critical_running = all(worker_states.get(n, {}).get("status") == "RUNNING" for n in CORE)
     no_restarts = all(worker_states.get(n, {}).get("restart_count") == 0 for n in CORE)
+    # A RUNNING supervisor and nonempty 15m snapshot are NOT a freshness proof.
+    near_tip_fresh = (not near_tip or (
+        freshness["checkpoint_block_age_seconds_p95"] is not None
+        and freshness["checkpoint_block_age_seconds_p95"] <= 120
+        and freshness["snapshot_window_trades"]["5m"] > 0
+        and freshness.get("flow_markets_with_trades", {}).get("5m", 0) > 0
+    ))
     if fatal or not db.get("quick_check_ok", False) or metrics["fatal_failures"]:
         result = "BLOCKED"
     elif (not interrupted and critical_running and no_restarts and metrics["blocks_processed"] > 0
           and metrics["catchup_observed"] is True and pipeline["real_trade_to_risk_binding_observed"]
-          and pipeline["paper_positions"] == 0):
+          and pipeline["paper_positions"] == 0 and near_tip_fresh):
         result = "PASS"
     else:
         result = "PARTIAL"
