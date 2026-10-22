@@ -5,9 +5,13 @@ startup. Uses existing local Polygon RPC credentials only in process memory.
 Do not confuse this metadata check with an executable Book/Paper gate.
 """
 import os
+import sys
 from pathlib import Path
 
 import requests
+
+BASE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE))
 
 FIRST_BLOCK = 95883353
 LAST_BLOCK = 95883357
