@@ -61,7 +61,7 @@ def recover(source, destination, *, parent=BASE):
         ),
         "historical_backfill_complete": False,
         "database": {k: v for k, v in db.items() if not k.startswith("_")},
-        "collector": observer.checkpoint_metrics(records, None, None, 0.001),
+        "collector": observer.checkpoint_metrics(records, None, None, 0.0),
         "pipeline": observer.pipeline_summary(data, db),
         "freshness": freshness,
         "phase_timings": observer.timing_diagnostics(records),
