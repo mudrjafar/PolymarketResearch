@@ -9,16 +9,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts import general1_e2e2_live_probe as live
 
-live.EXPECTED_NAME = "GENERAL1_FRESHNESS1_LIVE_SANDBOX"
-live.REPORT_NAME = "general1_freshness1_live_report.json"
-
-
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
-    if "--near-tip" in argv:
-        print("[BLOCKED] --near-tip is already enforced by this entry point.")
+    if "--near-tip" in argv or "--dashboard" in argv:
+        print("[BLOCKED] No duplicate flags or dashboard allowed in isolated freshness run.")
         return 3
-    return live.main(["--near-tip", *argv])
+    original_name, original_report = live.EXPECTED_NAME, live.REPORT_NAME
+    try:
+        live.EXPECTED_NAME = "GENERAL1_FRESHNESS1_LIVE_SANDBOX"
+        live.REPORT_NAME = "general1_freshness1_live_report.json"
+        return live.main(["--near-tip", *argv])
+    finally:
+        live.EXPECTED_NAME, live.REPORT_NAME = original_name, original_report
 
 
 if __name__ == "__main__":
