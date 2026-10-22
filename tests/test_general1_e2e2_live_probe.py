@@ -88,7 +88,7 @@ def test_windows_cp1252_market_title_does_not_crash(tmp_path, monkeypatch):
     )
     assert child.returncode == 0
     assert child.stdout.decode("utf-8").splitlines() == [
-        "MARKET: 市場 🏀", r"\\ud800",
+        "MARKET: 市場 🏀", r"\ud800",
     ]
 
 
