@@ -180,3 +180,68 @@ def test_neartip_requires_real_freshness_for_pass(tmp_path, monkeypatch):
     assert report["experiment"]["historical_backfill_complete"] is False
     assert report["freshness"]["checkpoint_block_age_seconds_p95"] == 600.0
     assert report["freshness"]["snapshot_window_trades"]["5m"] == 0
+
+
+def _canonical_v4_event(now, seconds_old, block, hex_byte, side="BUY"):
+    return {
+        "collector_version": 4,
+        "transaction_hash": "0x" + format(hex_byte, "02x") * 32,
+        "log_index": 0,
+        "block": block,
+        "block_timestamp": int(now.timestamp()) - seconds_old,
+        "detected_at": now.isoformat(),
+        "condition_id": "condition-a",
+        "token_id": "token-a",
+        "outcome": "Yes",
+        "side_label": side,
+        "trade_usd": 120.0,
+    }
+
+
+def test_old_chain_evidence_cannot_create_1m_or_5m_signal():
+    from scripts import flow_tracker as flow
+    from scripts import risk_engine as risk
+    from scripts import focus_engine as focus
+    now = datetime(2026, 10, 23, 0, 0, tzinfo=timezone.utc)
+    old = _canonical_v4_event(now, 700, 100, 17)
+    assert flow.is_flow_eligible_trade(old)
+    assert flow.analyze_flow([old], now, "1m")["trade_count"] == 0
+    assert flow.analyze_flow([old], now, "5m")["trade_count"] == 0
+    assert flow.analyze_flow([old], now, "15m")["trade_count"] == 1
+    assert flow.confirmation_evidence_id(
+        old, flow.evidence_identity(old), True, "NEUTRAL"
+    ) is None
+    rejected = risk.assess(
+        {"classification": "DATA_RISK", "diamond": False, "direction": "NEUTRAL"},
+        {},
+        now=now,
+    )
+    assert rejected["decision"] == "BLOCK"
+    assert focus._eligible(rejected, focus.new_state()) is False
+
+
+def test_fresh_chain_evidence_populates_windows_and_preserves_evidence_triple():
+    from scripts import flow_tracker as flow
+    from scripts import diamond_filter_v3 as diamond
+    now = datetime(2026, 10, 23, 0, 0, tzinfo=timezone.utc)
+    trades = [
+        _canonical_v4_event(now, 200, 100, 18),
+        _canonical_v4_event(now, 45, 101, 19),
+        _canonical_v4_event(now, 5, 102, 20),
+    ]
+    for row in trades:
+        assert flow.is_flow_eligible_trade(row)
+    assert flow.analyze_flow(trades, now, "1m")["trade_count"] == 2
+    assert flow.analyze_flow(trades, now, "5m")["trade_count"] == 3
+    assert flow.analyze_flow(trades, now, "15m")["trade_count"] == 3
+    assert flow.analyze_flow(trades, now, "5m")["direction"] == "BUY"
+    latest = max(trades, key=flow.trade_order_key)
+    identity = flow.evidence_identity(latest)
+    confirmed = flow.confirmation_evidence_id(latest, identity, True, "BUY")
+    evidence = flow.confirmation_evidence_triple(latest, confirmed)
+    assert evidence["evidence_id"] == identity
+    assert evidence["evidence_cursor"] == [102, 0]
+    assert evidence["evidence_at"] == datetime.fromtimestamp(
+        latest["block_timestamp"], timezone.utc
+    ).isoformat()
+    assert diamond._canonical_block_time(latest["block_timestamp"]) == evidence["evidence_at"]
