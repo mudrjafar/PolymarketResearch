@@ -255,14 +255,25 @@ def compact_status(supervisor):
     }
 
 
+def worker_process_environment(rpc):
+    """Explicit UTF-8 worker logs even on Windows cp1252 installations.
+
+    Preserve valid multilingual market titles; escape unpaired surrogates
+    rather than crashing a critical worker while printing diagnostics.
+    """
+    env = os.environ.copy()
+    env["POLYMARKET_RPC_URL"] = rpc
+    env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
+    for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        env.pop(name, None)
+    return env
+
+
 def run_live(duration, rpc, *, dashboard=False):
     # A fresh sandbox has no data, so the preparation code cannot archive
     # any pre-existing user files. Never run preparation in a reused sandbox.
     isolation_gate(ROOT)
-    run_env = os.environ.copy()
-    run_env["POLYMARKET_RPC_URL"] = rpc
-    for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
-        run_env.pop(name, None)
+    run_env = worker_process_environment(rpc)
     # Inherited credentials are not needed by any other worker.
     os.environ.pop("TELEGRAM_BOT_TOKEN", None)
     os.environ.pop("TELEGRAM_CHAT_ID", None)
