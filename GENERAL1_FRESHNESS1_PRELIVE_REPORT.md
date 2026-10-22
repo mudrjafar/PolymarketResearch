@@ -78,3 +78,20 @@ Live data still needed: checkpoint block age p50/p95, 1m and 5m counts, actual c
 5. Share **only** `general1_freshness1_live_report.json`, not raw worker logs, .env or personal data.
 
 The valid completion boundary for this report is **offline complete / controlled live verification pending**, until the user supplies an independently captured live report.
+
+
+---
+
+## Follow-up incident: interrupted SQLite postflight, missing report
+
+**Evidence:** Windows traceback `general1_e2e2_live_probe.py:497 → db_summary:127` at `SELECT payload_json FROM trades ORDER BY block_number DESC, log_index DESC LIMIT 500`, ending with `KeyboardInterrupt` and repeated `^C`. Launcher printed `No report produced`.
+
+**Interpretation:** The process was interrupted **during postflight report generation after supervisor shutdown**. This traceback is not proof of a collector or signal worker crash. The old report was not published, and the duration/final runtime status are therefore **unknown**, not FAIL/PASS.
+
+**Confirmed SQL inefficiency:** `idx_trades_block(chain_id, block_number, log_index)` existed, but the report query lacked a `chain_id=137` predicate, preventing the desired ordered index traversal. The patched read-only query includes the chain filter, and a bounded SQLite progress handler prevents indefinite postflight stalls. Database evidence counters are gathered before potentially expensive `PRAGMA quick_check`. No production schema/index changes were made.
+
+**Recovery tool:** `scripts/general1_freshness1_recover.py` reads the interrupted test sandbox's SQLite, snapshot and existing collector diagnostics **without starting workers, using RPC or modifying the original dataset**. It writes `general1_freshness1_recovery_report.json` to the **launcher checkout**, refusing overwrite. The recovery status is always `RECOVERED_UNVERIFIED`; it can reconstruct recent counters and phase timings, but **cannot reconstruct the original live checkpoint-age p95, supervisor sequence or duration**. Snapshot age is evaluated as of the file's modification time and is explicitly labeled as retrospective.
+
+**Safe recovery command:** In the separate launcher checkout, run `git pull --ff-only origin feat/general1-freshness-1-neartip-diagnostics-20261023`, then `C:\PolymarketResearch\GENERAL1_E2E1_SANDBOX\.venv\Scripts\python.exe -B scripts\general1_freshness1_recover.py`. Do NOT rerun the one-shot live launcher against the existing sandbox or upload private raw worker logs.
+
+**Next step:** Evaluate the recovered sanitized report and decide whether a new live run is needed. No historical database migration or change to `main` is permitted.
