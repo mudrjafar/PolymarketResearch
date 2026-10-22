@@ -7,9 +7,11 @@ Recovery ages are as-of the persisted snapshot mtime, not live observations.
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts import general1_e2e2_live_probe as observer
 
 BASE = Path(r"C:\PolymarketResearch")
