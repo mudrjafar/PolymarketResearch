@@ -112,41 +112,53 @@ def safe_json(path, default=None):
         return default
 
 
-def db_summary(db):
+def db_summary(db, *, budget_seconds=10.0):
+    """Bounded read-only summary; the chain-scoped block index avoids full-table sorts."""
+    db = Path(db)
     if not db.is_file():
         return {"exists": False}
+    conn = None
     try:
-        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        deadline = time.monotonic() + budget_seconds
+        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 5000)
+        conn.execute("PRAGMA query_only=ON")
+        cp = conn.execute("SELECT block_number FROM checkpoint WHERE chain_id=137").fetchone()
+        blocks = conn.execute("SELECT COUNT(*) FROM blocks WHERE chain_id=137").fetchone()[0]
+        trades = conn.execute("SELECT COUNT(*) FROM trades WHERE chain_id=137").fetchone()[0]
+        evidence = []
+        # idx_trades_block = (chain_id, block_number, log_index); chain_id
+        # equality permits indexed descending traversal with LIMIT, no temp sort.
+        for (payload,) in conn.execute(
+            "SELECT payload_json FROM trades WHERE chain_id=137 "
+            "ORDER BY block_number DESC, log_index DESC LIMIT 500"
+        ):
+            try:
+                row = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            if (isinstance(row, dict) and row.get("collector_version") == 4
+                and isinstance(row.get("condition_id"), str)
+                and isinstance(row.get("token_id"), str)
+                and isinstance(row.get("transaction_hash"), str)
+                and isinstance(row.get("log_index"), int)):
+                evidence.append((str(row["token_id"]), str(row["condition_id"])))
+        # Verify SQLite only after gathering primary evidence. An expensive or
+        # interrupted quick_check does not discard diagnostic counters.
+        result = {"exists": True, "checkpoint": cp[0] if cp else None,
+                  "blocks": blocks, "trades": trades, "_evidence": evidence,
+                  "quick_check_ok": False}
         try:
-            conn.execute("PRAGMA query_only=ON")
-            quick = conn.execute("PRAGMA quick_check").fetchone()[0]
-            cp = conn.execute("SELECT block_number FROM checkpoint WHERE chain_id=137").fetchone()
-            blocks = conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
-            trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-            evidence = []
-            for (payload,) in conn.execute(
-                "SELECT payload_json FROM trades ORDER BY block_number DESC, log_index DESC LIMIT 500"
-            ):
-                try:
-                    row = json.loads(payload)
-                except (TypeError, ValueError):
-                    continue
-                if (row.get("collector_version") == 4
-                    and isinstance(row.get("condition_id"), str)
-                    and isinstance(row.get("token_id"), str)
-                    and isinstance(row.get("transaction_hash"), str)
-                    and isinstance(row.get("log_index"), int)):
-                    evidence.append((str(row["token_id"]), str(row["condition_id"])))
-            return {
-                "exists": True, "quick_check_ok": quick == "ok",
-                "checkpoint": cp[0] if cp else None,
-                "blocks": blocks, "trades": trades,
-                "_evidence": evidence,
-            }
-        finally:
-            conn.close()
+            result["quick_check_ok"] = conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        except sqlite3.Error as exc:
+            result["quick_check_error_type"] = type(exc).__name__
+        return result
     except (sqlite3.Error, OSError, ValueError) as exc:
-        return {"exists": True, "error_type": type(exc).__name__}
+        return {"exists": True, "quick_check_ok": False,
+                "error_type": type(exc).__name__}
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def diagnostic_records(log_file):
