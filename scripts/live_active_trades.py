@@ -1101,8 +1101,6 @@ def normalize_trade(log, trade, market, header):
         "exchange_address": exchange,
         "market_id": market["market_id"],
         "condition_id": market["condition_id"],
-        "structural_condition_id": market.get("structural_condition_id"),
-        "metadata_source": market.get("metadata_source"),
         "question": market["question"],
         "outcome": market["outcome"],
         "start_date": market.get("start_date"),
@@ -1157,6 +1155,10 @@ def normalize_trade(log, trade, market, header):
         "trade_to_volume_ratio": ratio,
         "fee": trade["fee"],
     }
+    # Preserve byte-for-byte legacy CTF payload shape; V3 adds provenance only.
+    if exchange.lower() == EXCHANGE_V3.lower():
+        saved['structural_condition_id'] = market.get('structural_condition_id')
+        saved['metadata_source'] = market.get('metadata_source')
     saved['block_hash'] = log['blockHash']
     saved['block_timestamp'] = header['block_timestamp']
     return saved
