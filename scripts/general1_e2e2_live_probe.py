@@ -121,7 +121,10 @@ def db_summary(db, *, budget_seconds=10.0):
     try:
         conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
         deadline = time.monotonic() + budget_seconds
-        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 5000)
+        conn.set_progress_handler(
+            lambda: int(time.monotonic() >= deadline),
+            1 if budget_seconds <= 0 else 5000,
+        )
         conn.execute("PRAGMA query_only=ON")
         cp = conn.execute("SELECT block_number FROM checkpoint WHERE chain_id=137").fetchone()
         blocks = conn.execute("SELECT COUNT(*) FROM blocks WHERE chain_id=137").fetchone()[0]
