@@ -187,3 +187,68 @@ CI run on `f3115439659a2aa2a89c240caaf08310bea221a7`:
 https://github.com/mudrjafar/PolymarketResearch/actions/runs/39506395713 —
 **472 pytest passed, 48 subtests passed**, machine self-test pass; does not
 constitute a fresh live runtime PASS.
+
+## V3 GAMMA-TO-DATA-API CONTRACT — 2026-10-22 FIX
+
+Live user-run forensic observations in the first blocked batch after
+checkpoint 95883352:
+
+- Range: 95883353–95883357, 326 total exchange events, 27 V3 logs,
+  11 V3 aggressor fills, 5 research-only, 6 supported binary fills
+  (six distinct positions).
+- Local SQLite: 5,870 legacy CTF trades, 0 persisted V3 POSITION rows.
+- Gamma /markets position_ids searched open and closed: 0/12 hits.
+  Gamma /markets/keyset position and 31/32-byte condition attempts:
+  0/3 hits. Gamma keyset parameter assumptions were not sufficient
+  to establish provider coverage; do not present HTTP 200 as proof
+  of valid lookup semantics.
+- Public `https://data-api.polymarket.com/v2/tokens?token_id=...`
+  returned 6/6 exact decimal ERC-1155 token ids, 6/6 binary module,
+  correct outcome_index and structural_condition_id.
+  Data API market condition is a **different 32-byte namespace** from
+  the V3 on-chain structural condition on carried-over markets.
+- Crucially, six outcome **labels** are basketball team names, not
+  canonical "Yes"/"No"; index=1 cannot safely be relabeled "No".
+- Relevant primary API contract:
+  https://data-api.polymarket.com/v2/openapi.json (GET /v2/tokens;
+  `condition_id`, `structural_condition_id`, `outcome`, `outcome_index`,
+  `opposite_token_id`, `module`, `question_index`, title and slug).
+
+### Production core fix on isolated branch
+
+When Gamma open/closed exact V3 search finds no match, the collector now
+calls the documented public Data API token resolver. The fallback validates
+exact token id, decoded V3 module (binary/neg-risk only), outcome index,
+structural condition, canonical 32-byte market condition, opposite
+position bitfield identity, valid text label, question and market slug,
+and neg-risk question index when applicable. Every mismatch fails closed,
+and a missing token retries the same uncommitted batch using existing
+bounded retry/backoff. No token, market id, outcome or quote is invented.
+
+For Data API V3 evidence, the recorded `condition_id` is the **market**
+32-byte id; the `structural_condition_id` is retained separately.
+The real market-defined outcome label is retained unchanged (including
+team names); legacy CTF records and their prior identity logic are untouched.
+Data API does not certify execution price, live order acceptance, market
+end time or actual depth: these fields remain explicit `None`. Thus
+**this change is only a metadata/collector recovery, NOT V3 Book/Paper
+authorization**. Existing Risk/Book gates must separately establish
+current executable state; no real orders.
+
+Read-only diagnostic:
+`scripts/general1_e2e2_v3_data_probe.py`, using the six historical
+positions in exactly five Polygon blocks, prints only identity PASS/FAIL
+and non-sensitive counters, never full token ids, wallets or RPC URLs.
+No file mutations or SQLite reads; the real execution remains on the user's
+local configured Polygon RPC.
+
+Offline tests include sports-outcome/structural/market separation, fail-closed
+invalid identities, retry without SQLite checkpoint advance, and
+privacy-safe diagnostic status. Offline CI passing is NOT the same as
+a real local V3 probe PASS, actual pipeline catch-up, or paper readiness.
+
+**Remaining live gates:** run read-only historical six-token probe,
+isolate V3 metadata request costs, prove supported first blocked batch
+can commit in a fresh dedicated sandbox, sustained collector blocks/sec
+> chain blocks/sec, decreasing lag, and real Collector→Flow→Diamond→Risk
+binding. PR remains DRAFT and unmerged until those checks pass.
