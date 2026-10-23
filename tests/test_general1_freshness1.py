@@ -348,3 +348,16 @@ def test_recovery_script_imports_from_other_cwd_without_rpc(tmp_path):
     assert completed.returncode == 3
     assert "[BLOCKED]" in completed.stdout
     assert "ModuleNotFoundError" not in completed.stderr
+
+
+def test_windows_launcher_prefers_portable_venv_and_protects_existing_sandbox():
+    """Office PC must not require the original PC's old E2E1 venv path."""
+    from pathlib import Path
+    launcher = (Path(__file__).resolve().parents[1] /
+                "scripts" / "general1_freshness1_windows.cmd")
+    content = launcher.read_text(encoding="utf-8")
+    assert 'for %%I in ("%~dp0..") do set "LAUNCHER=%%~fI"' in content
+    assert 'set "PY=%LAUNCHER%\\.venv\\Scripts\\python.exe"' in content
+    assert 'if exist "%TARGET%" (' in content
+    assert "exit /b 12" in content
+    assert 'git clone --depth 1 --single-branch --branch "%BRANCH%"' in content
