@@ -3,11 +3,16 @@ setlocal EnableExtensions DisableDelayedExpansion
 rem GENERAL1-FRESHNESS-1 / one-shot sandbox only. DO NOT call production launchers.
 set "BASE=C:\PolymarketResearch"
 set "TARGET=%BASE%\GENERAL1_FRESHNESS1_LIVE_SANDBOX"
-set "PY=%BASE%\GENERAL1_E2E1_SANDBOX\.venv\Scripts\python.exe"
+rem Prefer the isolated launcher's own venv for a fresh Windows machine.
+for %%I in ("%~dp0..") do set "LAUNCHER=%%~fI"
+set "PY=%LAUNCHER%\.venv\Scripts\python.exe"
+rem Retain compatibility with the earlier tested environment on the original PC.
+if not exist "%PY%" set "PY=%BASE%\GENERAL1_E2E1_SANDBOX\.venv\Scripts\python.exe"
 set "BRANCH=feat/general1-freshness-1-neartip-diagnostics-20261023"
 
 if not exist "%PY%" (
-  echo [BLOCKED] Known tested Python environment not found.
+  echo [BLOCKED] Python venv missing. Create one in the launcher checkout with: py -3.11 -m venv .venv
+  echo [BLOCKED] Then install requirements.txt using the venv Python before retrying.
   exit /b 11
 )
 if exist "%TARGET%" (
