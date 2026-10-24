@@ -1355,11 +1355,18 @@ def scan_once(store, token_map):
 
         market = token_map.get(asset_id)
         if market is None:
-            market = (
-                lookup_position_market(asset_id)
-                if is_v3
-                else lookup_market(asset_id)
-            )
+            if is_v3:
+                v3_started = time.perf_counter()
+                try:
+                    market = lookup_position_market(asset_id)
+                finally:
+                    record = globals().get('_LIVE1C_CURRENT')
+                    if isinstance(record, dict):
+                        record['gamma_v3_lookup_count'] = record.get('gamma_v3_lookup_count', 0) + 1
+                        record['gamma_v3_lookup_ms'] = record.get('gamma_v3_lookup_ms', 0.0) + (
+                            time.perf_counter() - v3_started) * 1000.0
+            else:
+                market = lookup_market(asset_id)
             if isinstance(token_map, GammaTokenMap):
                 market = token_map.remember_fallback(asset_id, market)
             else:
