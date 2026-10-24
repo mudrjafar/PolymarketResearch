@@ -63,12 +63,20 @@ The services are independent workers; list order is launch order, **not a synchr
 
 **Tests:** both absent-identifier cases, `book_worker.run_once` output, and `paper_worker.read_execution_gate` rejection.
 
+### C3: READY could be revoked while Paper was fetching fresh data
+
+**Before:** `paper_worker._process_open` checked Focus READY and Book PASS before multiple HTTP/settlement operations, then could append a new virtual position without rechecking. If Focus became WAIT/INVALIDATED during the Book request, a Paper OPEN could still be committed from the earlier allowed snapshot.
+
+**Fix:** Re-run `read_execution_gate` and `_matches_open_request` immediately before the virtual OPEN append. If Focus/Book or generation/evidence/request binding changed, emit a rejected event with `EXECUTION_GATE_CHANGED_*`, no position created. Network and settlement authority are unchanged.
+
+**Regression:** `test_focus_revoked_during_book_fetch_blocks_paper_commit` mutates the Focus file *within the mocked Book loader*, after the initial gate check, and verifies rejection.
+
 ## D. Important residual limits (not hidden by a PASS)
 
 - No sustained live readiness/market prevalence evidence: the Gamma run had Focus LOCKED, not READY. **One Risk PASS is not enough**. Future live READY requires three subsequent qualifying blockchain events spaced ≥60s. Failure to reach READY within 300s need not be a bug.
 - The collector batching remains opt-in; historical backfill is not complete. Gamma metadata batching supports only legacy CTF here; V3 remains strict nonbatched.
 - The current Book freshness check covers a timely fetched and published response; it does **not** independently establish freshness from the CLOB `timestamp` field, whose semantics must be validated against real API data before claiming an orderbook-timestamp proof. Paper still re-fetches and re-analyzes the current HTTP response before OPEN.
-- Separate runtime workers and JSON snapshots are not a single atomic transaction. Paper binds Focus and Book identities and checks freshness, but a rapidly changing Focus between read and final file commit remains a potential time-of-check/time-of-use edge; no real money is at risk in Paper mode. Explicit new invalidation tests protect the normal ready-loss-before-request path. Wider multi-process atomicity hardening should be separately scoped if needed.
+- Separate runtime workers and JSON snapshots are not a single atomic transaction. The additional final Paper-gate recheck closes the known *during-network-fetch* window, but cannot mathematically eliminate a concurrent mutation **after** that last read and before disk commit without a shared lock or CAS. No real money is at risk in Paper mode; full cross-process atomicity hardening is a separate release decision.
 - Offline mocks prove function contracts, not remote service availability, native V3 execution or final settlement results.
 - No new user-authorised Paper OPEN has been observed using *real* fresh-market READY evidence. The offline OPEN is synthetic and confined to isolated pytest fixtures.
 
