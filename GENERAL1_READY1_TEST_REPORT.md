@@ -57,12 +57,12 @@ Existing project tests also cover V3 identity, on-chain settlement cases, malici
 
 ## 5. GitHub Actions result
 
-Initial implementation workflow run:
+Final implementation code workflow run (including fetch-time READY invalidation):
 
-- **Run:** https://github.com/mudrjafar/PolymarketResearch/actions/runs/40141286522
+- **Run:** https://github.com/mudrjafar/PolymarketResearch/actions/runs/40141631931
 - **Result:** SUCCESS
-- **Focused suite:** 132 passed at the initial checkpoint; final count is expected to increase by one after the added fetch-time invalidation test.
-- **Full project pytest:** **524 passed, 61 subtests passed** at the initial checkpoint; final numbers are recorded by the latest branch-HEAD CI run.
+- **Focused suite (final implementation): 133 passed.**
+- **Full project pytest (final implementation): 525 passed, 61 subtests passed.**
 - **`python run_machine.py --self-test`:** SELF-TEST OK; ALL TESTS PASSED. Risk 7/7, Focus engine/runner, Book engine/worker and Paper engine/worker pass.
 
 Subsequent docs-only commits may trigger fresh CI; use the **latest** completed run at the feature-branch HEAD as the final check.
