@@ -55,6 +55,9 @@ COLLECTOR_VERSION = 4
 CONFIRMATION_BLOCKS = int(os.getenv('COLLECTOR_CONFIRMATION_BLOCKS', '20'))
 INITIAL_LOOKBACK_BLOCKS = int(os.getenv('COLLECTOR_INITIAL_LOOKBACK_BLOCKS', '500'))
 START_BLOCK = os.getenv('COLLECTOR_START_BLOCK', '').strip()
+# Opt-in only for isolated performance validation. Legacy production remains unchanged.
+GAMMA_BATCH_LOOKUP = os.getenv('COLLECTOR_GAMMA_BATCH_LOOKUP', '0') == '1'
+GAMMA_BATCH_SIZE = 12
 if CONFIRMATION_BLOCKS < 1 or INITIAL_LOOKBACK_BLOCKS < 1:
     raise SystemExit('Collector confirmation depth and initial lookback must be positive')
 
@@ -1083,6 +1086,124 @@ def load_market_map():
     return asset_map
 
 
+def _gamma_batch_legacy_lookup(token_ids):
+    """Resolve a bounded set of exact legacy CTF IDs; never infer missing identities.
+
+    Gamma accepts repeated clob_token_ids parameters. Open and closed are
+    queried separately, with only missing tokens passed into the closed query.
+    Any malformed/conflicting response fails the entire uncommitted scan.
+    """
+    tokens = list(dict.fromkeys(str(value) for value in token_ids))
+    if not 2 <= len(tokens) <= GAMMA_BATCH_SIZE:
+        raise ValueError('Gamma batch must contain 2..12 unique CTF ids')
+    for token in tokens:
+        if not token.isascii() or not token.isdecimal():
+            raise StorageError('Invalid canonical legacy token id for batch')
+    found = {}
+    record = globals().get('_LIVE1C_CURRENT')
+    started = time.perf_counter()
+    try:
+        for closed in (False, True):
+            missing = [token for token in tokens if token not in found]
+            if not missing:
+                break
+            params = {'clob_token_ids': missing, 'closed': closed, 'limit': 100}
+            response = requests.get(f'{GAMMA_API}/markets', params=params, timeout=30)
+            if isinstance(record, dict):
+                record['gamma_batch_http_requests'] = record.get('gamma_batch_http_requests', 0) + 1
+            response.raise_for_status()
+            markets = response.json()
+            if not isinstance(markets, list):
+                raise StorageError('Gamma batched CTF response shape invalid')
+            if len(markets) >= 100:
+                raise RetryableCollectorError('Gamma batched response may be truncated')
+            mapped = build_token_map(markets)
+            for token in tokens:
+                market = mapped.get(token)
+                if market is None:
+                    continue
+                identity = _gamma_identity(token, market)
+                _check_gamma_identity(
+                    _gamma_identity(token, found[token]) if token in found else None,
+                    identity,
+                )
+                if str(market.get('asset_type') or 'CTF_TOKEN').upper() != 'CTF_TOKEN':
+                    raise GammaIdentityConflict('Batch returned non-CTF asset')
+                if token not in found:
+                    found[token] = market
+        return found
+    finally:
+        if isinstance(record, dict):
+            record['gamma_batch_ms'] = record.get('gamma_batch_ms', 0.0) + (
+                time.perf_counter() - started) * 1000.0
+            record['gamma_batch_tokens_requested'] = (
+                record.get('gamma_batch_tokens_requested', 0) + len(tokens))
+            record['gamma_batch_tokens_resolved'] = (
+                record.get('gamma_batch_tokens_resolved', 0) + len(found))
+
+
+def _prefetch_legacy_assets(logs, by_number, token_map):
+    """Preload unique unknown legacy identities before any SQLite commit.
+
+    This prepass validates canonical block/log identity and uses the same
+    taker-aggressor filter as scan_once. V3 is left on the original strict
+    Gamma -> Data API route. Never skips an unresolved legacy token.
+    """
+    unknown = []
+    seen = set()
+    hits = 0
+    v3_events = 0
+    for log in logs:
+        n = int(log['blockNumber'], 16)
+        header = by_number.get(n)
+        if header is None or log.get('removed') or log['blockHash'].lower() != header['block_hash'].lower():
+            raise StorageError('Log does not match requested canonical batch')
+        trade = decode_order_filled(log)
+        exchange = log['_exchange_address']
+        if trade['taker'].lower() != exchange.lower():
+            continue
+        if exchange.lower() == EXCHANGE_V3.lower():
+            v3_events += 1
+            continue
+        token = trade['asset_id']
+        if token in token_map:
+            hits += 1
+        elif token not in seen:
+            seen.add(token)
+            unknown.append(token)
+    record = globals().get('_LIVE1C_CURRENT')
+    if isinstance(record, dict):
+        record['gamma_cache_hit_events'] = record.get('gamma_cache_hit_events', 0) + hits
+        record['gamma_cache_miss_unique_legacy'] = (
+            record.get('gamma_cache_miss_unique_legacy', 0) + len(unknown))
+        record['gamma_v3_events_unbatched'] = (
+            record.get('gamma_v3_events_unbatched', 0) + v3_events)
+    if len(unknown) < 2:
+        return
+    # Resolve before mutating the cache. Failures preserve the SQLite cursor.
+    staged = {}
+    for start in range(0, len(unknown), GAMMA_BATCH_SIZE):
+        chunk = unknown[start:start + GAMMA_BATCH_SIZE]
+        if len(chunk) == 1:
+            # Preserve singleton lookup semantics and diagnostic instrumentation.
+            staged[chunk[0]] = lookup_market(chunk[0])
+        else:
+            matched = _gamma_batch_legacy_lookup(chunk)
+            for token in chunk:
+                if token in matched:
+                    staged[token] = matched[token]
+                else:
+                    # Gamma may omit an ID in a filtered query; original
+                    # singleton lookup must still confirm open/closed or fail.
+                    staged[token] = lookup_market(token)
+    for token in unknown:
+        if isinstance(token_map, GammaTokenMap):
+            token_map.remember_fallback(token, staged[token])
+        else:
+            identity = _gamma_identity(token, staged[token])
+            token_map[token] = _fresh_gamma_entry(identity, staged[token])
+
+
 def normalize_trade(log, trade, market, header):
     metrics = calculate_trade_metrics(trade)
     if metrics['side_label'] == 'UNKNOWN' or not metrics['token_amount'] or not (0 < metrics['fill_price'] < 1):
@@ -1199,6 +1320,8 @@ def scan_once(store, token_map):
     by_number = {header['block_number']: header for header in headers}
     # get_order_filled_logs returns only after ALL monitored exchanges succeed.
     logs = get_order_filled_logs(from_block, to_block)
+    if GAMMA_BATCH_LOOKUP and len(logs) > 1:
+        _prefetch_legacy_assets(logs, by_number, token_map)
     rows = []
     for log in logs:
         n = int(log['blockNumber'], 16)
