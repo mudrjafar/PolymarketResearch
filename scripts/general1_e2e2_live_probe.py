@@ -408,7 +408,7 @@ def freshness_diagnostics(data, *, now=None):
 def timing_diagnostics(records):
     """Existing LIVE-1C timing counters; overlapping scopes are NOT additive."""
     keys = ("batch_ms", "rpc_ms", "get_logs_ms", "timestamp_ms",
-            "gamma_batch_ms",
+            "gamma_batch_ms", "gamma_v3_lookup_ms",
             "gamma_lookup_ms", "gamma_refresh_ms", "decode_ms",
             "enrichment_ms", "sqlite_ms", "compatibility_ms", "backoff_ms")
     out = {"note": "Phases may overlap (e.g. RPC inside lookups); do not sum percentages.",
@@ -572,6 +572,8 @@ def run_live(duration, rpc, *, dashboard=False, near_tip=False, gamma_batch=Fals
             int(r.get("gamma_cache_miss_unique_legacy") or 0) for r in records)
         performance["gamma_v3_events_unbatched"] = sum(
             int(r.get("gamma_v3_events_unbatched") or 0) for r in records)
+        performance["gamma_v3_lookup_count"] = sum(
+            int(r.get("gamma_v3_lookup_count") or 0) for r in records)
     final_status = statuses[-1] if statuses else {}
     worker_states = final_status.get("services", {})
     critical_running = all(worker_states.get(n, {}).get("status") == "RUNNING" for n in CORE)
