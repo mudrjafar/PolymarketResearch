@@ -174,3 +174,25 @@ def test_generation_lagged_archived_is_distinguished_from_invalid(tmp_path):
     out2 = report.pipeline_summary(tmp_path, {"_evidence":[("123",token["condition_id"])]})
     assert out2["risk_generation_status"] == "UNVERIFIED_ARCHIVE_MISSING"
     assert out2["risk_source_archive_real_trade_binding_observed"] is False
+
+
+def test_fixed_300_probe_uses_a_new_isolated_name_and_restores_settings(monkeypatch):
+    from scripts import general1_gamma1_300_live_probe as fixed
+    seen = []
+    before = (report.EXPECTED_NAME, report.REPORT_NAME)
+
+    def fake_main(argv):
+        seen.append((report.EXPECTED_NAME, report.REPORT_NAME, argv))
+        return 2
+
+    monkeypatch.setattr(report, "main", fake_main)
+    assert fixed.main([]) == 2
+    assert seen == [(
+        "GENERAL1_GAMMA1_300_LIVE_SANDBOX",
+        "general1_gamma1_300_live_report.json",
+        ["--near-tip", "--gamma-batch", "--duration", "300"],
+    )]
+    assert (report.EXPECTED_NAME, report.REPORT_NAME) == before
+    assert fixed.main(["--duration", "900"]) == 3
+    assert fixed.main(["--dashboard"]) == 3
+    assert len(seen) == 1
