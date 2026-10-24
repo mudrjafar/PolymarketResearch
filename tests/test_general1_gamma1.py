@@ -112,7 +112,9 @@ def test_prefetch_deduplicates_and_caches_exact_legacy_ids(monkeypatch):
     assert get.call_count == 1
     assert record["gamma_cache_miss_unique_legacy"] == 2
     assert record["gamma_batch_tokens_resolved"] == 2
-    with patch.object(collector, "lookup_market", side_effect=AssertionError("cached hit re-requested")):
+    with patch.object(collector, "decode_order_filled", side_effect=lambda log: {
+        "taker":log["_exchange_address"], "asset_id":log["asset"]
+    }), patch.object(collector, "lookup_market", side_effect=AssertionError("cached hit re-requested")):
         collector._prefetch_legacy_assets(logs, {101:{"block_hash":"0x" + "a"*64}}, ledger)
     assert record["gamma_cache_hit_events"] == 4
 
