@@ -14,6 +14,7 @@ Code changes:
 
 - `scripts/focus_engine.py`: invalidate active Focus if current Risk row has different canonical condition or outcome despite matching token.
 - `scripts/book_engine.py`: fail closed when the CLOB response does not contain the necessary asset ID or market ID.
+- `scripts/paper_worker.py`: final Focus/Book/request-binding recheck after network/settlement operations and immediately before a virtual OPEN commit.
 - `tests/test_general1_ready1.py`: isolated multi-worker integration and negative regressions, including actual Risk-assessed candidate publication.
 - `.github/workflows/general1-ready1-preflight.yml`: compile, targeted tests, full regression suite, machine self-test.
 
@@ -46,6 +47,7 @@ The actual `book_worker.run_once` consumes READY, validates a mocked market+asse
 | Paper request with wrong token/condition/generation/evidence | Reject |
 | Focus and Book snapshots stale | Reject |
 | Focus READY downgraded before Paper request processed | Reject |
+| Focus READY revoked *during* refreshed Book fetch | Final Paper gate rejects without OPEN |
 | Book assessment refers to another generation | Reject |
 | Fresh execution book insufficient for requested notional | Reject |
 | Settlement authority returns UNKNOWN | Reject |
@@ -59,8 +61,8 @@ Initial implementation workflow run:
 
 - **Run:** https://github.com/mudrjafar/PolymarketResearch/actions/runs/40141286522
 - **Result:** SUCCESS
-- **Focused suite:** 132 passed.
-- **Full project pytest:** **524 passed, 61 subtests passed.**
+- **Focused suite:** 132 passed at the initial checkpoint; final count is expected to increase by one after the added fetch-time invalidation test.
+- **Full project pytest:** **524 passed, 61 subtests passed** at the initial checkpoint; final numbers are recorded by the latest branch-HEAD CI run.
 - **`python run_machine.py --self-test`:** SELF-TEST OK; ALL TESTS PASSED. Risk 7/7, Focus engine/runner, Book engine/worker and Paper engine/worker pass.
 
 Subsequent docs-only commits may trigger fresh CI; use the **latest** completed run at the feature-branch HEAD as the final check.
