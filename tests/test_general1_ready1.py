@@ -382,3 +382,31 @@ def test_unknown_settlement_rejects_paper_open(monkeypatch, tmp_path):
     state, events = paper_tick(at, settlement=lambda _: {"status": "UNKNOWN"})
     assert state["positions"] == []
     assert events[0]["reason_code"] == "SETTLEMENT_UNKNOWN"
+
+
+def test_focus_revoked_during_book_fetch_blocks_paper_commit(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    ready_sequence(paths)
+    at = T0 + timedelta(seconds=184)
+    book_worker.run_once(now=at, book_loader=lambda _: book())
+    request_open(paths, at)
+
+    def book_loader_revokes_ready(_token):
+        # Focus changes *after* Paper's first gate read, in the network window.
+        payload = saved(paths["focus"])
+        payload["state"] = "WAIT 2/3"
+        payload["focus"]["status"] = "WAIT"
+        payload["focus"]["progress"] = 2
+        save_json_atomic(paths["focus"], payload)
+        return book()
+
+    state, events = paper_worker.run_once(
+        now=at,
+        book_loader=book_loader_revokes_ready,
+        market_info_loader=market_info,
+        identity_loader=settlement_identity,
+        settlement_checker=unresolved,
+    )
+    assert state["positions"] == []
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == "EXECUTION_GATE_CHANGED_FOCUS_NOT_READY"
