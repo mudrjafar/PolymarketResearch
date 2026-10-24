@@ -1,0 +1,28 @@
+name: GENERAL1-GAMMA-1 bounded metadata offline validation
+
+on:
+  push:
+    branches:
+      - feat/general1-gamma-1-bounded-metadata-20261025
+  workflow_dispatch:
+
+jobs:
+  gamma-and-full-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install checked-in dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile modified offline and launcher scripts
+        run: |
+          python -m py_compile scripts/live_active_trades.py scripts/general1_e2e2_live_probe.py scripts/general1_gamma1_live_probe.py tests/test_general1_gamma1.py
+      - name: GAMMA-1 targeted safety tests
+        run: python -m pytest -q tests/test_general1_gamma1.py tests/test_collector_sqlite.py tests/test_general1_freshness1.py tests/test_general1_e2e2_live_probe.py
+      - name: Full offline regressions
+        run: python -m pytest -q
+      - name: Machine self-test
+        run: python run_machine.py --self-test
