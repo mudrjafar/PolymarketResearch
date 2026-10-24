@@ -1,0 +1,28 @@
+name: GENERAL1-READY-1 Offline Focus to Paper Integration
+on:
+  push:
+    branches:
+      - feat/general1-ready1-focus-paper-integration-20261025
+  workflow_dispatch:
+
+jobs:
+  ready1-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile changes
+        run: |
+          python -m py_compile scripts/focus_engine.py scripts/book_engine.py tests/test_general1_ready1.py
+      - name: Focus to Paper integration and identity regression
+        run: |
+          python -m pytest -q tests/test_general1_ready1.py tests/test_focus_engine.py tests/test_focus_runner.py tests/test_risk_engine.py tests/test_risk_focus_contract.py tests/test_book_engine.py tests/test_book_worker.py tests/test_paper_worker.py tests/test_paper_settlement.py
+      - name: Full project regression
+        run: python -m pytest -q
+      - name: Machine self-test
+        run: python run_machine.py --self-test
