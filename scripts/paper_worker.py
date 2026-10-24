@@ -706,6 +706,17 @@ def _process_open(
         reason = str(settlement.get("reason_code") or "UNKNOWN").strip()
         return _reject(request_id, now, f"SETTLEMENT_UNRESOLVED_{reason}")
 
+    # Network calls above may outlive a READY window. Recheck both
+    # authoritative published gates just before committing any virtual OPEN.
+    # This closes the known fetch-time invalidation window without granting
+    # additional READY authority to Paper or modifying strategy thresholds.
+    final_gate, final_focus_payload, _ = read_execution_gate(now=now)
+    if final_gate != "READY_BOOK_PASS":
+        return _reject(request_id, now, "EXECUTION_GATE_CHANGED_" + final_gate)
+    matches, reason = _matches_open_request(request, final_focus_payload)
+    if not matches:
+        return _reject(request_id, now, "EXECUTION_GATE_CHANGED_" + reason)
+
     suffix = request_id.split("-", 1)[-1]
     paper_id = f"PAPER-{suffix}"
 
