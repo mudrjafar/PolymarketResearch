@@ -238,11 +238,42 @@ def pipeline_summary(data, db):
     analysis_pairs = {(str(v.get("token_id")), str(v.get("condition_id"))) for v in analysis if isinstance(v, dict)}
     risk_pairs = {(str(v.get("token_id")), str(v.get("condition_id"))) for v in results if isinstance(v, dict)}
     observed = e & flow_pairs & analysis_pairs & risk_pairs
+    risk_source = risk.get("source_generation_id")
+    risk_source_dir = data / "diamond_generations" / str(risk_source)
+    archived_flow = safe_json(risk_source_dir / "flow_state.json", {})
+    archived_analysis = safe_json(risk_source_dir / "diamond_analysis_v3.json", [])
+    archived_exists = (
+        isinstance(risk_source, str) and bool(risk_source)
+        and isinstance(archived_flow, dict) and bool(archived_flow)
+        and isinstance(archived_analysis, list) and bool(archived_analysis)
+    )
+    archived_flow_pairs = ({
+        (str(row.get("token_id")), str(row.get("condition_id")))
+        for row in archived_flow.values() if isinstance(row, dict)
+    } if archived_exists else set())
+    archived_analysis_pairs = ({
+        (str(row.get("token_id")), str(row.get("condition_id")))
+        for row in archived_analysis if isinstance(row, dict)
+    } if archived_exists else set())
+    archived_observed = bool(
+        archived_exists and e & risk_pairs & archived_flow_pairs & archived_analysis_pairs
+    )
+    if not generation or not risk_source:
+        generation_status = "MISSING_GENERATION"
+    elif risk_source == generation:
+        generation_status = "CURRENT_MATCH"
+    elif archived_exists:
+        generation_status = "LAGGED_ARCHIVED_GENERATION"
+    else:
+        generation_status = "UNVERIFIED_ARCHIVE_MISSING"
     return {
         "flow_market_count": len(flow),
         "diamond_generation_exists": bool(generation),
         "diamond_analysis_count": len(analysis),
-        "risk_generation_matches": bool(generation and risk.get("source_generation_id") == generation),
+        "risk_generation_matches": bool(generation and risk_source == generation),
+        "risk_generation_status": generation_status,
+        "risk_source_archive_available": archived_exists,
+        "risk_source_archive_real_trade_binding_observed": archived_observed,
         "risk_decisions": len(results),
         "real_trade_to_risk_binding_observed": bool(observed and generation and risk.get("source_generation_id") == generation),
         "focus_input_status": focus.get("input_status") if isinstance(focus, dict) else None,
@@ -377,6 +408,7 @@ def freshness_diagnostics(data, *, now=None):
 def timing_diagnostics(records):
     """Existing LIVE-1C timing counters; overlapping scopes are NOT additive."""
     keys = ("batch_ms", "rpc_ms", "get_logs_ms", "timestamp_ms",
+            "gamma_batch_ms",
             "gamma_lookup_ms", "gamma_refresh_ms", "decode_ms",
             "enrichment_ms", "sqlite_ms", "compatibility_ms", "backoff_ms")
     out = {"note": "Phases may overlap (e.g. RPC inside lookups); do not sum percentages.",
@@ -430,11 +462,16 @@ def controlled_neartip_environment(rpc):
     return env
 
 
-def run_live(duration, rpc, *, dashboard=False, near_tip=False):
+def run_live(duration, rpc, *, dashboard=False, near_tip=False, gamma_batch=False):
     # A fresh sandbox has no data, so the preparation code cannot archive
     # any pre-existing user files. Never run preparation in a reused sandbox.
     isolation_gate(ROOT)
     run_env = controlled_neartip_environment(rpc) if near_tip else worker_process_environment(rpc)
+    run_env.pop("COLLECTOR_GAMMA_BATCH_LOOKUP", None)
+    if gamma_batch:
+        if not near_tip:
+            raise GateError("Gamma batch experiment requires isolated near-tip mode")
+        run_env["COLLECTOR_GAMMA_BATCH_LOOKUP"] = "1"
     # Inherited credentials are not needed by any other worker.
     os.environ.pop("TELEGRAM_BOT_TOKEN", None)
     os.environ.pop("TELEGRAM_CHAT_ID", None)
@@ -522,6 +559,19 @@ def run_live(duration, rpc, *, dashboard=False, near_tip=False):
         freshness["chain_head_gap_blocks_end"] = max(0, end_block - db["checkpoint"])
         freshness["safe_tip_gap_blocks_end"] = max(0, end_block - 20 - db["checkpoint"]) if near_tip else None
     performance = timing_diagnostics(records)
+    if gamma_batch:
+        performance["gamma_batch_http_requests"] = sum(
+            int(r.get("gamma_batch_http_requests") or 0) for r in records)
+        performance["gamma_batch_tokens_requested"] = sum(
+            int(r.get("gamma_batch_tokens_requested") or 0) for r in records)
+        performance["gamma_batch_tokens_resolved"] = sum(
+            int(r.get("gamma_batch_tokens_resolved") or 0) for r in records)
+        performance["gamma_cache_hit_events"] = sum(
+            int(r.get("gamma_cache_hit_events") or 0) for r in records)
+        performance["gamma_cache_miss_unique_legacy"] = sum(
+            int(r.get("gamma_cache_miss_unique_legacy") or 0) for r in records)
+        performance["gamma_v3_events_unbatched"] = sum(
+            int(r.get("gamma_v3_events_unbatched") or 0) for r in records)
     final_status = statuses[-1] if statuses else {}
     worker_states = final_status.get("services", {})
     critical_running = all(worker_states.get(n, {}).get("status") == "RUNNING" for n in CORE)
@@ -543,8 +593,9 @@ def run_live(duration, rpc, *, dashboard=False, near_tip=False):
         result = "PARTIAL"
     # No RPC URLs, tokens, full worker stderr or individual wallets in report.
     report = {
-        "task": "GENERAL1-FRESHNESS-1" if near_tip else "GENERAL1-E2E-2", "result": result,
-        "experiment": ({"mode": "NEAR_TIP_ONLY", "initial_lookback_blocks": 30,
+        "task": ("GENERAL1-GAMMA-1" if gamma_batch else
+                 "GENERAL1-FRESHNESS-1" if near_tip else "GENERAL1-E2E-2"), "result": result,
+        "experiment": ({"mode": "NEAR_TIP_GAMMA_BATCH_LEGACY" if gamma_batch else "NEAR_TIP_ONLY", "initial_lookback_blocks": 30,
                         "confirmation_blocks": 20, "historical_backfill_complete": False}
                        if near_tip else {"mode": "E2E2_BASELINE"}),
         "generated_at": utc_now(), "duration_seconds": seconds,
@@ -573,6 +624,7 @@ def main(argv=None):
     parser.add_argument("--duration", type=int, default=900)
     parser.add_argument("--dashboard", action="store_true")
     parser.add_argument("--near-tip", action="store_true", help="Sandbox-only 30-block initial lookback; no backfill claim")
+    parser.add_argument("--gamma-batch", action="store_true", help="Isolated legacy Gamma batch experiment only")
     args = parser.parse_args(argv)
     try:
         isolation_gate(ROOT)
@@ -580,7 +632,8 @@ def main(argv=None):
             raise GateError("Duration must be between 60 and 1800 seconds")
         rpc = get_rpc(args.source_env)
         print("[PREFLIGHT] isolated sandbox, RPC configured, no credential output", flush=True)
-        return run_live(args.duration, rpc, dashboard=args.dashboard, near_tip=args.near_tip)
+        return run_live(args.duration, rpc, dashboard=args.dashboard, near_tip=args.near_tip,
+                        gamma_batch=args.gamma_batch)
     except GateError as exc:
         print(f"[BLOCKED] {exc}", flush=True)
         return 3
