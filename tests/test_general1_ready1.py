@@ -588,15 +588,18 @@ def test_focus_transition_cannot_commit_inside_paper_final_commit_lock(monkeypat
     book_worker.run_once(now=at, book_loader=lambda _: book())
     request_open(paths, at)
     observed = []
+    clock_calls = [0]
 
     def commit_clock():
-        # Paper final-lock is already held. A concurrent Focus transition
-        # cannot commit between the final READY read and Paper's state save.
-        from collector_storage_v4.bridge import CollectorLock
-        with pytest.raises(RuntimeError):
-            with CollectorLock(paths["focus_state"].with_suffix(".lock")):
-                observed.append("WRONGLY_LOCKED")
-        observed.append("FOCUS_COMMIT_BLOCKED")
+        clock_calls[0] += 1
+        # Book fetch and MARK observe the clock without holding Focus's lock.
+        # Only the third clock read is inside the final OPEN commit lock.
+        if clock_calls[0] == 3:
+            from collector_storage_v4.bridge import CollectorLock
+            with pytest.raises(RuntimeError):
+                with CollectorLock(paths["focus_state"].with_suffix(".lock")):
+                    observed.append("WRONGLY_LOCKED")
+            observed.append("FOCUS_COMMIT_BLOCKED")
         return at
 
     state, events = paper_worker.run_once(
@@ -616,14 +619,16 @@ def test_book_publisher_cannot_replace_binding_during_final_paper_commit(monkeyp
     book_worker.run_once(now=at, book_loader=lambda _: book())
     request_open(paths, at)
     observed = []
+    clock_calls = [0]
 
     def commit_clock():
-        # Paper holds the common short Focus/Book/OPEN commit lock here.
-        # The Book fetch itself is permitted, but its final publication
-        # must not change the assessment between Paper's gate and save.
-        with pytest.raises(RuntimeError):
-            book_worker.run_once(now=at, book_loader=lambda _: book())
-        observed.append("BOOK_PUBLISH_BLOCKED")
+        clock_calls[0] += 1
+        # Book response/mark reads must happen outside the shared lock;
+        # test book publication contention *only at final OPEN commit*.
+        if clock_calls[0] == 3:
+            with pytest.raises(RuntimeError):
+                book_worker.run_once(now=at, book_loader=lambda _: book())
+            observed.append("BOOK_PUBLISH_BLOCKED")
         return at
 
     state, events = paper_worker.run_once(
