@@ -605,3 +605,30 @@ def test_focus_transition_cannot_commit_inside_paper_final_commit_lock(monkeypat
     assert observed == ["FOCUS_COMMIT_BLOCKED"]
     assert len(state["positions"]) == 1
     assert any(x["type"] == "OPENED" for x in events)
+
+
+def test_book_publisher_cannot_replace_binding_during_final_paper_commit(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    ready_sequence(paths)
+    at = T0 + timedelta(seconds=184)
+    book_worker.run_once(now=at, book_loader=lambda _: book())
+    request_open(paths, at)
+    observed = []
+
+    def commit_clock():
+        # Paper holds the common short Focus/Book/OPEN commit lock here.
+        # The Book fetch itself is permitted, but its final publication
+        # must not change the assessment between Paper's gate and save.
+        with pytest.raises(RuntimeError):
+            book_worker.run_once(now=at, book_loader=lambda _: book())
+        observed.append("BOOK_PUBLISH_BLOCKED")
+        return at
+
+    state, events = paper_worker.run_once(
+        now=at, clock=commit_clock,
+        book_loader=lambda _: book(), market_info_loader=market_info,
+        identity_loader=settlement_identity, settlement_checker=unresolved,
+    )
+    assert observed == ["BOOK_PUBLISH_BLOCKED"]
+    assert len(state["positions"]) == 1
+    assert any(event["type"] == "OPENED" for event in events)
