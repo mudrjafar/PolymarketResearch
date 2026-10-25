@@ -836,3 +836,68 @@ def test_unknown_focus_engine_version_blocks_new_open(monkeypatch, tmp_path):
         market_info_loader=lambda _: {})
     assert state["positions"] == []
     assert events[0]["reason_code"] == "FOCUS_STATE_INVALID"
+
+
+def test_concurrent_paper_workers_are_serialized_with_thread_barrier(monkeypatch, tmp_path):
+    import threading
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    entered = threading.Event()
+    release = threading.Event()
+    result = []
+
+    def delayed_book(_):
+        entered.set()
+        assert release.wait(timeout=8), "offline barrier unexpectedly timed out"
+        return raw_book()
+
+    def first():
+        try:
+            result.append(run_worker(
+                now=NOW, book_loader=delayed_book,
+                market_info_loader=lambda _: market_info()
+            ))
+        except Exception as exc:
+            result.append(exc)
+
+    worker = threading.Thread(target=first)
+    worker.start()
+    try:
+        assert entered.wait(timeout=8), "first worker never reached network boundary"
+        with pytest.raises(paper_worker.PaperStateError, match="Concurrent Paper worker"):
+            run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                       market_info_loader=lambda _: market_info())
+    finally:
+        release.set()
+        worker.join(timeout=8)
+    assert not worker.is_alive()
+    assert len(result) == 1 and not isinstance(result[0], Exception)
+    assert len(result[0][0]["positions"]) == 1
+    replay, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                                market_info_loader=lambda _: market_info())
+    assert len(replay["positions"]) == 1
+    assert not any(row["type"] == "OPENED" for row in events)
+
+
+def test_crash_after_paper_state_save_does_not_reopen_request(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    append = paper_worker._append_events
+
+    def crash_before_event_journal(_events):
+        raise RuntimeError("simulated crash after durable Paper commit")
+
+    monkeypatch.setattr(paper_worker, "_append_events", crash_before_event_journal)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                   market_info_loader=lambda _: market_info())
+    durable = json.loads(paths["state"].read_text(encoding="utf-8"))
+    assert len(durable["positions"]) == 1
+    assert "REQ-open" in durable["processed_request_ids"]
+    monkeypatch.setattr(paper_worker, "_append_events", append)
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                                market_info_loader=lambda _: market_info())
+    assert len(state["positions"]) == 1
+    assert not any(row["type"] == "OPENED" for row in events)
