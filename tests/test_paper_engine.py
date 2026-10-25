@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timedelta, timezone
 
 from scripts import paper_engine
 
@@ -134,3 +135,39 @@ def test_settlement_math_rejects_invalid_payouts():
 
     with pytest.raises(ValueError, match="PAYOUT_STRUCTURE_INVALID"):
         paper_engine.calculate_settlement(40, 25, 0, 0)
+
+
+@pytest.mark.parametrize("field,expected", [
+    ("asset_id", "TOKEN_ID_MISSING"),
+    ("market", "CONDITION_ID_MISSING"),
+])
+def test_identity_missing_book_field_is_unknown_not_pass(field, expected):
+    raw = book()
+    del raw[field]
+    assert paper_engine.validate_book_identity(raw, "token-a", "condition-a") == (False, expected)
+
+
+def test_expected_market_identity_missing_is_not_pass():
+    assert paper_engine.validate_book_identity(book(), "token-a", "") == (
+        False, "CONDITION_ID_MISSING"
+    )
+    assert paper_engine.validate_book_identity(book(), "", "condition-a") == (
+        False, "TOKEN_ID_MISSING"
+    )
+
+
+def test_source_book_freshness_requires_epoch_milliseconds():
+    now = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
+    ms = lambda when: str(int(when.timestamp() * 1000))
+    assert paper_engine.validate_book_freshness(
+        {"timestamp": ms(now - timedelta(seconds=30))}, now
+    ) == (True, "OK")
+    assert paper_engine.validate_book_freshness(
+        {"timestamp": ms(now - timedelta(seconds=31))}, now
+    ) == (False, "BOOK_TIMESTAMP_STALE")
+    assert paper_engine.validate_book_freshness(
+        {"timestamp": ms(now + timedelta(seconds=6))}, now
+    ) == (False, "BOOK_TIMESTAMP_FUTURE")
+    assert paper_engine.validate_book_freshness({"timestamp": str(int(now.timestamp()))}, now) == (
+        False, "BOOK_TIMESTAMP_INVALID"
+    )
