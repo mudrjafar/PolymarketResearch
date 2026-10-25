@@ -115,10 +115,39 @@ def price_from(row):
     return None
 
 
+def _canonical_block_time(value):
+    """UTC ISO from canonical chain time; never substitute detection wall time."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, int):
+            if value < 0:
+                return None
+            timestamp = datetime.fromtimestamp(value, timezone.utc)
+        elif isinstance(value, str):
+            timestamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        else:
+            return None
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            return None
+        return timestamp.astimezone(timezone.utc).isoformat()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
 def normalize(item, live):
     m=market(item); f1=flowwin(item,"1m"); f5=flowwin(item,"5m"); f15=flowwin(item,"15m")
     matches=[r for r in live if same_market(item,r)]
     latest=matches[-1] if matches else {}
+    if matches:
+        # V4 block time is authoritative; never let detected_at make stale
+        # blockchain evidence look fresh. Legacy V3 retains its old fallback.
+        last_trade_at = _canonical_block_time(latest.get("block_timestamp"))
+        if latest.get("collector_version") != 4 and last_trade_at is None:
+            last_trade_at = latest.get("detected_at")
+    else:
+        # Flow publishes an aware ISO date derived from this same chain event.
+        last_trade_at = item.get("last_trade_at") or m.get("last_trade_at")
     p=price_from(latest) or price_from(m) or price_from(item)
     prices=[price_from(r) for r in matches[-100:]]; prices=[x for x in prices if x is not None]
     ratio=first_num(f5,"largest_trade_ratio","single_trade_ratio","trade_to_volume_ratio",default=None)
@@ -128,7 +157,7 @@ def normalize(item, live):
         remaining = min(remaining, -end_age) if remaining is not None else -end_age
     return {
         "source_updated_at": item.get("source_updated_at") or item.get("updated_at"),
-        "last_trade_at": latest.get("block_timestamp") or latest.get("detected_at") or item.get("last_trade_at") or m.get("last_trade_at"),
+        "last_trade_at": last_trade_at,
         "schema_version": item.get("schema_version"),
         "question": question(item), "outcome": outcome(item), "condition_id": condition(item), "token_id": token(item) or text(latest.get("token_id")),
         "price": p, "state": text(item.get("state") or "UNKNOWN").upper(), "verified": bool(item.get("verified",False)),

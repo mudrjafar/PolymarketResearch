@@ -1080,6 +1080,299 @@ class CollectorV3CoverageTests(unittest.TestCase):
         self.assertEqual(params['position_ids'], [position_id])
         self.assertNotIn('clob_token_ids', params)
 
+    def test_e2e2_gamma_position_missing_open_and_closed_is_retryable_not_fatal(self):
+        """Two empty Gamma position searches keep the exact V3 identity unresolved."""
+        raw = v3_market()
+        position_id = raw['positionIds'][0]
+
+        class EmptyResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return []
+
+        class MissingTokenResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {'data': []}
+
+        with patch.object(
+            collector.requests, 'get',
+            side_effect=[EmptyResponse(), EmptyResponse(), MissingTokenResponse()],
+        ) as get:
+            with self.assertRaisesRegex(
+                collector.RetryableCollectorError,
+                'V3 Data API token metadata unavailable',
+            ):
+                collector.lookup_position_market(position_id)
+
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual(
+            [call.kwargs['params']['closed'] for call in get.call_args_list[:2]],
+            [False, True],
+        )
+        self.assertTrue(all(
+            call.kwargs['params']['position_ids'] == [position_id]
+            for call in get.call_args_list[:2]
+        ))
+        self.assertEqual(get.call_args_list[2].kwargs['params'], {'token_id': position_id})
+
+    def test_e2e2_position_missing_does_not_commit_advance_or_publish(self):
+        """Retryable identity miss must fail the whole real blockchain batch closed."""
+        raw = v3_market()
+        position_id = raw['positionIds'][0]
+        v3log = event(101, int(position_id), collector.EXCHANGE_V3)
+        before = self.store.checkpoint()['block_number']
+
+        class EmptyResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return []
+
+        class MissingTokenResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {'data': []}
+
+        with patch.object(collector, 'get_latest_block', return_value=125), \
+             patch.object(collector, 'get_block_header', side_effect=header), \
+             patch.object(collector, 'get_order_filled_logs', return_value=[v3log]), \
+             patch.object(
+                 collector.requests, 'get',
+                 side_effect=[EmptyResponse(), EmptyResponse(), MissingTokenResponse()],
+             ) as get, \
+             patch.object(self.store, 'commit_batch', wraps=self.store.commit_batch) as commit, \
+             patch.object(collector, 'publish_snapshot') as publish:
+            with self.assertRaises(collector.RetryableCollectorError):
+                collector.scan_once(self.store, collector.GammaTokenMap({}))
+
+        self.assertEqual(get.call_count, 3)
+        commit.assert_not_called()
+        publish.assert_not_called()
+        self.assertEqual(self.store.checkpoint()['block_number'], before)
+        self.assertEqual(self.store.recent_trades(0), [])
+
+    def test_e2e2_position_nonempty_ineligible_gamma_identity_remains_fatal(self):
+        """Contradictory Gamma metadata must NEVER fall into missing-data retry."""
+        raw = v3_market()
+        position_id = raw['positionIds'][0]
+        wrong = v3_market()
+        wrong['outcomes'] = ['No', 'Yes']
+
+        class InvalidResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return [wrong]
+
+        with patch.object(collector.requests, 'get', return_value=InvalidResponse()) as get:
+            with self.assertRaises(collector.GammaIdentityConflict) as failure:
+                collector.lookup_position_market(position_id)
+
+        self.assertNotIsInstance(failure.exception, collector.RetryableCollectorError)
+        self.assertEqual(get.call_count, 1)
+
+    def test_e2e2_v3_data_api_team_outcome_has_separate_market_condition(self):
+        """Real V3 sports outcomes are teams, not positional Yes/No labels."""
+        raw = v3_market()
+        yes, no = raw['positionIds']
+        market_condition = h(345)
+        data = {
+            'token_id': no,
+            'module': 'binary',
+            'outcome_index': 1,
+            'structural_condition_id': v3_condition(no) + '00',
+            'condition_id': market_condition,
+            'opposite_token_id': yes,
+            'outcome': 'Besiktas',
+            'title': 'Who will win this match?',
+            'market_slug': 'basketball-example',
+            'closed': False,
+        }
+
+        class Response:
+            def __init__(self, value):
+                self.value = value
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self.value
+
+        with patch.object(
+            collector.requests, 'get',
+            side_effect=[Response([]), Response([]), Response({'data': [data]})],
+        ) as get:
+            market = collector.lookup_position_market(no)
+
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual(market['condition_id'], market_condition)
+        self.assertEqual(market['structural_condition_id'], v3_condition(no) + '00')
+        self.assertEqual(market['outcome'], 'Besiktas')
+        self.assertEqual(market['position_outcome_index'], 1)
+        self.assertEqual(market['position_module'], 'BINARY')
+        self.assertIsNone(market['active'])
+        self.assertIsNone(market['accepting_orders'])
+        self.assertIsNone(market['price'])
+        self.assertEqual(
+            collector._gamma_identity(no, market)['condition_id'],
+            market_condition,
+        )
+        self.assertEqual(get.call_args_list[2].kwargs['params'], {'token_id': no})
+
+        v3log = event(101, int(no), collector.EXCHANGE_V3, side=0)
+        before = self.store.checkpoint()['block_number']
+        with patch.object(collector, 'get_latest_block', return_value=125), \
+             patch.object(collector, 'get_block_header', side_effect=header), \
+             patch.object(collector, 'get_order_filled_logs', return_value=[v3log]), \
+             patch.object(
+                 collector.requests, 'get',
+                 side_effect=[Response([]), Response([]), Response({'data': [data]})],
+             ), \
+             patch.object(collector, 'publish_snapshot', return_value=1):
+            self.assertEqual(
+                collector.scan_once(self.store, collector.GammaTokenMap({})), 1,
+            )
+        self.assertEqual(self.store.checkpoint()['block_number'], before + 5)
+        row = self.store.recent_trades(0)[-1]
+        self.assertEqual(row['asset_type'], 'POSITION')
+        self.assertEqual(row['token_id'], no)
+        self.assertEqual(row['condition_id'], market_condition)
+        self.assertEqual(row['structural_condition_id'], v3_condition(no) + '00')
+        self.assertEqual(row['outcome'], 'Besiktas')
+        self.assertEqual(row['metadata_source'], 'DATA_API_V2')
+        self.assertIsNone(row['active'])
+        self.assertIsNone(row['price'])
+
+    def test_e2e2_v3_data_api_rejects_identity_collisions_and_untrusted_metadata(self):
+        raw = v3_market()
+        yes, no = raw['positionIds']
+        correct = {
+            'token_id': no,
+            'module': 'binary',
+            'outcome_index': 1,
+            'structural_condition_id': v3_condition(no) + '00',
+            'condition_id': h(345),
+            'opposite_token_id': yes,
+            'outcome': 'Besiktas',
+            'title': 'Who wins?',
+            'market_slug': 'basketball-example',
+        }
+        invalid = [
+            dict(correct, token_id=yes),
+            dict(correct, module='v1_ctf'),
+            dict(correct, outcome_index=0),
+            dict(correct, structural_condition_id=h(400)),
+            dict(correct, condition_id='invalid'),
+            dict(correct, opposite_token_id=no),
+            dict(correct, opposite_token_id=v3_position(module_id=3)),
+            dict(correct, outcome=''),
+            dict(correct, title=''),
+            dict(correct, market_slug=''),
+        ]
+        for i, candidate in enumerate(invalid):
+            with self.subTest(i=i):
+                with self.assertRaises(collector.StorageError):
+                    collector._v3_data_token_market(no, candidate)
+
+    def test_e2e2_v3_data_api_unknown_or_ambiguous_token_does_not_commit(self):
+        position_id = v3_market()['positionIds'][0]
+
+        class Response:
+            def __init__(self, value):
+                self.value = value
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self.value
+
+        for payload, expected in [
+            ({'data': []}, collector.RetryableCollectorError),
+            ({'data': [{} , {}]}, collector.GammaIdentityConflict),
+            ({'items': []}, collector.StorageError),
+        ]:
+            with self.subTest(payload=payload), patch.object(
+                collector.requests, 'get', return_value=Response(payload),
+            ):
+                with self.assertRaises(expected):
+                    collector.lookup_v3_data_token(position_id)
+
+    def test_e2e2_v3_data_api_negrisk_question_index_matches_position(self):
+        raw = v3_market(module_id=2, arity=3, condition_index=1)
+        yes, no = raw['positionIds']
+        row = {
+            'token_id': no, 'module': 'neg_risk',
+            'outcome_index': 1,
+            'structural_condition_id': v3_condition(no) + '00',
+            'condition_id': h(877),
+            'opposite_token_id': yes,
+            'outcome': 'Team B',
+            'title': 'Which team wins?', 'market_slug': 'example',
+            'question_index': 1,
+        }
+        result = collector._v3_data_token_market(no, row)
+        self.assertEqual(result['position_module'], 'NEG_RISK')
+        self.assertEqual(result['outcome'], 'Team B')
+        with self.assertRaises(collector.GammaIdentityConflict):
+            collector._v3_data_token_market(no, dict(row, question_index=2))
+
+    def test_e2e2_data_api_fallback_preserves_legacy_trade_payload_keys(self):
+        """The new V3 provenance fields must NOT touch CTF trade contracts."""
+        log = event(101, 123, collector.EXCHANGES[0])
+        trade = collector.decode_order_filled(log)
+        row = collector.normalize_trade(log, trade, market(), header(101))
+        self.assertEqual(row['asset_type'], 'CTF_TOKEN')
+        self.assertEqual(row['condition_id'], h(999))
+        self.assertNotIn('structural_condition_id', row)
+        self.assertNotIn('metadata_source', row)
+
+    def test_e2e2_live_identity_probe_codes_and_no_raw_ids(self):
+        from scripts import general1_e2e2_v3_data_probe as probe
+        raw = v3_market()
+        yes, no = raw['positionIds']
+        row = {
+            'token_id': no,
+            'module': 'binary',
+            'outcome_index': 1,
+            'structural_condition_id': v3_condition(no) + '00',
+            'condition_id': h(345),
+            'opposite_token_id': yes,
+            'outcome': 'Besiktas',
+            'title': 'Who wins?',
+            'market_slug': 'basketball',
+        }
+        self.assertEqual(
+            probe._validate_candidates([no], {'data': [row]}, collector),
+            ['IDENTITY_PASS'],
+        )
+        self.assertEqual(
+            probe._validate_candidates([no], {'data': []}, collector),
+            ['NOT_FOUND'],
+        )
+        self.assertEqual(
+            probe._validate_candidates([no], {'data': [row, row]}, collector),
+            ['AMBIGUOUS'],
+        )
+        self.assertEqual(
+            probe._validate_candidates([no], {'data': [dict(row, outcome_index=0)]}, collector),
+            ['IDENTITY_REJECTED:GammaIdentityConflict'],
+        )
+        self.assertEqual(
+            probe._validate_candidates([no], {'wrong': []}, collector),
+            ['RESPONSE_SHAPE_INVALID'],
+        )
+
     def test_v3_binary_trade_enters_existing_runtime_contract_with_explicit_asset_kind(self):
         raw=v3_market()
         position_id=raw['positionIds'][0]

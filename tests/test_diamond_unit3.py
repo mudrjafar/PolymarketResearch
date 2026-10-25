@@ -68,3 +68,54 @@ def test_direction_contradiction_blocks():
     x["flow_15m"]["net_flow"] = -8000
     r = diamond.analyze(x, [])
     assert r["diamond"] is False
+
+def test_v4_unix_block_time_normalized_for_diamond():
+    x = fixture()
+    now = datetime.now(timezone.utc)
+    trade = {
+        "collector_version": 4,
+        "token_id": x["token_id"],
+        "condition_id": x["condition_id"],
+        "outcome": "Yes",
+        "block_timestamp": int(now.timestamp()),
+        "detected_at": now.isoformat(),
+        "fill_price": 0.42,
+    }
+    result = diamond.analyze(x, [trade])
+    assert result["diamond"] is True
+    assert result["classification"] == "DIAMOND"
+    assert result["last_trade_at"].endswith("+00:00")
+    assert result["last_trade_at"] == datetime.fromtimestamp(
+        trade["block_timestamp"], timezone.utc
+    ).isoformat()
+
+
+def test_v4_stale_block_time_does_not_become_fresh_from_detected_at():
+    x = fixture()
+    trade = {
+        "collector_version": 4,
+        "token_id": x["token_id"],
+        "condition_id": x["condition_id"],
+        "block_timestamp": 1_000_000_000,
+        "detected_at": datetime.now(timezone.utc).isoformat(),
+        "fill_price": 0.42,
+    }
+    result = diamond.analyze(x, [trade])
+    assert result["diamond"] is False
+    assert result["classification"] == "DATA_RISK"
+    assert "Observed trade stale or timestamp missing" in result["why_not_diamond"]
+
+
+def test_v4_invalid_block_timestamp_fails_closed():
+    x = fixture()
+    for invalid in (True, -1, 10**30, "2026-10-23T12:00:00", None):
+        trade = {
+            "collector_version": 4,
+            "token_id": x["token_id"],
+            "condition_id": x["condition_id"],
+            "block_timestamp": invalid,
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+        }
+        result = diamond.analyze(x, [trade])
+        assert result["classification"] == "DATA_RISK"
+        assert result["last_trade_at"] is None
