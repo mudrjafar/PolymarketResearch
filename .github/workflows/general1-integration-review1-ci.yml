@@ -1,0 +1,28 @@
+name: GENERAL1 Integration Review 1 - Minimal Core Offline CI
+on:
+  push:
+    branches:
+      - feat/general1-integration-review1-core-20261025
+  workflow_dispatch:
+
+jobs:
+  integration-offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Core syntax check
+        run: |
+          python -m py_compile scripts/live_active_trades.py scripts/flow_tracker.py scripts/diamond_filter_v3.py scripts/focus_engine.py scripts/book_engine.py scripts/paper_worker.py
+      - name: Focused integration, collector and security regressions
+        run: |
+          python -m pytest -q tests/test_integration1_gamma_core.py tests/test_general1_ready1.py tests/test_collector_sqlite.py tests/test_flow_unit2.py tests/test_diamond_unit3.py tests/test_focus_engine.py tests/test_focus_runner.py tests/test_risk_engine.py tests/test_risk_focus_contract.py tests/test_book_engine.py tests/test_book_worker.py tests/test_paper_worker.py tests/test_paper_settlement.py
+      - name: Entire project test suite
+        run: python -m pytest -q
+      - name: Runtime self-test
+        run: python run_machine.py --self-test
