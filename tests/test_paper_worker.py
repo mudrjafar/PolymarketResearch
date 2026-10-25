@@ -97,7 +97,7 @@ def raw_book(*, bid="0.49", ask="0.50", bid_size="1000", ask_size="1000"):
     return {
         "market": "condition-a",
         "asset_id": "token-a",
-        "timestamp": "123",
+        "timestamp": str(int(NOW.timestamp() * 1000)),
         "hash": "book-x",
         "bids": [{"price": bid, "size": bid_size}],
         "asks": [{"price": ask, "size": ask_size}],
