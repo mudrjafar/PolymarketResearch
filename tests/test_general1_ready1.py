@@ -492,3 +492,116 @@ def test_paper_rejects_torn_focus_projection_after_durable_invalidation(monkeypa
     state, events = paper_tick(now)
     assert not state["positions"]
     assert events[0]["reason_code"] == "FOCUS_DURABLE_NOT_READY"
+
+
+def test_final_commit_rejects_elapsed_freshness_after_network_calls(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    ready_sequence(paths)
+    at = T0 + timedelta(seconds=184)
+    book_worker.run_once(now=at, book_loader=lambda _: book())
+    request_open(paths, at)
+    # All network mocks return success. The actual wall clock advances while
+    # their work occurs; only the FINAL commit-time gate must reject this OPEN.
+    late = at + timedelta(seconds=121)
+    state, events = paper_worker.run_once(
+        now=at, clock=lambda: late,
+        book_loader=lambda _: book(), market_info_loader=market_info,
+        identity_loader=settlement_identity, settlement_checker=unresolved,
+    )
+    assert state["positions"] == []
+    assert any(e["reason_code"] == "FINAL_COMMIT_INPUT_NOT_OK" for e in events
+               if e["type"] == "REJECTED")
+    assert not any(e["type"] == "OPENED" for e in events)
+    state2, _ = paper_tick(at + timedelta(seconds=1))
+    assert state2["positions"] == []
+
+
+def test_actual_focus_runner_invalidates_after_early_gate_before_commit(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    ready_sequence(paths)
+    at = T0 + timedelta(seconds=184)
+    book_worker.run_once(now=at, book_loader=lambda _: book())
+    request_open(paths, at)
+    calls = []
+
+    def fetch(_token):
+        calls.append(_token)
+        if len(calls) == 2:
+            # Second fetch is Paper MARK, after _process_open's early READY
+            # check but before the final durable paper_state.json commit.
+            row = risk_candidate(5, at, active=False)
+            assert row["decision"] == "BLOCK"
+            save_json_atomic(paths["risk"], {
+                "source_generation_id": "GEN-5",
+                "source_generated_at": at.isoformat(),
+                "generated_at": at.isoformat(), "results": [row],
+            })
+            result, events, status = focus_runner.run_once(now=at)
+            assert status == "OK"
+            assert result["focus"] is None
+            assert events[-1]["type"] == "INVALIDATED"
+        return book()
+
+    state, events = paper_worker.run_once(
+        now=at, book_loader=fetch, market_info_loader=market_info,
+        identity_loader=settlement_identity, settlement_checker=unresolved,
+    )
+    assert calls == [TOKEN, TOKEN]
+    assert state["positions"] == []
+    assert any(x["reason_code"] == "FINAL_COMMIT_FOCUS_NOT_READY"
+               for x in events if x["type"] == "REJECTED")
+    assert not any(x["type"] == "OPENED" for x in events)
+
+
+def test_book_generation_changed_after_early_gate_blocks_final_commit(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    ready_sequence(paths)
+    at = T0 + timedelta(seconds=184)
+    book_worker.run_once(now=at, book_loader=lambda _: book())
+    request_open(paths, at)
+    count = [0]
+
+    def fetch(_token):
+        count[0] += 1
+        if count[0] == 2:
+            book_snapshot = saved(paths["book"])
+            book_snapshot["source_generation_id"] = "DIFFERENT_GENERATION"
+            save_json_atomic(paths["book"], book_snapshot)
+        return book()
+
+    state, events = paper_worker.run_once(
+        now=at, book_loader=fetch, market_info_loader=market_info,
+        identity_loader=settlement_identity, settlement_checker=unresolved,
+    )
+    assert count[0] == 2
+    assert state["positions"] == []
+    assert any(x["reason_code"] == "FINAL_COMMIT_GENERATION_ID_MISMATCH"
+               for x in events if x["type"] == "REJECTED")
+
+
+def test_focus_transition_cannot_commit_inside_paper_final_commit_lock(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    ready_sequence(paths)
+    at = T0 + timedelta(seconds=184)
+    book_worker.run_once(now=at, book_loader=lambda _: book())
+    request_open(paths, at)
+    observed = []
+
+    def commit_clock():
+        # Paper final-lock is already held. A concurrent Focus transition
+        # cannot commit between the final READY read and Paper's state save.
+        from collector_storage_v4.bridge import CollectorLock
+        with pytest.raises(RuntimeError):
+            with CollectorLock(paths["focus_state"].with_suffix(".lock")):
+                observed.append("WRONGLY_LOCKED")
+        observed.append("FOCUS_COMMIT_BLOCKED")
+        return at
+
+    state, events = paper_worker.run_once(
+        now=at, clock=commit_clock,
+        book_loader=lambda _: book(), market_info_loader=market_info,
+        identity_loader=settlement_identity, settlement_checker=unresolved,
+    )
+    assert observed == ["FOCUS_COMMIT_BLOCKED"]
+    assert len(state["positions"]) == 1
+    assert any(x["type"] == "OPENED" for x in events)
