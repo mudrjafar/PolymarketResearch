@@ -22,6 +22,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import fresh, save_json_atomic
+from collector_storage_v4.bridge import CollectorLock
 from scripts import book_engine, book_worker, paper_engine, paper_settlement
 
 try:
@@ -35,6 +36,7 @@ except Exception as exc:
 
 DATA_DIR = BASE_DIR / "data"
 FOCUS_FILE = DATA_DIR / "focused_market.json"
+FOCUS_STATE_FILE = DATA_DIR / "focus_state.json"
 BOOK_FILE = DATA_DIR / "book_assessment.json"
 REQUEST_DIR = DATA_DIR / "paper_requests"
 STATE_FILE = DATA_DIR / "paper_state.json"
@@ -55,6 +57,16 @@ class PaperStateError(RuntimeError):
 
 class PaperFetchError(RuntimeError):
     pass
+
+
+class PaperWorkerLock(CollectorLock):
+    """One writer per Paper-state file, across processes on Windows and Linux."""
+
+    def __enter__(self):
+        try:
+            return super().__enter__()
+        except RuntimeError as exc:
+            raise PaperStateError("Concurrent Paper worker blocked by exclusive state lock") from exc
 
 
 def _read_json(path):
@@ -114,6 +126,39 @@ def _snapshot(path, now):
     return "OK", payload
 
 
+def _durable_focus_gate(focus_payload):
+    """Fail closed if a READY view is not the projection of committed Focus.
+
+    Focus runner writes durable focus_state.json first, then focused_market.json.
+    A crash or concurrent tick between those writes must not leave an old READY
+    compatibility view capable of authorizing a new virtual Paper OPEN.
+    """
+    try:
+        durable = _read_json(FOCUS_STATE_FILE)
+    except FileNotFoundError:
+        return "FOCUS_STATE_MISSING"
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return "FOCUS_STATE_CORRUPT"
+
+    if not isinstance(durable, dict) or durable.get("schema_version") != 1:
+        return "FOCUS_STATE_INVALID"
+    engine = durable.get("engine_state")
+    if not isinstance(engine, dict) or engine.get("version") != 3:
+        return "FOCUS_STATE_INVALID"
+    current = engine.get("focus")
+    if not isinstance(current, dict) or current.get("status") != "READY":
+        return "FOCUS_DURABLE_NOT_READY"
+
+    if (
+        durable.get("updated_at") != focus_payload.get("generated_at")
+        or durable.get("last_source_generation_id")
+        != focus_payload.get("source_generation_id")
+        or current != focus_payload.get("focus")
+    ):
+        return "FOCUS_STATE_VIEW_MISMATCH"
+    return "OK"
+
+
 def read_execution_gate(now=None):
     now = now or datetime.now(timezone.utc)
     focus_status, focus_payload = _snapshot(FOCUS_FILE, now)
@@ -152,6 +197,10 @@ def read_execution_gate(now=None):
         return "EVIDENCE_ID_MISMATCH", focus_payload, book_payload
     if str(book_payload.get("source_generation_id") or "").strip() != generation_id:
         return "GENERATION_ID_MISMATCH", focus_payload, book_payload
+
+    durable_status = _durable_focus_gate(focus_payload)
+    if durable_status != "OK":
+        return durable_status, focus_payload, book_payload
 
     return "READY_BOOK_PASS", focus_payload, book_payload
 
@@ -706,6 +755,17 @@ def _process_open(
         reason = str(settlement.get("reason_code") or "UNKNOWN").strip()
         return _reject(request_id, now, f"SETTLEMENT_UNRESOLVED_{reason}")
 
+    # Network calls above may outlive a READY window. Recheck both
+    # authoritative published gates just before committing any virtual OPEN.
+    # This closes the known fetch-time invalidation window without granting
+    # additional READY authority to Paper or modifying strategy thresholds.
+    final_gate, final_focus_payload, _ = read_execution_gate(now=now)
+    if final_gate != "READY_BOOK_PASS":
+        return _reject(request_id, now, "EXECUTION_GATE_CHANGED_" + final_gate)
+    matches, reason = _matches_open_request(request, final_focus_payload)
+    if not matches:
+        return _reject(request_id, now, "EXECUTION_GATE_CHANGED_" + reason)
+
     suffix = request_id.split("-", 1)[-1]
     paper_id = f"PAPER-{suffix}"
 
@@ -860,7 +920,7 @@ def _process_close(state, request_id, request, now, book_loader):
     )
 
 
-def run_once(
+def _run_once_unlocked(
     now=None,
     book_loader=book_worker.fetch_book,
     market_info_loader=fetch_market_info,
@@ -964,6 +1024,27 @@ def run_once(
     return state, events
 
 
+def run_once(
+    now=None,
+    book_loader=book_worker.fetch_book,
+    market_info_loader=fetch_market_info,
+    identity_loader=paper_settlement.resolve_position_identity,
+    settlement_checker=paper_settlement.check_settlement,
+):
+    # Lock the entire read -> request processing -> atomic write cycle.
+    # Otherwise two manual or independently supervised Paper workers can
+    # both load the previous state and commit conflicting OPEN requests.
+    # The file is kept for reuse; OS advisory lock is released on exit/crash.
+    with PaperWorkerLock(STATE_FILE.with_suffix(".lock")):
+        return _run_once_unlocked(
+            now=now,
+            book_loader=book_loader,
+            market_info_loader=market_info_loader,
+            identity_loader=identity_loader,
+            settlement_checker=settlement_checker,
+        )
+
+
 def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
     last_signature = None
 
@@ -1000,11 +1081,12 @@ def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
 
 
 def self_test():
-    global DATA_DIR, FOCUS_FILE, BOOK_FILE, REQUEST_DIR, STATE_FILE, EVENTS_FILE
+    global DATA_DIR, FOCUS_FILE, FOCUS_STATE_FILE, BOOK_FILE, REQUEST_DIR, STATE_FILE, EVENTS_FILE
 
     original = (
         DATA_DIR,
         FOCUS_FILE,
+        FOCUS_STATE_FILE,
         BOOK_FILE,
         REQUEST_DIR,
         STATE_FILE,
@@ -1016,6 +1098,7 @@ def self_test():
         with tempfile.TemporaryDirectory() as temp:
             DATA_DIR = Path(temp)
             FOCUS_FILE = DATA_DIR / "focused_market.json"
+            FOCUS_STATE_FILE = DATA_DIR / "focus_state.json"
             BOOK_FILE = DATA_DIR / "book_assessment.json"
             REQUEST_DIR = DATA_DIR / "paper_requests"
             STATE_FILE = DATA_DIR / "paper_state.json"
@@ -1044,6 +1127,15 @@ def self_test():
                     "source_generation_id": "GEN-X",
                     "state": "READY",
                     "focus": focus,
+                },
+            )
+            save_json_atomic(
+                FOCUS_STATE_FILE,
+                {
+                    "schema_version": 1,
+                    "updated_at": now.isoformat(),
+                    "last_source_generation_id": "GEN-X",
+                    "engine_state": {"version": 3, "focus": focus},
                 },
             )
             save_json_atomic(
@@ -1154,6 +1246,7 @@ def self_test():
         (
             DATA_DIR,
             FOCUS_FILE,
+            FOCUS_STATE_FILE,
             BOOK_FILE,
             REQUEST_DIR,
             STATE_FILE,
