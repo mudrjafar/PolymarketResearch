@@ -20,6 +20,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import fresh, save_json_atomic
+from collector_storage_v4.bridge import CollectorLock
 from scripts import book_engine
 from scripts.learning_queue import enqueue_book_observation
 from scripts.learning_versioning import current_strategy_versions
@@ -166,6 +167,14 @@ def _queue_learning(output):
             _LEARNING_INIT_ERROR = signature
 
 
+def _publish_book(output):
+    # Serialize only Book's final atomic publication with committed Focus
+    # transitions and Paper's final execution authorization. Never hold this
+    # shared lock during remote CLOB requests or learning queue writes.
+    with CollectorLock(FOCUS_FILE.with_name("focus_state.lock")):
+        save_json_atomic(BOOK_FILE, output)
+
+
 def run_once(now=None, book_loader=fetch_book):
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
@@ -176,7 +185,7 @@ def run_once(now=None, book_loader=fetch_book):
     if focus_status != "READY":
         output = _base_output(focus_status, now, focus_payload)
         output["reason_codes"] = [f"FOCUS_{focus_status}"]
-        save_json_atomic(BOOK_FILE, output)
+        _publish_book(output)
         return output
 
     focus = focus_payload["focus"]
@@ -188,7 +197,7 @@ def run_once(now=None, book_loader=fetch_book):
         output = _base_output("API_ERROR", now, focus_payload)
         code = str(exc).strip() or type(exc).__name__
         output["reason_codes"] = ["BOOK_API_ERROR", code]
-        save_json_atomic(BOOK_FILE, output)
+        _publish_book(output)
         _queue_learning(output)
         return output
 
@@ -198,7 +207,7 @@ def run_once(now=None, book_loader=fetch_book):
     output.update(analysis)
     output["status"] = "OK"
 
-    save_json_atomic(BOOK_FILE, output)
+    _publish_book(output)
     _queue_learning(output)
     return output
 
