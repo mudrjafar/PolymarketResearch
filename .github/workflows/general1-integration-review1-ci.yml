@@ -4,6 +4,7 @@ on:
     branches:
       - feat/general1-integration-review1-core-20261025
       - fix/integration45-durable-focus-gate-20261025
+      - feat/general1-merge-gate1-consolidated-20261025
   workflow_dispatch:
 
 jobs:
