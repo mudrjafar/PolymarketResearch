@@ -410,3 +410,65 @@ def test_focus_revoked_during_book_fetch_blocks_paper_commit(monkeypatch, tmp_pa
     assert state["positions"] == []
     assert events[0]["type"] == "REJECTED"
     assert events[0]["reason_code"] == "EXECUTION_GATE_CHANGED_FOCUS_NOT_READY"
+
+
+def test_invalidated_during_network_fetch_cannot_open(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    ready_sequence(paths)
+    at = T0 + timedelta(seconds=184)
+    book_worker.run_once(now=at, book_loader=lambda _: book())
+    request_open(paths, at)
+
+    def invalidating_book(_token):
+        view = saved(paths["focus"])
+        view["state"] = "IDLE"
+        view["focus"] = None
+        save_json_atomic(paths["focus"], view)
+        return book()
+
+    state, events = paper_worker.run_once(
+        now=at, book_loader=invalidating_book, market_info_loader=market_info,
+        identity_loader=settlement_identity, settlement_checker=unresolved
+    )
+    assert state["positions"] == []
+    assert events[0]["reason_code"] == "EXECUTION_GATE_CHANGED_FOCUS_NOT_READY"
+
+
+def test_bound_book_swap_during_network_fetch_cannot_open(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    ready_sequence(paths)
+    at = T0 + timedelta(seconds=184)
+    book_worker.run_once(now=at, book_loader=lambda _: book())
+    request_open(paths, at)
+
+    def replaced_book(_token):
+        assessment = saved(paths["book"])
+        assessment["source_evidence_id"] = "0x" + "f" * 64 + ":99"
+        save_json_atomic(paths["book"], assessment)
+        return book()
+
+    state, events = paper_worker.run_once(
+        now=at, book_loader=replaced_book, market_info_loader=market_info,
+        identity_loader=settlement_identity, settlement_checker=unresolved
+    )
+    assert state["positions"] == []
+    assert events[0]["reason_code"] == "EXECUTION_GATE_CHANGED_EVIDENCE_ID_MISMATCH"
+
+
+def test_two_explicit_open_requests_for_one_token_create_only_one_position(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    ready_sequence(paths)
+    at = T0 + timedelta(seconds=184)
+    book_worker.run_once(now=at, book_loader=lambda _: book())
+    request_open(paths, at, request_id="READY1-OPEN-A")
+    request_open(paths, at, request_id="READY1-OPEN-B")
+
+    state, events = paper_tick(at)
+    assert len(state["positions"]) == 1
+    assert [x["type"] for x in events if x["type"] in ("OPENED", "REJECTED")] == ["OPENED", "REJECTED"]
+    assert events[1]["reason_code"] == "POSITION_ALREADY_OPEN"
+
+    # The worker reloads its durable state from disk even after a new call.
+    state2, events2 = paper_tick(at + timedelta(seconds=1))
+    assert len(state2["positions"]) == 1
+    assert not any(x["type"] == "OPENED" for x in events2)
