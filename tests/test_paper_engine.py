@@ -171,3 +171,25 @@ def test_source_book_freshness_requires_epoch_milliseconds():
     assert paper_engine.validate_book_freshness({"timestamp": str(int(now.timestamp()))}, now) == (
         False, "BOOK_TIMESTAMP_INVALID"
     )
+
+
+@pytest.mark.parametrize("received_at,delta_seconds,expected", [
+    (None, 0, (False, "BOOK_RECEIPT_MISSING")),
+    ("not-a-timestamp", 0, (False, "BOOK_RECEIPT_INVALID")),
+    ("2026-10-25T12:00:00", 0, (False, "BOOK_RECEIPT_INVALID")),
+    ("CURRENT", 30, (True, "OK")),
+    ("CURRENT", 31, (False, "BOOK_RECEIPT_STALE")),
+    ("FUTURE", 0, (False, "BOOK_RECEIPT_FUTURE")),
+])
+def test_local_book_receipt_age_is_distinct_from_exchange_generation(
+    received_at, delta_seconds, expected
+):
+    t0 = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
+    value = {
+        "CURRENT": t0.isoformat(),
+        "FUTURE": (t0 + timedelta(seconds=6)).isoformat(),
+    }.get(received_at, received_at)
+    actual = paper_engine.validate_book_receipt_age(
+        value, t0 + timedelta(seconds=delta_seconds)
+    )
+    assert actual == expected
