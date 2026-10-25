@@ -926,10 +926,17 @@ def _run_once_unlocked(
     market_info_loader=fetch_market_info,
     identity_loader=paper_settlement.resolve_position_identity,
     settlement_checker=paper_settlement.check_settlement,
+    clock=None,
 ):
+    # A caller-supplied 'now' is a deterministic logical clock for tests.
+    # Production does not pass 'now': a fresh wall clock is read at COMMIT,
+    # not recycled after potentially slow Book / RPC / settlement calls.
+    injected_now = now is not None
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
+    if clock is None:
+        clock = (lambda: now) if injected_now else (lambda: datetime.now(timezone.utc))
 
     state = load_state(now=now)
     processed = set(str(x) for x in state.get("processed_request_ids", []))
@@ -943,7 +950,9 @@ def _run_once_unlocked(
         )
     )
 
+    requests_by_id = {}
     for request_id, request in _load_requests():
+        requests_by_id[request_id] = request
         if request_id in processed:
             continue
 
@@ -1013,7 +1022,59 @@ def _run_once_unlocked(
     state["updated_at"] = now.isoformat()
     state["processed_request_ids"] = list(processed)[-MAX_PROCESSED_REQUEST_IDS:]
 
-    save_json_atomic(STATE_FILE, state)
+    pending_opens = [
+        event for event in events
+        if isinstance(event, dict) and event.get("type") == "OPENED"
+    ]
+    if pending_opens:
+        # The only shared Focus/Paper critical section. No HTTP, RPC or
+        # learning calls are permitted inside this lock. Focus commits its
+        # authoritative state and READY view using this exact same lock.
+        # OPEN is still tentative until this short atomic authorization+save.
+        with CollectorLock(FOCUS_STATE_FILE.with_suffix(".lock")):
+            commit_now = clock()
+            if commit_now.tzinfo is None:
+                raise ValueError("commit clock must be timezone-aware")
+            gate, latest_focus, _ = read_execution_gate(now=commit_now)
+            rejected_ids = set()
+            for event in pending_opens:
+                request_id = str(event.get("request_id") or "")
+                if gate != "READY_BOOK_PASS":
+                    reason = gate
+                else:
+                    matches, reason = _matches_open_request(
+                        requests_by_id.get(request_id) or {}, latest_focus
+                    )
+                    if matches and not _request_is_fresh(
+                        requests_by_id.get(request_id), commit_now
+                    ):
+                        matches, reason = False, "REQUEST_STALE"
+                    if matches:
+                        continue
+
+                paper_id = event.get("paper_id")
+                rejected_ids.add(paper_id)
+                state["positions"] = [
+                    position for position in state["positions"]
+                    if position.get("paper_id") != paper_id
+                ]
+                # OPENED must never be published for a rolled-back entry.
+                event.clear()
+                event.update(_reject(
+                    request_id, commit_now, "FINAL_COMMIT_" + reason
+                ))
+            if rejected_ids:
+                # Settlement/mark records generated from an OPEN that was
+                # revoked before commit must not leak into the event journal.
+                events = [
+                    event for event in events
+                    if event.get("paper_id") not in rejected_ids
+                ]
+            save_json_atomic(STATE_FILE, state)
+    else:
+        # No new OPEN authorization. CLOSE and settlement are independent
+        # of Focus READY and retain their existing Paper-only state lock.
+        save_json_atomic(STATE_FILE, state)
     _append_events(events)
 
     # Learning is downstream of committed Paper authority. A queue failure
@@ -1030,6 +1091,7 @@ def run_once(
     market_info_loader=fetch_market_info,
     identity_loader=paper_settlement.resolve_position_identity,
     settlement_checker=paper_settlement.check_settlement,
+    clock=None,
 ):
     # Lock the entire read -> request processing -> atomic write cycle.
     # Otherwise two manual or independently supervised Paper workers can
@@ -1042,6 +1104,7 @@ def run_once(
             market_info_loader=market_info_loader,
             identity_loader=identity_loader,
             settlement_checker=settlement_checker,
+            clock=clock,
         )
 
 
