@@ -41,6 +41,7 @@ def configure(monkeypatch, tmp_path):
         (book_worker, {"DATA_DIR": data, "FOCUS_FILE": paths["focus"],
                        "BOOK_FILE": paths["book"]}),
         (paper_worker, {"DATA_DIR": data, "FOCUS_FILE": paths["focus"],
+                        "FOCUS_STATE_FILE": paths["focus_state"],
                         "BOOK_FILE": paths["book"], "REQUEST_DIR": paths["requests"],
                         "STATE_FILE": paths["paper_state"], "EVENTS_FILE": paths["paper_events"]}),
     ):
@@ -472,3 +473,22 @@ def test_two_explicit_open_requests_for_one_token_create_only_one_position(monke
     state2, events2 = paper_tick(at + timedelta(seconds=1))
     assert len(state2["positions"]) == 1
     assert not any(x["type"] == "OPENED" for x in events2)
+
+
+def test_paper_rejects_torn_focus_projection_after_durable_invalidation(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    ready_sequence(paths)
+    now = T0 + timedelta(seconds=184)
+    book_worker.run_once(now=now, book_loader=lambda _: book())
+    request_open(paths, now)
+
+    # Simulates interruption after focus_runner committed its new engine state
+    # but before focused_market.json was refreshed: compatibility view is READY.
+    committed = saved(paths["focus_state"])
+    committed["engine_state"]["focus"] = None
+    save_json_atomic(paths["focus_state"], committed)
+    assert saved(paths["focus"])["state"] == "READY"
+    assert paper_worker.read_execution_gate(now=now)[0] == "FOCUS_DURABLE_NOT_READY"
+    state, events = paper_tick(now)
+    assert not state["positions"]
+    assert events[0]["reason_code"] == "FOCUS_DURABLE_NOT_READY"
