@@ -18,6 +18,7 @@ def configure(monkeypatch, tmp_path):
     paths = {
         "data": data,
         "focus": data / "focused_market.json",
+        "focus_state": data / "focus_state.json",
         "book": data / "book_assessment.json",
         "requests": request_dir,
         "state": data / "paper_state.json",
@@ -26,6 +27,7 @@ def configure(monkeypatch, tmp_path):
 
     monkeypatch.setattr(paper_worker, "DATA_DIR", data, raising=False)
     monkeypatch.setattr(paper_worker, "FOCUS_FILE", paths["focus"], raising=False)
+    monkeypatch.setattr(paper_worker, "FOCUS_STATE_FILE", paths["focus_state"], raising=False)
     monkeypatch.setattr(paper_worker, "BOOK_FILE", paths["book"], raising=False)
     monkeypatch.setattr(paper_worker, "REQUEST_DIR", paths["requests"], raising=False)
     monkeypatch.setattr(paper_worker, "STATE_FILE", paths["state"], raising=False)
@@ -63,6 +65,15 @@ def write_gate(
             "source_generation_id": generation,
             "state": state,
             "focus": focus,
+        },
+    )
+    save_json_atomic(
+        paths["focus_state"],
+        {
+            "schema_version": 1,
+            "updated_at": NOW.isoformat(),
+            "last_source_generation_id": generation,
+            "engine_state": {"version": 3, "focus": focus},
         },
     )
     save_json_atomic(
@@ -745,3 +756,148 @@ def test_learning_queue_failure_never_rejects_successful_paper_open(
 
     stored = json.loads(paths["state"].read_text(encoding="utf-8"))
     assert stored["positions"][0]["status"] == "OPEN"
+
+
+def test_durable_focus_revocation_blocks_old_ready_view(monkeypatch, tmp_path):
+    """A torn Focus publication must not leave an executable READY view."""
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    from machine_common import save_json_atomic
+    persisted = json.loads(paths["focus_state"].read_text(encoding="utf-8"))
+    persisted["engine_state"]["focus"]["status"] = "WAIT"
+    persisted["engine_state"]["focus"]["progress"] = 2
+    save_json_atomic(paths["focus_state"], persisted)
+    assert paper_worker.read_execution_gate(now=NOW)[0] == "FOCUS_DURABLE_NOT_READY"
+
+
+def test_missing_or_mismatched_durable_focus_never_authorizes_open(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    paths["focus_state"].unlink()
+    assert paper_worker.read_execution_gate(now=NOW)[0] == "FOCUS_STATE_MISSING"
+
+    write_gate(paths)
+    persisted = json.loads(paths["focus_state"].read_text(encoding="utf-8"))
+    persisted["updated_at"] = "2026-01-01T00:00:00+00:00"
+    save_json_atomic(paths["focus_state"], persisted)
+    assert paper_worker.read_execution_gate(now=NOW)[0] == "FOCUS_STATE_VIEW_MISMATCH"
+
+
+def test_second_paper_writer_cannot_enter_state_transaction(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    lock_path = paths["state"].with_suffix(".lock")
+    with paper_worker.PaperWorkerLock(lock_path):
+        with pytest.raises(paper_worker.PaperStateError, match="Concurrent Paper worker"):
+            run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                       market_info_loader=lambda _: market_info())
+        assert not paths["state"].exists()
+    # Lock release allows a subsequent worker (or supervised restart) to
+    # process the same explicit request exactly once.
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert len(state["positions"]) == 1
+    assert [event["type"] for event in events] == ["OPENED"]
+    state2, events2 = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                                 market_info_loader=lambda _: market_info())
+    assert len(state2["positions"]) == 1
+    assert not any(event["type"] == "OPENED" for event in events2)
+
+
+def test_close_survives_revoked_durable_focus_authority(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    state, _ = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                          market_info_loader=lambda _: market_info())
+    paper_id = state["positions"][0]["paper_id"]
+    committed = json.loads(paths["focus_state"].read_text(encoding="utf-8"))
+    committed["engine_state"]["focus"] = None
+    save_json_atomic(paths["focus_state"], committed)
+    write_close_request(paths, paper_id)
+    state2, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                                market_info_loader=lambda _: market_info())
+    assert state2["positions"][0]["status"] == "CLOSED"
+    assert any(event["type"] == "CLOSED" for event in events)
+    assert paper_worker.read_execution_gate(now=NOW)[0] == "FOCUS_DURABLE_NOT_READY"
+
+
+def test_unknown_focus_engine_version_blocks_new_open(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    payload = json.loads(paths["focus_state"].read_text(encoding="utf-8"))
+    payload["engine_state"]["version"] = 999
+    save_json_atomic(paths["focus_state"], payload)
+    write_open_request(paths)
+    assert paper_worker.read_execution_gate(now=NOW)[0] == "FOCUS_STATE_INVALID"
+    state, events = run_worker(now=NOW, book_loader=lambda _: (_ for _ in ()).throw(
+        AssertionError("No CLOB call for invalid Focus")),
+        market_info_loader=lambda _: {})
+    assert state["positions"] == []
+    assert events[0]["reason_code"] == "FOCUS_STATE_INVALID"
+
+
+def test_concurrent_paper_workers_are_serialized_with_thread_barrier(monkeypatch, tmp_path):
+    import threading
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    entered = threading.Event()
+    release = threading.Event()
+    result = []
+
+    def delayed_book(_):
+        entered.set()
+        assert release.wait(timeout=8), "offline barrier unexpectedly timed out"
+        return raw_book()
+
+    def first():
+        try:
+            result.append(run_worker(
+                now=NOW, book_loader=delayed_book,
+                market_info_loader=lambda _: market_info()
+            ))
+        except Exception as exc:
+            result.append(exc)
+
+    worker = threading.Thread(target=first)
+    worker.start()
+    try:
+        assert entered.wait(timeout=8), "first worker never reached network boundary"
+        with pytest.raises(paper_worker.PaperStateError, match="Concurrent Paper worker"):
+            run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                       market_info_loader=lambda _: market_info())
+    finally:
+        release.set()
+        worker.join(timeout=8)
+    assert not worker.is_alive()
+    assert len(result) == 1 and not isinstance(result[0], Exception)
+    assert len(result[0][0]["positions"]) == 1
+    replay, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                                market_info_loader=lambda _: market_info())
+    assert len(replay["positions"]) == 1
+    assert not any(row["type"] == "OPENED" for row in events)
+
+
+def test_crash_after_paper_state_save_does_not_reopen_request(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    append = paper_worker._append_events
+
+    def crash_before_event_journal(_events):
+        raise RuntimeError("simulated crash after durable Paper commit")
+
+    monkeypatch.setattr(paper_worker, "_append_events", crash_before_event_journal)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                   market_info_loader=lambda _: market_info())
+    durable = json.loads(paths["state"].read_text(encoding="utf-8"))
+    assert len(durable["positions"]) == 1
+    assert "REQ-open" in durable["processed_request_ids"]
+    monkeypatch.setattr(paper_worker, "_append_events", append)
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                                market_info_loader=lambda _: market_info())
+    assert len(state["positions"]) == 1
+    assert not any(row["type"] == "OPENED" for row in events)

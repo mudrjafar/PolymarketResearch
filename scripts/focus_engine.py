@@ -551,6 +551,18 @@ def step(state, candidates, now=None):
 
     focus["absent_since"] = None
 
+    # A token_id alone is not the locked market/outcome authority. The
+    # upstream row may be individually Risk PASS yet refer to a different
+    # condition/outcome. It must never confirm this existing exclusive Focus.
+    if (
+        _text(current.get("condition_id")).casefold()
+        != _text(focus.get("condition_id")).casefold()
+        or _text(current.get("outcome")).casefold()
+        != _text(focus.get("outcome")).casefold()
+    ):
+        _invalidate(state, focus, ["IDENTITY_MISMATCH"], now, events)
+        return state, events
+
     codes = set(
         current.get("reason_codes")
         or []

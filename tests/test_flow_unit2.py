@@ -297,3 +297,81 @@ def test_focus_evidence_metadata_is_exported_only_for_counted_confirmation():
     finally:
         flow.market_states = old_states
         flow.flow_states = old_flow_states
+
+def test_live_collector_v4_integer_epoch_timestamp_is_flow_eligible():
+    """Real collector encodes Polygon block_timestamp as integer Unix seconds."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    row = _canonical_v4(now, block_timestamp=int(now.timestamp()))
+    assert flow.is_flow_eligible_trade(row) is True
+    assert flow.event_time(row) == now
+    assert flow.analyze_flow([row], now, "5m")["trade_count"] == 1
+
+
+def test_live_v4_epoch_timestamp_remains_fail_closed_for_invalid_or_old_values():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    for raw in (True, -1, 10**100, None):
+        assert flow.is_flow_eligible_trade(_canonical_v4(now, block_timestamp=raw)) is False
+    old = _canonical_v4(now, block_timestamp=int((now - timedelta(minutes=25)).timestamp()),
+                        detected_at=now.isoformat())
+    assert flow.is_flow_eligible_trade(old) is True
+    assert flow.analyze_flow([old], now, "15m")["trade_count"] == 0
+
+
+def test_real_collector_epoch_is_normalized_for_diamond_freshness(tmp_path):
+    from machine_common import fresh
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    row = _canonical_v4(now,
+        block_timestamp=int(now.timestamp()),
+        detected_at=now.isoformat(),
+        question="LIVE BLOCK TIME CONTRACT",
+        end_date=(now + timedelta(days=10)).isoformat(),
+        active=True, closed=False, accepting_orders=True,
+        fill_price=.44,
+    )
+    trade_file = tmp_path / "real_collector.jsonl"
+    flow_file = tmp_path / "flow_state.json"
+    verify_file = tmp_path / "verification_state.json"
+    trade_file.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    old = (flow.TRADES_FILE, flow.FLOW_STATE_FILE, flow.VERIFICATION_STATE_FILE,
+           flow.market_states, flow.flow_states, flow.analysis_schedule)
+    try:
+        flow.TRADES_FILE = trade_file
+        flow.FLOW_STATE_FILE = flow_file
+        flow.VERIFICATION_STATE_FILE = verify_file
+        flow.market_states = {}
+        flow.flow_states = {}
+        flow.analysis_schedule = {}
+        with patch.object(flow.time, "sleep", side_effect=InterruptedError), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                flow.main()
+            except InterruptedError:
+                pass
+        state = json.loads(flow_file.read_text(encoding="utf-8"))
+        assert "yes-token" in state
+        entry = state["yes-token"]
+        assert entry["schema_version"] == 4
+        assert entry["market"]["last_trade_at"] == now.isoformat()
+        assert entry["last_trade_at"] == now.isoformat()
+        assert fresh(entry["market"]["last_trade_at"]) is True
+        assert entry["condition_id"] == row["condition_id"]
+        assert entry["token_id"] == row["token_id"]
+    finally:
+        (flow.TRADES_FILE, flow.FLOW_STATE_FILE, flow.VERIFICATION_STATE_FILE,
+         flow.market_states, flow.flow_states, flow.analysis_schedule) = old
+
+
+def test_collector_epoch_jsonl_is_ingested_without_using_detection_time(tmp_path):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    valid = _canonical_v4(now, block_timestamp=int(now.timestamp()), detected_at=now.isoformat())
+    stale = _canonical_v4(now, transaction_hash="0x" + "cd" * 32, log_index=5,
+        block_timestamp=int((now - timedelta(minutes=35)).timestamp()), detected_at=now.isoformat())
+    file = tmp_path / "trades.jsonl"
+    file.write_text(json.dumps(valid) + "\n" + json.dumps(stale) + "\n", encoding="utf-8")
+    old_file = flow.TRADES_FILE
+    try:
+        flow.TRADES_FILE = file
+        seen = flow.load_trades()
+        assert len(seen) == 1
+        assert seen[0]["transaction_hash"] == valid["transaction_hash"]
+    finally:
+        flow.TRADES_FILE = old_file
