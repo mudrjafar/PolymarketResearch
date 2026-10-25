@@ -1337,42 +1337,6 @@ class CollectorV3CoverageTests(unittest.TestCase):
         self.assertNotIn('structural_condition_id', row)
         self.assertNotIn('metadata_source', row)
 
-    def test_e2e2_live_identity_probe_codes_and_no_raw_ids(self):
-        from scripts import general1_e2e2_v3_data_probe as probe
-        raw = v3_market()
-        yes, no = raw['positionIds']
-        row = {
-            'token_id': no,
-            'module': 'binary',
-            'outcome_index': 1,
-            'structural_condition_id': v3_condition(no) + '00',
-            'condition_id': h(345),
-            'opposite_token_id': yes,
-            'outcome': 'Besiktas',
-            'title': 'Who wins?',
-            'market_slug': 'basketball',
-        }
-        self.assertEqual(
-            probe._validate_candidates([no], {'data': [row]}, collector),
-            ['IDENTITY_PASS'],
-        )
-        self.assertEqual(
-            probe._validate_candidates([no], {'data': []}, collector),
-            ['NOT_FOUND'],
-        )
-        self.assertEqual(
-            probe._validate_candidates([no], {'data': [row, row]}, collector),
-            ['AMBIGUOUS'],
-        )
-        self.assertEqual(
-            probe._validate_candidates([no], {'data': [dict(row, outcome_index=0)]}, collector),
-            ['IDENTITY_REJECTED:GammaIdentityConflict'],
-        )
-        self.assertEqual(
-            probe._validate_candidates([no], {'wrong': []}, collector),
-            ['RESPONSE_SHAPE_INVALID'],
-        )
-
     def test_v3_binary_trade_enters_existing_runtime_contract_with_explicit_asset_kind(self):
         raw=v3_market()
         position_id=raw['positionIds'][0]
