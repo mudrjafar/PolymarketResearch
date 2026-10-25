@@ -976,7 +976,9 @@ def test_final_paper_commit_rechecks_same_raw_quote_after_31s(monkeypatch, tmp_p
     write_gate(paths)
     write_open_request(paths)
     late = NOW + timedelta(seconds=31)
-    state, events = run_worker(now=NOW, clock=lambda: late,
+    # Quote arrives at NOW; subsequent settlement / mark work advances time.
+    ticks = iter((NOW, NOW, late))
+    state, events = run_worker(now=NOW, clock=lambda: next(ticks),
                                book_loader=lambda _: raw_book(),
                                market_info_loader=lambda _: market_info())
     assert state["positions"] == []
@@ -999,3 +1001,126 @@ def test_close_rejects_expired_quote_without_realizing_pnl(monkeypatch, tmp_path
                                market_info_loader=lambda _: market_info())
     assert state["positions"][0]["status"] == "OPEN"
     assert any(e["type"] == "REJECTED" and e["reason_code"] == "BOOK_TIMESTAMP_STALE" for e in events)
+
+
+def test_close_accepts_book_arriving_after_seven_seconds(monkeypatch, tmp_path):
+    """Old tick-start clock would falsely reject a fresh book as future."""
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    state, _ = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                          market_info_loader=lambda _: market_info())
+    paper_id = state["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+    late = NOW + timedelta(seconds=7)
+    book = raw_book()
+    book["timestamp"] = str(int(late.timestamp() * 1000))
+    state, events = run_worker(now=NOW, clock=lambda: late,
+                               book_loader=lambda _: book,
+                               market_info_loader=lambda _: market_info())
+    assert state["positions"][0]["status"] == "CLOSED"
+    assert state["positions"][0]["exit"]["book_received_at"] == late.isoformat()
+    assert any(e["type"] == "CLOSED" for e in events)
+
+
+def test_close_rolls_back_when_quote_expires_before_commit(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    state, _ = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                          market_info_loader=lambda _: market_info())
+    paper_id = state["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+    times = iter((NOW, NOW + timedelta(seconds=31)))
+    state, events = run_worker(
+        now=NOW, clock=lambda: next(times),
+        book_loader=lambda _: raw_book(), market_info_loader=lambda _: market_info()
+    )
+    position = state["positions"][0]
+    assert position["status"] == "OPEN"
+    assert position.get("realized_pnl_usd") is None
+    assert position["mark"] is None
+    assert any(e["type"] == "REJECTED" and
+               e["reason_code"] == "FINAL_COMMIT_BOOK_TIMESTAMP_STALE" for e in events)
+    assert not any(e["type"] == "CLOSED" for e in events)
+
+
+def test_mark_uses_book_receipt_time_and_clears_previous_value(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    state, _ = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                          market_info_loader=lambda _: market_info())
+    assert state["positions"][0]["mark_status"] == "OK"
+    late = NOW + timedelta(seconds=7)
+    fresh = raw_book()
+    fresh["timestamp"] = str(int(late.timestamp() * 1000))
+    state, _ = run_worker(
+        now=NOW, clock=lambda: late,
+        book_loader=lambda _: fresh, market_info_loader=lambda _: market_info()
+    )
+    assert state["positions"][0]["mark_status"] == "OK"
+    assert state["positions"][0]["mark"]["book_received_at"] == late.isoformat()
+    bad = dict(fresh)
+    bad.pop("asset_id")
+    state, _ = run_worker(
+        now=NOW, clock=lambda: late,
+        book_loader=lambda _: bad, market_info_loader=lambda _: market_info()
+    )
+    assert state["positions"][0]["mark_status"] == "TOKEN_ID_MISSING"
+    assert state["positions"][0]["mark"] is None
+
+
+def test_mark_rolls_to_stale_before_state_save(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    run_worker(now=NOW, book_loader=lambda _: raw_book(),
+               market_info_loader=lambda _: market_info())
+    times = iter((NOW, NOW + timedelta(seconds=31)))
+    state, _ = run_worker(
+        now=NOW, clock=lambda: next(times),
+        book_loader=lambda _: raw_book(), market_info_loader=lambda _: market_info()
+    )
+    pos = state["positions"][0]
+    assert pos["status"] == "OPEN"
+    assert pos["mark_status"] == "BOOK_TIMESTAMP_STALE"
+    assert pos["mark"] is None
+
+
+def test_open_final_commit_catches_expired_local_receipt_even_if_source_is_recent(
+    monkeypatch, tmp_path
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    newer = raw_book()
+    newer["timestamp"] = str(int((NOW + timedelta(seconds=5)).timestamp() * 1000))
+    # Source timestamp is only 26s old at final commit, but our locally
+    # received response is already 31s old: that must not create a Paper OPEN.
+    times = iter((NOW, NOW, NOW + timedelta(seconds=31)))
+    state, events = run_worker(
+        now=NOW, clock=lambda: next(times),
+        book_loader=lambda _: newer,
+        market_info_loader=lambda _: market_info()
+    )
+    assert state["positions"] == []
+    assert any(e["type"] == "REJECTED" and
+               e["reason_code"] == "FINAL_COMMIT_BOOK_RECEIPT_STALE" for e in events)
+
+
+def test_old_source_with_fresh_http_receipt_is_conservatively_rejected_for_open(
+    monkeypatch, tmp_path
+):
+    """Unknown CLOB timestamp update guarantees: keep explicit fail-closed policy."""
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    old = raw_book()
+    old["timestamp"] = str(int((NOW - timedelta(seconds=120)).timestamp() * 1000))
+    state, events = run_worker(
+        now=NOW, clock=lambda: NOW,
+        book_loader=lambda _: old, market_info_loader=lambda _: market_info()
+    )
+    assert state["positions"] == []
+    assert any(e["reason_code"] == "BOOK_TIMESTAMP_STALE" for e in events)

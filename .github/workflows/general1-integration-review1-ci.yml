@@ -7,6 +7,7 @@ on:
       - feat/general1-merge-gate1-consolidated-20261025
       - feat/general1-final-gate1-atomic-paper-20261025
       - fix/general1-paper-f1-f2-20261025
+      - fix/general1-paper-clock-finalization-20261026
   workflow_dispatch:
 
 jobs:
