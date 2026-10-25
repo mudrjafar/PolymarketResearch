@@ -476,6 +476,11 @@ def _refresh_settlements(
     return events
 
 def _position_mark(position, raw_book, now):
+    fresh_quote, quote_reason = paper_engine.validate_book_freshness(raw_book, now)
+    if not fresh_quote:
+        position["mark_status"] = quote_reason
+        position["mark_checked_at"] = now.isoformat()
+        return
     ok, reason = paper_engine.validate_book_identity(
         raw_book,
         position.get("token_id"),
@@ -694,6 +699,10 @@ def _process_open(
             f"BOOK_FETCH_{str(exc).strip() or type(exc).__name__}",
         )
 
+    quote_fresh, quote_reason = paper_engine.validate_book_freshness(raw_book, now)
+    if not quote_fresh:
+        return _reject(request_id, now, quote_reason)
+
     live_analysis = book_engine.analyze_book(
         raw_book,
         focus,
@@ -865,6 +874,9 @@ def _process_close(state, request_id, request, now, book_loader):
     )
     if not ok:
         return _reject(request_id, now, reason)
+    fresh_quote, quote_reason = paper_engine.validate_book_freshness(raw_book, now)
+    if not fresh_quote:
+        return _reject(request_id, now, quote_reason)
 
     try:
         exit_quote = paper_engine.simulate_sell(
@@ -1049,6 +1061,17 @@ def _run_once_unlocked(
                         requests_by_id.get(request_id), commit_now
                     ):
                         matches, reason = False, "REQUEST_STALE"
+                    if matches:
+                        # The exact execution quote, not just the independently
+                        # published Book assessment, must remain fresh at commit.
+                        pending_position = next(
+                            (p for p in state["positions"]
+                             if p.get("paper_id") == event.get("paper_id")),
+                            None,
+                        )
+                        entry = pending_position.get("entry") if isinstance(pending_position, dict) else None
+                        quote = {"timestamp": entry.get("book_timestamp")} if isinstance(entry, dict) else {}
+                        matches, reason = paper_engine.validate_book_freshness(quote, commit_now)
                     if matches:
                         continue
 
