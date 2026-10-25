@@ -101,6 +101,30 @@ def validate_book_freshness(book, now=None):
     return True, "OK"
 
 
+def validate_book_receipt_age(received_at, now):
+    """Bound how long an already received CLOB response may be used.
+
+    This is a *local* UTC receipt age, not the exchange's book-generation
+    timestamp. Both must pass independently; neither proves execution.
+    """
+    if not isinstance(received_at, str) or not received_at.strip():
+        return False, "BOOK_RECEIPT_MISSING"
+    try:
+        receipt = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return False, "BOOK_RECEIPT_INVALID"
+    if receipt.tzinfo is None or receipt.utcoffset() is None:
+        return False, "BOOK_RECEIPT_INVALID"
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        return False, "BOOK_CLOCK_INVALID"
+    age = (now - receipt).total_seconds()
+    if age < -MAX_BOOK_FUTURE_SKEW_SECONDS:
+        return False, "BOOK_RECEIPT_FUTURE"
+    if age > MAX_EXECUTION_BOOK_AGE_SECONDS:
+        return False, "BOOK_RECEIPT_STALE"
+    return True, "OK"
+
+
 def parse_fee_info(market_info, token_id):
     """Return the per-market V2 fee curve from CLOB market metadata."""
     if not isinstance(market_info, dict):
