@@ -22,6 +22,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import fresh, save_json_atomic
+from collector_storage_v4.bridge import CollectorLock
 from scripts import book_engine, book_worker, paper_engine, paper_settlement
 
 try:
@@ -56,6 +57,16 @@ class PaperStateError(RuntimeError):
 
 class PaperFetchError(RuntimeError):
     pass
+
+
+class PaperWorkerLock(CollectorLock):
+    """One writer per Paper-state file, across processes on Windows and Linux."""
+
+    def __enter__(self):
+        try:
+            return super().__enter__()
+        except RuntimeError as exc:
+            raise PaperStateError("Concurrent Paper worker blocked by exclusive state lock") from exc
 
 
 def _read_json(path):
@@ -909,7 +920,7 @@ def _process_close(state, request_id, request, now, book_loader):
     )
 
 
-def run_once(
+def _run_once_unlocked(
     now=None,
     book_loader=book_worker.fetch_book,
     market_info_loader=fetch_market_info,
@@ -1011,6 +1022,27 @@ def run_once(
         save_json_atomic(STATE_FILE, state)
 
     return state, events
+
+
+def run_once(
+    now=None,
+    book_loader=book_worker.fetch_book,
+    market_info_loader=fetch_market_info,
+    identity_loader=paper_settlement.resolve_position_identity,
+    settlement_checker=paper_settlement.check_settlement,
+):
+    # Lock the entire read -> request processing -> atomic write cycle.
+    # Otherwise two manual or independently supervised Paper workers can
+    # both load the previous state and commit conflicting OPEN requests.
+    # The file is kept for reuse; OS advisory lock is released on exit/crash.
+    with PaperWorkerLock(STATE_FILE.with_suffix(".lock")):
+        return _run_once_unlocked(
+            now=now,
+            book_loader=book_loader,
+            market_info_loader=market_info_loader,
+            identity_loader=identity_loader,
+            settlement_checker=settlement_checker,
+        )
 
 
 def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
