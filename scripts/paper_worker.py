@@ -940,6 +940,64 @@ def _process_close(state, request_id, request, now, book_loader, clock):
     )
 
 
+def _finalize_exits_and_marks(state, events, closed_before, commit_now):
+    """Paper-only commit-time quote fence; never checks Focus READY.
+
+    CLOSE remains tentative until this check. A stale exit restores the
+    original OPEN position and rewrites the event to REJECTED. An old or
+    invalid MARK clears its valuation rather than displaying stale P&L.
+    No RPC/CLOB calls or Focus transitions occur here.
+    """
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "CLOSED":
+            continue
+        request_id = str(event.get("request_id") or "")
+        paper_id = event.get("paper_id")
+        position = next((p for p in state["positions"]
+                         if isinstance(p, dict) and p.get("paper_id") == paper_id),
+                        None)
+        exit_data = position.get("exit") if isinstance(position, dict) else None
+        quote = {"timestamp": exit_data.get("book_timestamp")} if isinstance(exit_data, dict) else {}
+        allowed, reason = paper_engine.validate_book_freshness(quote, commit_now)
+        if allowed:
+            allowed, reason = paper_engine.validate_book_receipt_age(
+                exit_data.get("book_received_at"), commit_now
+            )
+        if not allowed:
+            previous = closed_before.get(request_id)
+            if previous is None or position is None:
+                raise PaperStateError("CLOSE_ROLLBACK_STATE_MISSING")
+            position.clear()
+            position.update(previous)
+            position["mark"] = None
+            position["mark_status"] = "EXIT_" + reason
+            position["mark_checked_at"] = commit_now.isoformat()
+            event.clear()
+            event.update(_reject(request_id, commit_now, "FINAL_COMMIT_" + reason))
+        else:
+            position["closed_at"] = commit_now.isoformat()
+            event["event_at"] = commit_now.isoformat()
+
+    for position in state["positions"]:
+        if not isinstance(position, dict) or position.get("status") != "OPEN":
+            continue
+        mark = position.get("mark")
+        if position.get("mark_status") != "OK" or not isinstance(mark, dict):
+            position["mark"] = None
+            continue
+        allowed, reason = paper_engine.validate_book_freshness(
+            {"timestamp": mark.get("book_timestamp")}, commit_now
+        )
+        if allowed:
+            allowed, reason = paper_engine.validate_book_receipt_age(
+                mark.get("book_received_at"), commit_now
+            )
+        if not allowed:
+            position["mark_status"] = reason
+            position["mark_checked_at"] = commit_now.isoformat()
+            position["mark"] = None
+
+
 def _run_once_unlocked(
     now=None,
     book_loader=book_worker.fetch_book,
@@ -1092,6 +1150,10 @@ def _run_once_unlocked(
                         entry = pending_position.get("entry") if isinstance(pending_position, dict) else None
                         quote = {"timestamp": entry.get("book_timestamp")} if isinstance(entry, dict) else {}
                         matches, reason = paper_engine.validate_book_freshness(quote, commit_now)
+                        if matches:
+                            matches, reason = paper_engine.validate_book_receipt_age(
+                                entry.get("book_received_at"), commit_now
+                            )
                     if matches:
                         continue
 
@@ -1113,10 +1175,17 @@ def _run_once_unlocked(
                     event for event in events
                     if event.get("paper_id") not in rejected_ids
                 ]
+            _finalize_exits_and_marks(state, events, closed_before, commit_now)
+            state["updated_at"] = commit_now.isoformat()
             save_json_atomic(STATE_FILE, state)
     else:
-        # No new OPEN authorization. CLOSE and settlement are independent
-        # of Focus READY and retain their existing Paper-only state lock.
+        # CLOSE and settlement never require Focus READY. The Paper state lock
+        # already serializes this process; commit against the *current* clock.
+        commit_now = clock()
+        if commit_now.tzinfo is None:
+            raise ValueError("commit clock must be timezone-aware")
+        _finalize_exits_and_marks(state, events, closed_before, commit_now)
+        state["updated_at"] = commit_now.isoformat()
         save_json_atomic(STATE_FILE, state)
     _append_events(events)
 
