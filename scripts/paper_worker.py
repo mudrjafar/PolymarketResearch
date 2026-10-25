@@ -35,6 +35,7 @@ except Exception as exc:
 
 DATA_DIR = BASE_DIR / "data"
 FOCUS_FILE = DATA_DIR / "focused_market.json"
+FOCUS_STATE_FILE = DATA_DIR / "focus_state.json"
 BOOK_FILE = DATA_DIR / "book_assessment.json"
 REQUEST_DIR = DATA_DIR / "paper_requests"
 STATE_FILE = DATA_DIR / "paper_state.json"
@@ -114,6 +115,39 @@ def _snapshot(path, now):
     return "OK", payload
 
 
+def _durable_focus_gate(focus_payload):
+    """Fail closed if a READY view is not the projection of committed Focus.
+
+    Focus runner writes durable focus_state.json first, then focused_market.json.
+    A crash or concurrent tick between those writes must not leave an old READY
+    compatibility view capable of authorizing a new virtual Paper OPEN.
+    """
+    try:
+        durable = _read_json(FOCUS_STATE_FILE)
+    except FileNotFoundError:
+        return "FOCUS_STATE_MISSING"
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return "FOCUS_STATE_CORRUPT"
+
+    if not isinstance(durable, dict) or durable.get("schema_version") != 1:
+        return "FOCUS_STATE_INVALID"
+    engine = durable.get("engine_state")
+    if not isinstance(engine, dict) or engine.get("version") != 3:
+        return "FOCUS_STATE_INVALID"
+    current = engine.get("focus")
+    if not isinstance(current, dict) or current.get("status") != "READY":
+        return "FOCUS_DURABLE_NOT_READY"
+
+    if (
+        durable.get("updated_at") != focus_payload.get("generated_at")
+        or durable.get("last_source_generation_id")
+        != focus_payload.get("source_generation_id")
+        or current != focus_payload.get("focus")
+    ):
+        return "FOCUS_STATE_VIEW_MISMATCH"
+    return "OK"
+
+
 def read_execution_gate(now=None):
     now = now or datetime.now(timezone.utc)
     focus_status, focus_payload = _snapshot(FOCUS_FILE, now)
@@ -152,6 +186,10 @@ def read_execution_gate(now=None):
         return "EVIDENCE_ID_MISMATCH", focus_payload, book_payload
     if str(book_payload.get("source_generation_id") or "").strip() != generation_id:
         return "GENERATION_ID_MISMATCH", focus_payload, book_payload
+
+    durable_status = _durable_focus_gate(focus_payload)
+    if durable_status != "OK":
+        return durable_status, focus_payload, book_payload
 
     return "READY_BOOK_PASS", focus_payload, book_payload
 
@@ -1011,11 +1049,12 @@ def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
 
 
 def self_test():
-    global DATA_DIR, FOCUS_FILE, BOOK_FILE, REQUEST_DIR, STATE_FILE, EVENTS_FILE
+    global DATA_DIR, FOCUS_FILE, FOCUS_STATE_FILE, BOOK_FILE, REQUEST_DIR, STATE_FILE, EVENTS_FILE
 
     original = (
         DATA_DIR,
         FOCUS_FILE,
+        FOCUS_STATE_FILE,
         BOOK_FILE,
         REQUEST_DIR,
         STATE_FILE,
@@ -1027,6 +1066,7 @@ def self_test():
         with tempfile.TemporaryDirectory() as temp:
             DATA_DIR = Path(temp)
             FOCUS_FILE = DATA_DIR / "focused_market.json"
+            FOCUS_STATE_FILE = DATA_DIR / "focus_state.json"
             BOOK_FILE = DATA_DIR / "book_assessment.json"
             REQUEST_DIR = DATA_DIR / "paper_requests"
             STATE_FILE = DATA_DIR / "paper_state.json"
@@ -1055,6 +1095,15 @@ def self_test():
                     "source_generation_id": "GEN-X",
                     "state": "READY",
                     "focus": focus,
+                },
+            )
+            save_json_atomic(
+                FOCUS_STATE_FILE,
+                {
+                    "schema_version": 1,
+                    "updated_at": now.isoformat(),
+                    "last_source_generation_id": "GEN-X",
+                    "engine_state": {"version": 3, "focus": focus},
                 },
             )
             save_json_atomic(
@@ -1165,6 +1214,7 @@ def self_test():
         (
             DATA_DIR,
             FOCUS_FILE,
+            FOCUS_STATE_FILE,
             BOOK_FILE,
             REQUEST_DIR,
             STATE_FILE,
