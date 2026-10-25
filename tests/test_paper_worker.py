@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -97,7 +97,7 @@ def raw_book(*, bid="0.49", ask="0.50", bid_size="1000", ask_size="1000"):
     return {
         "market": "condition-a",
         "asset_id": "token-a",
-        "timestamp": "123",
+        "timestamp": str(int(NOW.timestamp() * 1000)),
         "hash": "book-x",
         "bids": [{"price": bid, "size": bid_size}],
         "asks": [{"price": ask, "size": ask_size}],
@@ -901,3 +901,101 @@ def test_crash_after_paper_state_save_does_not_reopen_request(monkeypatch, tmp_p
                                 market_info_loader=lambda _: market_info())
     assert len(state["positions"]) == 1
     assert not any(row["type"] == "OPENED" for row in events)
+
+
+@pytest.mark.parametrize("field,reason", [
+    ("asset_id", "TOKEN_ID_MISSING"),
+    ("market", "CONDITION_ID_MISSING"),
+])
+def test_close_rejects_missing_clob_identity_without_changing_position(monkeypatch, tmp_path, field, reason):
+    """F1 regression: no virtual realised P&L against unbound bid depth."""
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    state, _ = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                          market_info_loader=lambda _: market_info())
+    paper_id = state["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+    unbound = raw_book()
+    unbound.pop(field)
+    state, events = run_worker(now=NOW, book_loader=lambda _: unbound,
+                               market_info_loader=lambda _: market_info())
+    assert state["positions"][0]["status"] == "OPEN"
+    assert state["positions"][0]["mark_status"] == reason
+    assert state["positions"][0].get("realized_pnl_usd") is None
+    assert any(e["type"] == "REJECTED" and e["reason_code"] == reason for e in events)
+    assert not any(e["type"] == "CLOSED" for e in events)
+
+
+def test_mark_unbound_book_never_recalculates_pnl(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    state, _ = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                          market_info_loader=lambda _: market_info())
+    bad = raw_book()
+    bad.pop("market")
+    state, _ = run_worker(now=NOW, book_loader=lambda _: bad,
+                          market_info_loader=lambda _: market_info())
+    position = state["positions"][0]
+    assert position["status"] == "OPEN"
+    assert position["mark_status"] == "CONDITION_ID_MISSING"
+
+
+@pytest.mark.parametrize("value,reason", [
+    (None, "BOOK_TIMESTAMP_MISSING"),
+    ("123", "BOOK_TIMESTAMP_INVALID"),
+    ("not-an-epoch", "BOOK_TIMESTAMP_INVALID"),
+    ("STALE", "BOOK_TIMESTAMP_STALE"),
+    ("FUTURE", "BOOK_TIMESTAMP_FUTURE"),
+])
+def test_open_rejects_untrusted_source_book_timestamp(monkeypatch, tmp_path, value, reason):
+    """F2 regression: fresh local assessment cannot bless a stale source quote."""
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    bad = raw_book()
+    if value == "STALE":
+        value = str(int((NOW - timedelta(seconds=31)).timestamp() * 1000))
+    if value == "FUTURE":
+        value = str(int((NOW + timedelta(seconds=6)).timestamp() * 1000))
+    if value is None:
+        bad.pop("timestamp")
+    else:
+        bad["timestamp"] = value
+    state, events = run_worker(now=NOW, book_loader=lambda _: bad,
+                               market_info_loader=lambda _: market_info())
+    assert state["positions"] == []
+    assert any(e["type"] == "REJECTED" and e["reason_code"] == reason for e in events)
+    assert not any(e["type"] == "OPENED" for e in events)
+
+
+def test_final_paper_commit_rechecks_same_raw_quote_after_31s(monkeypatch, tmp_path):
+    """F2 TOCTOU: local Focus+Book snapshots are fresh, but entry quote aged."""
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    late = NOW + timedelta(seconds=31)
+    state, events = run_worker(now=NOW, clock=lambda: late,
+                               book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert state["positions"] == []
+    assert any(e["type"] == "REJECTED" and
+               e["reason_code"] == "FINAL_COMMIT_BOOK_TIMESTAMP_STALE" for e in events)
+    assert not any(e["type"] == "OPENED" for e in events)
+
+
+def test_close_rejects_expired_quote_without_realizing_pnl(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    state, _ = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                          market_info_loader=lambda _: market_info())
+    paper_id = state["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id)
+    expired = raw_book()
+    expired["timestamp"] = str(int((NOW - timedelta(seconds=60)).timestamp() * 1000))
+    state, events = run_worker(now=NOW, book_loader=lambda _: expired,
+                               market_info_loader=lambda _: market_info())
+    assert state["positions"][0]["status"] == "OPEN"
+    assert any(e["type"] == "REJECTED" and e["reason_code"] == "BOOK_TIMESTAMP_STALE" for e in events)

@@ -118,7 +118,7 @@ def ready_sequence(paths):
 def book():
     return {
         "market": CONDITION, "asset_id": TOKEN,
-        "timestamp": "123", "hash": "offline-book",
+        "timestamp": str(int((T0 + timedelta(seconds=184)).timestamp() * 1000)), "hash": "offline-book",
         "bids": [{"price": "0.49", "size": "1000"}],
         "asks": [{"price": "0.50", "size": "1000"}],
         "min_order_size": "5", "tick_size": "0.01",
