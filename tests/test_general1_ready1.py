@@ -503,8 +503,10 @@ def test_final_commit_rejects_elapsed_freshness_after_network_calls(monkeypatch,
     # All network mocks return success. The actual wall clock advances while
     # their work occurs; only the FINAL commit-time gate must reject this OPEN.
     late = at + timedelta(seconds=121)
+    # First two book responses are received at t0; commit is delayed.
+    ticks = iter((at, at, late))
     state, events = paper_worker.run_once(
-        now=at, clock=lambda: late,
+        now=at, clock=lambda: next(ticks),
         book_loader=lambda _: book(), market_info_loader=market_info,
         identity_loader=settlement_identity, settlement_checker=unresolved,
     )
