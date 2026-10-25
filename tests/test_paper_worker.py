@@ -18,6 +18,7 @@ def configure(monkeypatch, tmp_path):
     paths = {
         "data": data,
         "focus": data / "focused_market.json",
+        "focus_state": data / "focus_state.json",
         "book": data / "book_assessment.json",
         "requests": request_dir,
         "state": data / "paper_state.json",
@@ -26,6 +27,7 @@ def configure(monkeypatch, tmp_path):
 
     monkeypatch.setattr(paper_worker, "DATA_DIR", data, raising=False)
     monkeypatch.setattr(paper_worker, "FOCUS_FILE", paths["focus"], raising=False)
+    monkeypatch.setattr(paper_worker, "FOCUS_STATE_FILE", paths["focus_state"], raising=False)
     monkeypatch.setattr(paper_worker, "BOOK_FILE", paths["book"], raising=False)
     monkeypatch.setattr(paper_worker, "REQUEST_DIR", paths["requests"], raising=False)
     monkeypatch.setattr(paper_worker, "STATE_FILE", paths["state"], raising=False)
@@ -63,6 +65,15 @@ def write_gate(
             "source_generation_id": generation,
             "state": state,
             "focus": focus,
+        },
+    )
+    save_json_atomic(
+        paths["focus_state"],
+        {
+            "schema_version": 1,
+            "updated_at": NOW.isoformat(),
+            "last_source_generation_id": generation,
+            "engine_state": {"version": 3, "focus": focus},
         },
     )
     save_json_atomic(
@@ -745,3 +756,28 @@ def test_learning_queue_failure_never_rejects_successful_paper_open(
 
     stored = json.loads(paths["state"].read_text(encoding="utf-8"))
     assert stored["positions"][0]["status"] == "OPEN"
+
+
+def test_durable_focus_revocation_blocks_old_ready_view(monkeypatch, tmp_path):
+    """A torn Focus publication must not leave an executable READY view."""
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    from machine_common import save_json_atomic
+    persisted = json.loads(paths["focus_state"].read_text(encoding="utf-8"))
+    persisted["engine_state"]["focus"]["status"] = "WAIT"
+    persisted["engine_state"]["focus"]["progress"] = 2
+    save_json_atomic(paths["focus_state"], persisted)
+    assert paper_worker.read_execution_gate(now=NOW)[0] == "FOCUS_DURABLE_NOT_READY"
+
+
+def test_missing_or_mismatched_durable_focus_never_authorizes_open(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    paths["focus_state"].unlink()
+    assert paper_worker.read_execution_gate(now=NOW)[0] == "FOCUS_STATE_MISSING"
+
+    write_gate(paths)
+    persisted = json.loads(paths["focus_state"].read_text(encoding="utf-8"))
+    persisted["updated_at"] = "2026-01-01T00:00:00+00:00"
+    save_json_atomic(paths["focus_state"], persisted)
+    assert paper_worker.read_execution_gate(now=NOW)[0] == "FOCUS_STATE_VIEW_MISMATCH"
