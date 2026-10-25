@@ -1261,7 +1261,7 @@ def self_test():
                 return {
                     "market": "condition-a",
                     "asset_id": "token-a",
-                    "timestamp": "1",
+                    "timestamp": str(int(now.timestamp() * 1000)),
                     "hash": "book-x",
                     "bids": [{"price": "0.49", "size": "1000"}],
                     "asks": [{"price": "0.50", "size": "1000"}],
