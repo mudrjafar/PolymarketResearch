@@ -6,6 +6,7 @@ on:
       - fix/integration45-durable-focus-gate-20261025
       - feat/general1-merge-gate1-consolidated-20261025
       - feat/general1-final-gate1-atomic-paper-20261025
+      - fix/general1-paper-f1-f2-20261025
   workflow_dispatch:
 
 jobs:
