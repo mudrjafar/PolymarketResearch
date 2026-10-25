@@ -632,3 +632,73 @@ def test_book_publisher_cannot_replace_binding_during_final_paper_commit(monkeyp
     assert observed == ["BOOK_PUBLISH_BLOCKED"]
     assert len(state["positions"]) == 1
     assert any(event["type"] == "OPENED" for event in events)
+
+
+def test_focus_invalidation_after_final_read_waits_for_paper_commit(monkeypatch, tmp_path):
+    """Precisely schedule Focus invalidation *during* Paper's final state save."""
+    import threading
+
+    paths = configure(monkeypatch, tmp_path)
+    ready_sequence(paths)
+    at = T0 + timedelta(seconds=184)
+    book_worker.run_once(now=at, book_loader=lambda _: book())
+    request_open(paths, at)
+    original_save = paper_worker.save_json_atomic
+    in_final_commit = threading.Event()
+    allow_commit = threading.Event()
+    results = []
+
+    def pause_at_final_paper_save(path, data):
+        if path == paths["paper_state"]:
+            # The call happens only after Paper acquired the same short
+            # lock used for Focus's state+view publication.
+            in_final_commit.set()
+            assert allow_commit.wait(timeout=8), "commit barrier timed out"
+        return original_save(path, data)
+
+    monkeypatch.setattr(paper_worker, "save_json_atomic", pause_at_final_paper_save)
+
+    def paper_thread():
+        try:
+            results.append(paper_worker.run_once(
+                now=at, book_loader=lambda _: book(),
+                market_info_loader=market_info,
+                identity_loader=settlement_identity,
+                settlement_checker=unresolved,
+            ))
+        except Exception as exc:
+            results.append(exc)
+
+    t = threading.Thread(target=paper_thread)
+    t.start()
+    try:
+        assert in_final_commit.wait(timeout=8), "Paper did not enter final commit"
+        blocked = risk_candidate(5, at, active=False)
+        assert blocked["decision"] == "BLOCK"
+        original_save(paths["risk"], {
+            "source_generation_id": "GEN-5",
+            "generated_at": at.isoformat(),
+            "source_generated_at": at.isoformat(),
+            "results": [blocked],
+        })
+        # The competing Focus writer cannot invalidate after Paper's FINAL
+        # READY read but before the atomic Paper state write.
+        with pytest.raises(RuntimeError):
+            focus_runner.run_once(now=at)
+        assert saved(paths["focus"])["state"] == "READY"
+    finally:
+        allow_commit.set()
+        t.join(timeout=8)
+
+    assert not t.is_alive()
+    assert len(results) == 1 and not isinstance(results[0], Exception)
+    assert len(results[0][0]["positions"]) == 1
+    assert any(event["type"] == "OPENED" for event in results[0][1])
+
+    state, events, status = focus_runner.run_once(now=at)
+    assert status == "OK" and state["focus"] is None
+    assert events[-1]["type"] == "INVALIDATED"
+    # A second Paper tick cannot open the already processed request again.
+    repeat, replay_events = paper_tick(at + timedelta(seconds=1))
+    assert len(repeat["positions"]) == 1
+    assert not any(event["type"] == "OPENED" for event in replay_events)
