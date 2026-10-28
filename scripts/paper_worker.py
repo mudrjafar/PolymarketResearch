@@ -253,19 +253,48 @@ def _request_event(request_id, event_type, now, **extra):
     return event
 
 
+def _request_timestamp(payload):
+    """Return an aware UTC submission time or None for an invalid request.
+
+    Submission time is user-provided ordering evidence, NOT trusted authorization
+    or a durable global sequence. Existing freshness checks still apply.
+    """
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("requested_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        return None
+    return stamp.astimezone(timezone.utc)
+
+
 def _load_requests():
     if not REQUEST_DIR.exists():
         return []
 
     rows = []
-    for path in sorted(REQUEST_DIR.glob("*.json")):
+    for path in REQUEST_DIR.glob("*.json"):
         request_id = path.stem
         try:
             payload = _read_json(path)
         except Exception:
             payload = None
         rows.append((request_id, payload))
-    return rows
+
+    # Process valid submission timestamps chronologically with a stable
+    # request-ID tie-break. Corrupt/undated requests are handled explicitly
+    # *after* valid requests, also in stable request-ID order.
+    def order(row):
+        request_id, payload = row
+        stamp = _request_timestamp(payload)
+        return (stamp is None, stamp or datetime.max.replace(tzinfo=timezone.utc), request_id)
+
+    return sorted(rows, key=order)
 
 
 def _request_is_fresh(payload, now):
@@ -1030,6 +1059,7 @@ def _run_once_unlocked(
 
     requests_by_id = {}
     closed_before = {}
+    tentative_open_ids = set()
     for request_id, request in _load_requests():
         requests_by_id[request_id] = request
         if request_id in processed:
@@ -1041,6 +1071,8 @@ def _run_once_unlocked(
             event = _reject(request_id, now, "REQUEST_ID_MISMATCH")
         elif request.get("schema_version") != SCHEMA_VERSION:
             event = _reject(request_id, now, "REQUEST_SCHEMA_MISMATCH")
+        elif _request_timestamp(request) is None:
+            event = _reject(request_id, now, "REQUEST_TIMESTAMP_INVALID")
         elif not _request_is_fresh(request, now):
             event = _reject(request_id, now, "REQUEST_STALE")
         elif request.get("action") == "OPEN":
@@ -1057,23 +1089,30 @@ def _run_once_unlocked(
             )
         elif request.get("action") == "CLOSE":
             paper_id = str(request.get("paper_id") or "").strip()
-            previous = next((p for p in state["positions"]
-                             if isinstance(p, dict) and p.get("paper_id") == paper_id), None)
-            if previous is not None:
-                closed_before[request_id] = deepcopy(previous)
-            event = _process_close(
-                state,
-                request_id,
-                request,
-                now,
-                book_loader,
-                clock,
-            )
+            if paper_id in tentative_open_ids:
+                # An OPEN is not committed until final READY/Book/quote checks
+                # and the durable Paper state save. Never CLOSE it in this tick.
+                event = _reject(request_id, now, "POSITION_NOT_COMMITTED")
+            else:
+                previous = next((p for p in state["positions"]
+                                 if isinstance(p, dict) and p.get("paper_id") == paper_id), None)
+                if previous is not None:
+                    closed_before[request_id] = deepcopy(previous)
+                event = _process_close(
+                    state,
+                    request_id,
+                    request,
+                    now,
+                    book_loader,
+                    clock,
+                )
         else:
             event = _reject(request_id, now, "ACTION_INVALID")
 
         processed.add(request_id)
         events.append(event)
+        if event.get("type") == "OPENED" and event.get("paper_id"):
+            tentative_open_ids.add(str(event["paper_id"]))
 
     opened_ids = {
         event.get("paper_id")
@@ -1169,12 +1208,20 @@ def _run_once_unlocked(
                     request_id, commit_now, "FINAL_COMMIT_" + reason
                 ))
             if rejected_ids:
-                # Settlement/mark records generated from an OPEN that was
-                # revoked before commit must not leak into the event journal.
-                events = [
-                    event for event in events
-                    if event.get("paper_id") not in rejected_ids
-                ]
+                # Revoke observational SETTLED/MARK events derived from a
+                # cancelled tentative OPEN, but NEVER silently discard a
+                # processed user-request outcome, even if future actions
+                # introduce new dependent events carrying a paper_id.
+                surviving = []
+                for event in events:
+                    if event.get("paper_id") not in rejected_ids:
+                        surviving.append(event)
+                    elif event.get("request_id"):
+                        surviving.append(_reject(
+                            str(event["request_id"]), commit_now,
+                            "DEPENDENT_OPEN_NOT_COMMITTED"
+                        ))
+                events = surviving
             _finalize_exits_and_marks(state, events, closed_before, commit_now)
             state["updated_at"] = commit_now.isoformat()
             save_json_atomic(STATE_FILE, state)
