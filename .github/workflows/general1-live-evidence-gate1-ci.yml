@@ -24,3 +24,18 @@ jobs:
           mkdir -p /tmp/general1_livegate_empty
           python scripts/live_evidence_gate1.py --data-dir /tmp/general1_livegate_empty > /tmp/general1_livegate_empty_result.json
           python -c "import json; d=json.load(open('/tmp/general1_livegate_empty_result.json')); assert d['data']['collector']['status']=='MISSING'; assert d['data']['paper_worker_started_by_gate'] is False; assert d['strategy_edge']=='INCONCLUSIVE'"
+ 
+  full-offline-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install project dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run full existing project regression
+        run: python -m pytest -q
+      - name: Run machine self-test
+        run: python run_machine.py --self-test
