@@ -1046,7 +1046,7 @@ def _run_once_unlocked(
     # A tentative OPEN from this batch has not passed its final READY gate.
     committed_position_ids = {
         str(p.get("paper_id")) for p in state["positions"]
-        if isinstance(p, dict) and p.get("status") == "OPEN"
+        if isinstance(p, dict)
     }
     processed = set(str(x) for x in state.get("processed_request_ids", []))
     events = []
