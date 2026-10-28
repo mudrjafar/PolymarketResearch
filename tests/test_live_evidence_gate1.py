@@ -91,3 +91,26 @@ def test_invalid_rpc_never_printed(tmp_path, monkeypatch):
                         encoding="utf-8")
     with pytest.raises(ValueError, match="RPC_MISSING_OR_INVALID_HTTPS_URL"):
         gate._env_rpc(env_file)
+
+
+def test_diagnostic_aggregation_never_exposes_tokens_or_urls(tmp_path):
+    p = tmp_path / "collector.log"
+    p.write_text(
+        '[LIVE-1C] ' + json.dumps({
+            "status": "SUCCESS", "blocks": 4, "trade_count": 2,
+            "rpc_calls": 3, "rpc_retries": 1, "gamma_lookup_count": 5,
+            "gamma_lookup_ms": 125.5, "outer_retries": 2,
+            "gamma_misses": ["sensitive-wallet-id"],
+            "samples": [{"wallet": "hidden"}],
+        }) + "\\n" +
+        '[COLLECTOR] RETRYABLE_BATCH (RetryableCollectorError)' + "\\n",
+        encoding="utf-8",
+    )
+    result = gate._collector_diagnostics(p)
+    assert result["batch_statuses"]["SUCCESS"] == 1
+    assert result["total_metrics"]["rpc_retries"] == 1
+    assert result["total_metrics"]["gamma_lookup_ms"] == 125.5
+    assert result["total_metrics"]["gamma_miss_count"] == 1
+    assert result["total_metrics"]["max_outer_retry_streak"] == 2
+    assert "sensitive-wallet-id" not in json.dumps(result)
+    assert "hidden" not in json.dumps(result)
