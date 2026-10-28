@@ -1124,3 +1124,90 @@ def test_old_source_with_fresh_http_receipt_is_conservatively_rejected_for_open(
     )
     assert state["positions"] == []
     assert any(e["reason_code"] == "BOOK_TIMESTAMP_STALE" for e in events)
+
+
+# GENERAL1-REQUEST-INTEGRITY-FINAL: reproducing tests, initially red on PR #50.
+def _set_request_time(paths, request_id, requested_at):
+    path = paths["requests"] / (request_id + ".json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["requested_at"] = requested_at
+    save_json_atomic(path, payload)
+
+
+def test_request_order_follows_submission_time_not_random_filename(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-z-older")
+    write_open_request(paths, request_id="REQ-a-newer")
+    _set_request_time(paths, "REQ-z-older", (NOW - timedelta(seconds=2)).isoformat())
+    _set_request_time(paths, "REQ-a-newer", (NOW - timedelta(seconds=1)).isoformat())
+
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert len(state["positions"]) == 1
+    assert state["positions"][0]["request_id"] == "REQ-z-older"
+    assert [(e["request_id"], e["type"]) for e in events
+            if e.get("request_id")] == [
+                ("REQ-z-older", "OPENED"),
+                ("REQ-a-newer", "REJECTED"),
+            ]
+
+
+def test_close_cannot_execute_tentative_open_in_same_paper_tick(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-a-open")
+    write_close_request(paths, "PAPER-a-open", request_id="REQ-z-close")
+    _set_request_time(paths, "REQ-a-open", (NOW - timedelta(seconds=1)).isoformat())
+
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert len(state["positions"]) == 1
+    assert state["positions"][0]["status"] == "OPEN"
+    assert [(e["request_id"], e["type"]) for e in events
+            if e.get("request_id")] == [
+                ("REQ-a-open", "OPENED"),
+                ("REQ-z-close", "REJECTED"),
+            ]
+    assert events[1]["reason_code"] == "POSITION_NOT_COMMITTED"
+    assert not any(e["type"] == "CLOSED" for e in events)
+
+
+def test_rejected_tentative_open_does_not_erase_dependent_close_request(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-a-open")
+    write_close_request(paths, "PAPER-a-open", request_id="REQ-z-close")
+    _set_request_time(paths, "REQ-a-open", (NOW - timedelta(seconds=1)).isoformat())
+    calls = [0]
+
+    def invalidate_at_second_quote_clock():
+        calls[0] += 1
+        if calls[0] == 2:
+            write_gate(paths, state="WAIT")
+        return NOW
+
+    state, events = run_worker(
+        now=NOW, clock=invalidate_at_second_quote_clock,
+        book_loader=lambda _: raw_book(), market_info_loader=lambda _: market_info()
+    )
+    assert state["positions"] == []
+    by_request = {e["request_id"]: e for e in events if e.get("request_id")}
+    assert set(by_request) == {"REQ-a-open", "REQ-z-close"}
+    assert by_request["REQ-a-open"]["type"] == "REJECTED"
+    assert by_request["REQ-a-open"]["reason_code"] == "FINAL_COMMIT_FOCUS_NOT_READY"
+    assert by_request["REQ-z-close"]["type"] == "REJECTED"
+    assert by_request["REQ-z-close"]["reason_code"] == "POSITION_NOT_COMMITTED"
+    assert {"REQ-a-open", "REQ-z-close"}.issubset(state["processed_request_ids"])
+
+
+def test_bad_request_timestamp_is_distinct_from_expired_request(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-bad-time")
+    _set_request_time(paths, "REQ-bad-time", "unparseable")
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["reason_code"] == "REQUEST_TIMESTAMP_INVALID"
