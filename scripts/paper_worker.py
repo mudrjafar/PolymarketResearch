@@ -1027,6 +1027,22 @@ def _finalize_exits_and_marks(state, events, closed_before, commit_now):
             position["mark"] = None
 
 
+def _assert_terminal_request_events(events, consumed_request_ids):
+    """Never persist processed IDs with missing or duplicated request outcomes."""
+    counts = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        request_id = event.get("request_id")
+        if request_id not in consumed_request_ids:
+            continue
+        if event.get("type") not in {"OPENED", "CLOSED", "REJECTED"}:
+            raise PaperStateError("REQUEST_TERMINAL_EVENT_INVALID")
+        counts[request_id] = counts.get(request_id, 0) + 1
+    if set(counts) != consumed_request_ids or any(v != 1 for v in counts.values()):
+        raise PaperStateError("REQUEST_TERMINAL_EVENT_INCOMPLETE")
+
+
 def _run_once_unlocked(
     now=None,
     book_loader=book_worker.fetch_book,
@@ -1060,6 +1076,7 @@ def _run_once_unlocked(
     requests_by_id = {}
     closed_before = {}
     tentative_open_ids = set()
+    consumed_request_ids = set()
     for request_id, request in _load_requests():
         requests_by_id[request_id] = request
         if request_id in processed:
@@ -1110,6 +1127,7 @@ def _run_once_unlocked(
             event = _reject(request_id, now, "ACTION_INVALID")
 
         processed.add(request_id)
+        consumed_request_ids.add(request_id)
         events.append(event)
         if event.get("type") == "OPENED" and event.get("paper_id"):
             tentative_open_ids.add(str(event["paper_id"]))
@@ -1224,6 +1242,7 @@ def _run_once_unlocked(
                 events = surviving
             _finalize_exits_and_marks(state, events, closed_before, commit_now)
             state["updated_at"] = commit_now.isoformat()
+            _assert_terminal_request_events(events, consumed_request_ids)
             save_json_atomic(STATE_FILE, state)
     else:
         # CLOSE and settlement never require Focus READY. The Paper state lock
@@ -1233,6 +1252,7 @@ def _run_once_unlocked(
             raise ValueError("commit clock must be timezone-aware")
         _finalize_exits_and_marks(state, events, closed_before, commit_now)
         state["updated_at"] = commit_now.isoformat()
+        _assert_terminal_request_events(events, consumed_request_ids)
         save_json_atomic(STATE_FILE, state)
     _append_events(events)
 
