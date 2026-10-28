@@ -102,8 +102,8 @@ def test_diagnostic_aggregation_never_exposes_tokens_or_urls(tmp_path):
             "gamma_lookup_ms": 125.5, "outer_retries": 2,
             "gamma_misses": ["sensitive-wallet-id"],
             "samples": [{"wallet": "hidden"}],
-        }) + "\\n" +
-        '[COLLECTOR] RETRYABLE_BATCH (RetryableCollectorError)' + "\\n",
+        }) + "\n" +
+        '[COLLECTOR] RETRYABLE_BATCH (RetryableCollectorError)' + "\n",
         encoding="utf-8",
     )
     result = gate._collector_diagnostics(p)
