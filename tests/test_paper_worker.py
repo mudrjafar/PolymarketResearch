@@ -1211,3 +1211,167 @@ def test_bad_request_timestamp_is_distinct_from_expired_request(monkeypatch, tmp
     assert state["positions"] == []
     assert len(events) == 1
     assert events[0]["reason_code"] == "REQUEST_TIMESTAMP_INVALID"
+
+
+def test_open_close_open_same_tick_has_one_committed_position_and_three_outcomes(
+    monkeypatch, tmp_path
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-z-first-open")
+    write_close_request(paths, "PAPER-z-first-open", request_id="REQ-m-close")
+    write_open_request(paths, request_id="REQ-a-second-open")
+    _set_request_time(paths, "REQ-z-first-open", (NOW - timedelta(seconds=3)).isoformat())
+    _set_request_time(paths, "REQ-m-close", (NOW - timedelta(seconds=2)).isoformat())
+    _set_request_time(paths, "REQ-a-second-open", (NOW - timedelta(seconds=1)).isoformat())
+
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert [(e["request_id"], e["type"]) for e in events
+            if e.get("request_id")] == [
+                ("REQ-z-first-open", "OPENED"),
+                ("REQ-m-close", "REJECTED"),
+                ("REQ-a-second-open", "REJECTED"),
+            ]
+    assert events[1]["reason_code"] == "POSITION_NOT_COMMITTED"
+    assert events[2]["reason_code"] == "POSITION_ALREADY_OPEN"
+    assert len(state["positions"]) == 1
+    assert state["positions"][0]["status"] == "OPEN"
+    assert state["positions"][0]["request_id"] == "REQ-z-first-open"
+
+
+def test_two_close_requests_for_committed_position_are_individually_accounted(
+    monkeypatch, tmp_path
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    state, _ = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                          market_info_loader=lambda _: market_info())
+    paper_id = state["positions"][0]["paper_id"]
+    write_close_request(paths, paper_id, request_id="REQ-z-close-earlier")
+    write_close_request(paths, paper_id, request_id="REQ-a-close-later")
+    _set_request_time(paths, "REQ-z-close-earlier", (NOW - timedelta(seconds=2)).isoformat())
+    _set_request_time(paths, "REQ-a-close-later", (NOW - timedelta(seconds=1)).isoformat())
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert [(e["request_id"], e["type"]) for e in events
+            if e.get("request_id")] == [
+                ("REQ-z-close-earlier", "CLOSED"),
+                ("REQ-a-close-later", "REJECTED"),
+            ]
+    assert events[1]["reason_code"] == "OPEN_POSITION_NOT_FOUND"
+    assert state["positions"][0]["status"] == "CLOSED"
+    assert state["positions"][0]["close_request_id"] == "REQ-z-close-earlier"
+
+
+def test_same_request_timestamps_tie_break_by_request_id(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_open_request(paths, request_id="REQ-z")
+    write_open_request(paths, request_id="REQ-a")
+    first = [row[0] for row in paper_worker._load_requests()]
+    second = [row[0] for row in paper_worker._load_requests()]
+    assert first == second == ["REQ-a", "REQ-z"]
+
+
+def test_timestamp_timezone_offsets_are_normalized_before_sorting(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_open_request(paths, request_id="REQ-a-later")
+    write_open_request(paths, request_id="REQ-z-earlier")
+    _set_request_time(paths, "REQ-a-later", (NOW - timedelta(seconds=1)).isoformat())
+    earlier = NOW - timedelta(seconds=2)
+    # Equivalent UTC timestamp with a +02:00 offset must sort chronologically.
+    plus_two = timezone(timedelta(hours=2))
+    _set_request_time(paths, "REQ-z-earlier", earlier.astimezone(plus_two).isoformat())
+    assert [r[0] for r in paper_worker._load_requests()] == [
+        "REQ-z-earlier", "REQ-a-later"
+    ]
+
+
+@pytest.mark.parametrize("bad_time", ["", None, "2026-10-28T11:00:00", "NaN"])
+def test_naive_missing_and_invalid_timestamp_fail_closed(monkeypatch, tmp_path, bad_time):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-invalid")
+    _set_request_time(paths, "REQ-invalid", bad_time)
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert state["positions"] == []
+    assert len(events) == 1
+    assert events[0]["reason_code"] == "REQUEST_TIMESTAMP_INVALID"
+    assert "REQ-invalid" in state["processed_request_ids"]
+
+
+def test_pending_open_then_book_generation_revoked_preserves_both_request_outcomes(
+    monkeypatch, tmp_path
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-a-open")
+    write_close_request(paths, "PAPER-a-open", request_id="REQ-z-close")
+    _set_request_time(paths, "REQ-a-open", (NOW - timedelta(seconds=1)).isoformat())
+    calls = [0]
+
+    def fetch_and_revoke(_token):
+        calls[0] += 1
+        if calls[0] == 2:
+            assessment = json.loads(paths["book"].read_text(encoding="utf-8"))
+            assessment["source_generation_id"] = "DIFFERENT_GENERATION"
+            save_json_atomic(paths["book"], assessment)
+        return raw_book()
+
+    state, events = run_worker(now=NOW, book_loader=fetch_and_revoke,
+                               market_info_loader=lambda _: market_info())
+    assert calls[0] == 2
+    assert state["positions"] == []
+    outcomes = {e["request_id"]: e for e in events if e.get("request_id")}
+    assert outcomes["REQ-a-open"]["reason_code"] == "FINAL_COMMIT_GENERATION_ID_MISMATCH"
+    assert outcomes["REQ-z-close"]["reason_code"] == "POSITION_NOT_COMMITTED"
+
+
+def test_rewrite_same_request_file_during_fetch_does_not_change_snapshot_or_replay(
+    monkeypatch, tmp_path
+):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-immutable")
+    calls = [0]
+
+    def fetch_with_request_rewrite(_token):
+        calls[0] += 1
+        if calls[0] == 1:
+            path = paths["requests"] / "REQ-immutable.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["amount_usd"] = 100
+            save_json_atomic(path, payload)
+        return raw_book()
+
+    state, events = run_worker(now=NOW, book_loader=fetch_with_request_rewrite,
+                               market_info_loader=lambda _: market_info())
+    assert len(state["positions"]) == 1
+    assert state["positions"][0]["investment_usd"] == 25.0
+    assert events[0]["type"] == "OPENED"
+    state2, events2 = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                                 market_info_loader=lambda _: market_info())
+    assert len(state2["positions"]) == 1
+    assert not any(e.get("request_id") == "REQ-immutable" for e in events2)
+
+
+def test_different_market_open_request_cannot_use_current_focus(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-z-valid")
+    write_open_request(paths, request_id="REQ-a-other")
+    _set_request_time(paths, "REQ-z-valid", (NOW - timedelta(seconds=1)).isoformat())
+    other = paths["requests"] / "REQ-a-other.json"
+    payload = json.loads(other.read_text(encoding="utf-8"))
+    payload["token_id"] = "token-b"
+    payload["condition_id"] = "condition-b"
+    save_json_atomic(other, payload)
+
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert len(state["positions"]) == 1
+    assert state["positions"][0]["token_id"] == "token-a"
+    assert [e["type"] for e in events] == ["OPENED", "REJECTED"]
+    assert events[1]["reason_code"] == "REQUEST_TOKEN_ID_MISMATCH"
