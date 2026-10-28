@@ -258,14 +258,39 @@ def _load_requests():
         return []
 
     rows = []
-    for path in sorted(REQUEST_DIR.glob("*.json")):
+    for path in REQUEST_DIR.glob("*.json"):
         request_id = path.stem
         try:
             payload = _read_json(path)
         except Exception:
             payload = None
         rows.append((request_id, payload))
+
+    # The request file name is a random UUID, not its submission order.
+    # Invalid timestamps sort last and are explicitly rejected by the worker.
+    # Equal UTC instants have a deterministic ID tie-breaker, not a claim of
+    # perfect cross-process arrival ordering.
+    rows.sort(key=lambda pair: (
+        _request_timestamp(pair[1]) is None,
+        _request_timestamp(pair[1]) or datetime.max.replace(tzinfo=timezone.utc),
+        pair[0],
+    ))
     return rows
+
+
+def _request_timestamp(payload):
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("requested_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        at = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        if at.tzinfo is None or at.utcoffset() is None:
+            return None
+        return at.astimezone(timezone.utc)
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 def _request_is_fresh(payload, now):
@@ -1017,6 +1042,12 @@ def _run_once_unlocked(
         clock = (lambda: now) if injected_now else (lambda: datetime.now(timezone.utc))
 
     state = load_state(now=now)
+    # Only positions present in the last durable state are CLOSE-eligible.
+    # A tentative OPEN from this batch has not passed its final READY gate.
+    committed_position_ids = {
+        str(p.get("paper_id")) for p in state["positions"]
+        if isinstance(p, dict) and p.get("status") == "OPEN"
+    }
     processed = set(str(x) for x in state.get("processed_request_ids", []))
     events = []
     events.extend(
@@ -1041,6 +1072,8 @@ def _run_once_unlocked(
             event = _reject(request_id, now, "REQUEST_ID_MISMATCH")
         elif request.get("schema_version") != SCHEMA_VERSION:
             event = _reject(request_id, now, "REQUEST_SCHEMA_MISMATCH")
+        elif _request_timestamp(request) is None:
+            event = _reject(request_id, now, "REQUEST_TIMESTAMP_INVALID")
         elif not _request_is_fresh(request, now):
             event = _reject(request_id, now, "REQUEST_STALE")
         elif request.get("action") == "OPEN":
@@ -1059,16 +1092,21 @@ def _run_once_unlocked(
             paper_id = str(request.get("paper_id") or "").strip()
             previous = next((p for p in state["positions"]
                              if isinstance(p, dict) and p.get("paper_id") == paper_id), None)
-            if previous is not None:
-                closed_before[request_id] = deepcopy(previous)
-            event = _process_close(
-                state,
-                request_id,
-                request,
-                now,
-                book_loader,
-                clock,
-            )
+            if previous is not None and paper_id not in committed_position_ids:
+                # The apparent position only exists provisionally in memory.
+                # Never allow CLOSE to consume a tentative OPEN in this tick.
+                event = _reject(request_id, now, "POSITION_NOT_COMMITTED")
+            else:
+                if previous is not None:
+                    closed_before[request_id] = deepcopy(previous)
+                event = _process_close(
+                    state,
+                    request_id,
+                    request,
+                    now,
+                    book_loader,
+                    clock,
+                )
         else:
             event = _reject(request_id, now, "ACTION_INVALID")
 
