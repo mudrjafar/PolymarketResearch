@@ -126,6 +126,28 @@ def snapshot(data_dir):
         finally:
             db.close()
 
+    flow = _json(data_dir / "flow_state.json")
+    if isinstance(flow, dict):
+        out["flow_latest"] = {
+            "tokens": len(flow),
+            "verified": sum(x.get("verified") is True for x in flow.values()
+                            if isinstance(x, dict)),
+        }
+    paper = _json(data_dir / "paper_state.json")
+    if isinstance(paper, dict):
+        positions = paper.get("positions")
+        if isinstance(positions, list):
+            out["paper_state_existing"] = {
+                "position_count": len(positions),
+                "statuses": dict(Counter(str(x.get("status") or "UNKNOWN")[:30]
+                    for x in positions if isinstance(x, dict))),
+                "processed_request_id_count": len(paper.get("processed_request_ids") or []),
+                "journal_reconciled": "NOT_CHECKED",
+            }
+    event_file = data_dir / "paper_events.jsonl"
+    if event_file.is_file():
+        with event_file.open(encoding="utf-8") as stream:
+            out["paper_existing_event_line_count"] = sum(1 for _ in stream)
     analyzed = _json(data_dir / "diamond_analysis_v3.json")
     if isinstance(analyzed, list):
         out["diamond_latest"] = {
