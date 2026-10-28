@@ -1169,13 +1169,17 @@ def test_failed_tentative_open_keeps_dependent_close_rejection_event(monkeypatch
     write_gate(paths)
     write_open_request(paths, request_id="REQ-a-open")
     write_close_request(paths, "PAPER-a-open", request_id="REQ-b-close")
-    def revoke_before_final(_token):
-        # This runs during OPEN's Book fetch, while Focus isn't locked.
-        state = json.loads(paths["focus_state"].read_text(encoding="utf-8"))
-        state["engine_state"]["focus"] = None
-        save_json_atomic(paths["focus_state"], state)
-        return raw_book()
-    state, events = run_worker(now=NOW, book_loader=revoke_before_final,
+    original_gate = paper_worker.read_execution_gate
+    reads = [0]
+    def final_only_revocation(now=None):
+        reads[0] += 1
+        if reads[0] == 3:
+            return "FOCUS_DURABLE_NOT_READY", None, None
+        return original_gate(now=now)
+    # OPEN validates twice before staging. Only the third (final, locked)
+    # check revokes authority, after the unrelated CLOSE was rejected.
+    monkeypatch.setattr(paper_worker, "read_execution_gate", final_only_revocation)
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
                                market_info_loader=lambda _: market_info())
     outcome = {e["request_id"]: e for e in events if e.get("request_id")}
     assert state["positions"] == []
