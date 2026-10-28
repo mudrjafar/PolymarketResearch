@@ -114,3 +114,24 @@ def test_diagnostic_aggregation_never_exposes_tokens_or_urls(tmp_path):
     assert result["total_metrics"]["max_outer_retry_streak"] == 2
     assert "sensitive-wallet-id" not in json.dumps(result)
     assert "hidden" not in json.dumps(result)
+
+
+def test_preexisting_flow_paper_summary_is_sanitized(tmp_path):
+    (tmp_path / "flow_state.json").write_text(json.dumps({
+        "private-token": {"verified": True},
+        "another-token": {"verified": False}
+    }), encoding="utf-8")
+    (tmp_path / "paper_state.json").write_text(json.dumps({
+        "positions": [{"status": "OPEN", "token_id": "secret-id"}],
+        "processed_request_ids": ["secret-request"]
+    }), encoding="utf-8")
+    (tmp_path / "paper_events.jsonl").write_text(
+        json.dumps({"event": "OPEN", "token_id": "secret-id"}) + "\n",
+        encoding="utf-8")
+    result = gate.snapshot(tmp_path)
+    assert result["flow_latest"] == {"tokens": 2, "verified": 1}
+    assert result["paper_state_existing"]["position_count"] == 1
+    assert result["paper_state_existing"]["processed_request_id_count"] == 1
+    assert result["paper_existing_event_line_count"] == 1
+    assert "secret-id" not in json.dumps(result)
+    assert "secret-request" not in json.dumps(result)
