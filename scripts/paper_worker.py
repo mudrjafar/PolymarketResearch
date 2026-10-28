@@ -8,6 +8,7 @@ submits a real order.
 """
 
 import argparse
+from copy import deepcopy
 import json
 import os
 import sys
@@ -22,6 +23,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import fresh, save_json_atomic
+from collector_storage_v4.bridge import CollectorLock
 from scripts import book_engine, book_worker, paper_engine, paper_settlement
 
 try:
@@ -35,6 +37,7 @@ except Exception as exc:
 
 DATA_DIR = BASE_DIR / "data"
 FOCUS_FILE = DATA_DIR / "focused_market.json"
+FOCUS_STATE_FILE = DATA_DIR / "focus_state.json"
 BOOK_FILE = DATA_DIR / "book_assessment.json"
 REQUEST_DIR = DATA_DIR / "paper_requests"
 STATE_FILE = DATA_DIR / "paper_state.json"
@@ -55,6 +58,16 @@ class PaperStateError(RuntimeError):
 
 class PaperFetchError(RuntimeError):
     pass
+
+
+class PaperWorkerLock(CollectorLock):
+    """One writer per Paper-state file, across processes on Windows and Linux."""
+
+    def __enter__(self):
+        try:
+            return super().__enter__()
+        except RuntimeError as exc:
+            raise PaperStateError("Concurrent Paper worker blocked by exclusive state lock") from exc
 
 
 def _read_json(path):
@@ -114,6 +127,39 @@ def _snapshot(path, now):
     return "OK", payload
 
 
+def _durable_focus_gate(focus_payload):
+    """Fail closed if a READY view is not the projection of committed Focus.
+
+    Focus runner writes durable focus_state.json first, then focused_market.json.
+    A crash or concurrent tick between those writes must not leave an old READY
+    compatibility view capable of authorizing a new virtual Paper OPEN.
+    """
+    try:
+        durable = _read_json(FOCUS_STATE_FILE)
+    except FileNotFoundError:
+        return "FOCUS_STATE_MISSING"
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return "FOCUS_STATE_CORRUPT"
+
+    if not isinstance(durable, dict) or durable.get("schema_version") != 1:
+        return "FOCUS_STATE_INVALID"
+    engine = durable.get("engine_state")
+    if not isinstance(engine, dict) or engine.get("version") != 3:
+        return "FOCUS_STATE_INVALID"
+    current = engine.get("focus")
+    if not isinstance(current, dict) or current.get("status") != "READY":
+        return "FOCUS_DURABLE_NOT_READY"
+
+    if (
+        durable.get("updated_at") != focus_payload.get("generated_at")
+        or durable.get("last_source_generation_id")
+        != focus_payload.get("source_generation_id")
+        or current != focus_payload.get("focus")
+    ):
+        return "FOCUS_STATE_VIEW_MISMATCH"
+    return "OK"
+
+
 def read_execution_gate(now=None):
     now = now or datetime.now(timezone.utc)
     focus_status, focus_payload = _snapshot(FOCUS_FILE, now)
@@ -152,6 +198,10 @@ def read_execution_gate(now=None):
         return "EVIDENCE_ID_MISMATCH", focus_payload, book_payload
     if str(book_payload.get("source_generation_id") or "").strip() != generation_id:
         return "GENERATION_ID_MISMATCH", focus_payload, book_payload
+
+    durable_status = _durable_focus_gate(focus_payload)
+    if durable_status != "OK":
+        return durable_status, focus_payload, book_payload
 
     return "READY_BOOK_PASS", focus_payload, book_payload
 
@@ -203,19 +253,48 @@ def _request_event(request_id, event_type, now, **extra):
     return event
 
 
+def _request_timestamp(payload):
+    """Return an aware UTC submission time or None for an invalid request.
+
+    Submission time is user-provided ordering evidence, NOT trusted authorization
+    or a durable global sequence. Existing freshness checks still apply.
+    """
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("requested_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        return None
+    return stamp.astimezone(timezone.utc)
+
+
 def _load_requests():
     if not REQUEST_DIR.exists():
         return []
 
     rows = []
-    for path in sorted(REQUEST_DIR.glob("*.json")):
+    for path in REQUEST_DIR.glob("*.json"):
         request_id = path.stem
         try:
             payload = _read_json(path)
         except Exception:
             payload = None
         rows.append((request_id, payload))
-    return rows
+
+    # Process valid submission timestamps chronologically with a stable
+    # request-ID tie-break. Corrupt/undated requests are handled explicitly
+    # *after* valid requests, also in stable request-ID order.
+    def order(row):
+        request_id, payload = row
+        stamp = _request_timestamp(payload)
+        return (stamp is None, stamp or datetime.max.replace(tzinfo=timezone.utc), request_id)
+
+    return sorted(rows, key=order)
 
 
 def _request_is_fresh(payload, now):
@@ -427,6 +506,13 @@ def _refresh_settlements(
     return events
 
 def _position_mark(position, raw_book, now):
+    # A failed refresh must never leave the previous MARK displayed as current.
+    position["mark"] = None
+    fresh_quote, quote_reason = paper_engine.validate_book_freshness(raw_book, now)
+    if not fresh_quote:
+        position["mark_status"] = quote_reason
+        position["mark_checked_at"] = now.isoformat()
+        return
     ok, reason = paper_engine.validate_book_identity(
         raw_book,
         position.get("token_id"),
@@ -576,6 +662,7 @@ def _process_open(
     market_info_loader,
     identity_loader,
     settlement_checker,
+    clock,
 ):
     amount = request.get("amount_usd")
     try:
@@ -638,12 +725,17 @@ def _process_open(
 
     try:
         raw_book = book_loader(token_id)
+        book_received_at = clock()
     except Exception as exc:
         return _reject(
             request_id,
             now,
             f"BOOK_FETCH_{str(exc).strip() or type(exc).__name__}",
         )
+
+    quote_fresh, quote_reason = paper_engine.validate_book_freshness(raw_book, book_received_at)
+    if not quote_fresh:
+        return _reject(request_id, now, quote_reason)
 
     live_analysis = book_engine.analyze_book(
         raw_book,
@@ -706,6 +798,17 @@ def _process_open(
         reason = str(settlement.get("reason_code") or "UNKNOWN").strip()
         return _reject(request_id, now, f"SETTLEMENT_UNRESOLVED_{reason}")
 
+    # Network calls above may outlive a READY window. Recheck both
+    # authoritative published gates just before committing any virtual OPEN.
+    # This closes the known fetch-time invalidation window without granting
+    # additional READY authority to Paper or modifying strategy thresholds.
+    final_gate, final_focus_payload, _ = read_execution_gate(now=now)
+    if final_gate != "READY_BOOK_PASS":
+        return _reject(request_id, now, "EXECUTION_GATE_CHANGED_" + final_gate)
+    matches, reason = _matches_open_request(request, final_focus_payload)
+    if not matches:
+        return _reject(request_id, now, "EXECUTION_GATE_CHANGED_" + reason)
+
     suffix = request_id.split("-", 1)[-1]
     paper_id = f"PAPER-{suffix}"
 
@@ -736,6 +839,7 @@ def _process_open(
         "entry": {
             "book_hash": raw_book.get("hash"),
             "book_timestamp": raw_book.get("timestamp"),
+            "book_received_at": book_received_at.isoformat(),
             "best_ask": entry.get("best_ask"),
             "vwap": entry.get("vwap"),
             "effective_entry_price": entry.get("effective_entry_price"),
@@ -767,7 +871,7 @@ def _process_open(
     )
 
 
-def _process_close(state, request_id, request, now, book_loader):
+def _process_close(state, request_id, request, now, book_loader, clock):
     paper_id = str(request.get("paper_id") or "").strip()
     if not paper_id:
         return _reject(request_id, now, "PAPER_ID_MISSING")
@@ -791,6 +895,7 @@ def _process_close(state, request_id, request, now, book_loader):
 
     try:
         raw_book = book_loader(token_id)
+        book_received_at = clock()
     except Exception as exc:
         return _reject(
             request_id,
@@ -805,6 +910,9 @@ def _process_close(state, request_id, request, now, book_loader):
     )
     if not ok:
         return _reject(request_id, now, reason)
+    fresh_quote, quote_reason = paper_engine.validate_book_freshness(raw_book, book_received_at)
+    if not fresh_quote:
+        return _reject(request_id, now, quote_reason)
 
     try:
         exit_quote = paper_engine.simulate_sell(
@@ -834,6 +942,7 @@ def _process_close(state, request_id, request, now, book_loader):
     position["exit"] = {
         "book_hash": raw_book.get("hash"),
         "book_timestamp": raw_book.get("timestamp"),
+        "book_received_at": book_received_at.isoformat(),
         "best_bid": exit_quote.get("best_bid"),
         "vwap": exit_quote.get("vwap"),
         "effective_exit_price": exit_quote.get("effective_exit_price"),
@@ -860,16 +969,97 @@ def _process_close(state, request_id, request, now, book_loader):
     )
 
 
-def run_once(
+def _finalize_exits_and_marks(state, events, closed_before, commit_now):
+    """Paper-only commit-time quote fence; never checks Focus READY.
+
+    CLOSE remains tentative until this check. A stale exit restores the
+    original OPEN position and rewrites the event to REJECTED. An old or
+    invalid MARK clears its valuation rather than displaying stale P&L.
+    No RPC/CLOB calls or Focus transitions occur here.
+    """
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "CLOSED":
+            continue
+        request_id = str(event.get("request_id") or "")
+        paper_id = event.get("paper_id")
+        position = next((p for p in state["positions"]
+                         if isinstance(p, dict) and p.get("paper_id") == paper_id),
+                        None)
+        exit_data = position.get("exit") if isinstance(position, dict) else None
+        quote = {"timestamp": exit_data.get("book_timestamp")} if isinstance(exit_data, dict) else {}
+        allowed, reason = paper_engine.validate_book_freshness(quote, commit_now)
+        if allowed:
+            allowed, reason = paper_engine.validate_book_receipt_age(
+                exit_data.get("book_received_at"), commit_now
+            )
+        if not allowed:
+            previous = closed_before.get(request_id)
+            if previous is None or position is None:
+                raise PaperStateError("CLOSE_ROLLBACK_STATE_MISSING")
+            position.clear()
+            position.update(previous)
+            position["mark"] = None
+            position["mark_status"] = "EXIT_" + reason
+            position["mark_checked_at"] = commit_now.isoformat()
+            event.clear()
+            event.update(_reject(request_id, commit_now, "FINAL_COMMIT_" + reason))
+        else:
+            position["closed_at"] = commit_now.isoformat()
+            event["event_at"] = commit_now.isoformat()
+
+    for position in state["positions"]:
+        if not isinstance(position, dict) or position.get("status") != "OPEN":
+            continue
+        mark = position.get("mark")
+        if position.get("mark_status") != "OK" or not isinstance(mark, dict):
+            position["mark"] = None
+            continue
+        allowed, reason = paper_engine.validate_book_freshness(
+            {"timestamp": mark.get("book_timestamp")}, commit_now
+        )
+        if allowed:
+            allowed, reason = paper_engine.validate_book_receipt_age(
+                mark.get("book_received_at"), commit_now
+            )
+        if not allowed:
+            position["mark_status"] = reason
+            position["mark_checked_at"] = commit_now.isoformat()
+            position["mark"] = None
+
+
+def _assert_terminal_request_events(events, consumed_request_ids):
+    """Never persist processed IDs with missing or duplicated request outcomes."""
+    counts = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        request_id = event.get("request_id")
+        if request_id not in consumed_request_ids:
+            continue
+        if event.get("type") not in {"OPENED", "CLOSED", "REJECTED"}:
+            raise PaperStateError("REQUEST_TERMINAL_EVENT_INVALID")
+        counts[request_id] = counts.get(request_id, 0) + 1
+    if set(counts) != consumed_request_ids or any(v != 1 for v in counts.values()):
+        raise PaperStateError("REQUEST_TERMINAL_EVENT_INCOMPLETE")
+
+
+def _run_once_unlocked(
     now=None,
     book_loader=book_worker.fetch_book,
     market_info_loader=fetch_market_info,
     identity_loader=paper_settlement.resolve_position_identity,
     settlement_checker=paper_settlement.check_settlement,
+    clock=None,
 ):
+    # A caller-supplied 'now' is a deterministic logical clock for tests.
+    # Production does not pass 'now': a fresh wall clock is read at COMMIT,
+    # not recycled after potentially slow Book / RPC / settlement calls.
+    injected_now = now is not None
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
+    if clock is None:
+        clock = (lambda: now) if injected_now else (lambda: datetime.now(timezone.utc))
 
     state = load_state(now=now)
     processed = set(str(x) for x in state.get("processed_request_ids", []))
@@ -883,7 +1073,12 @@ def run_once(
         )
     )
 
+    requests_by_id = {}
+    closed_before = {}
+    tentative_open_ids = set()
+    consumed_request_ids = set()
     for request_id, request in _load_requests():
+        requests_by_id[request_id] = request
         if request_id in processed:
             continue
 
@@ -893,6 +1088,8 @@ def run_once(
             event = _reject(request_id, now, "REQUEST_ID_MISMATCH")
         elif request.get("schema_version") != SCHEMA_VERSION:
             event = _reject(request_id, now, "REQUEST_SCHEMA_MISMATCH")
+        elif _request_timestamp(request) is None:
+            event = _reject(request_id, now, "REQUEST_TIMESTAMP_INVALID")
         elif not _request_is_fresh(request, now):
             event = _reject(request_id, now, "REQUEST_STALE")
         elif request.get("action") == "OPEN":
@@ -905,20 +1102,35 @@ def run_once(
                 market_info_loader,
                 identity_loader,
                 settlement_checker,
+                clock,
             )
         elif request.get("action") == "CLOSE":
-            event = _process_close(
-                state,
-                request_id,
-                request,
-                now,
-                book_loader,
-            )
+            paper_id = str(request.get("paper_id") or "").strip()
+            if paper_id in tentative_open_ids:
+                # An OPEN is not committed until final READY/Book/quote checks
+                # and the durable Paper state save. Never CLOSE it in this tick.
+                event = _reject(request_id, now, "POSITION_NOT_COMMITTED")
+            else:
+                previous = next((p for p in state["positions"]
+                                 if isinstance(p, dict) and p.get("paper_id") == paper_id), None)
+                if previous is not None:
+                    closed_before[request_id] = deepcopy(previous)
+                event = _process_close(
+                    state,
+                    request_id,
+                    request,
+                    now,
+                    book_loader,
+                    clock,
+                )
         else:
             event = _reject(request_id, now, "ACTION_INVALID")
 
         processed.add(request_id)
+        consumed_request_ids.add(request_id)
         events.append(event)
+        if event.get("type") == "OPENED" and event.get("paper_id"):
+            tentative_open_ids.add(str(event["paper_id"]))
 
     opened_ids = {
         event.get("paper_id")
@@ -943,17 +1155,105 @@ def run_once(
             continue
         try:
             raw_book = book_loader(str(position.get("token_id") or ""))
-            _position_mark(position, raw_book, now)
+            mark_received_at = clock()
+            _position_mark(position, raw_book, mark_received_at)
+            if position["mark_status"] == "OK":
+                position["mark"]["book_received_at"] = mark_received_at.isoformat()
         except Exception as exc:
             position["mark_status"] = (
                 f"BOOK_FETCH_{str(exc).strip() or type(exc).__name__}"
             )
-            position["mark_checked_at"] = now.isoformat()
+            position["mark_checked_at"] = clock().isoformat()
+            position["mark"] = None
 
     state["updated_at"] = now.isoformat()
     state["processed_request_ids"] = list(processed)[-MAX_PROCESSED_REQUEST_IDS:]
 
-    save_json_atomic(STATE_FILE, state)
+    pending_opens = [
+        event for event in events
+        if isinstance(event, dict) and event.get("type") == "OPENED"
+    ]
+    if pending_opens:
+        # The only shared Focus/Paper critical section. No HTTP, RPC or
+        # learning calls are permitted inside this lock. Focus commits its
+        # authoritative state and READY view using this exact same lock.
+        # OPEN is still tentative until this short atomic authorization+save.
+        with CollectorLock(FOCUS_STATE_FILE.with_suffix(".lock")):
+            commit_now = clock()
+            if commit_now.tzinfo is None:
+                raise ValueError("commit clock must be timezone-aware")
+            gate, latest_focus, _ = read_execution_gate(now=commit_now)
+            rejected_ids = set()
+            for event in pending_opens:
+                request_id = str(event.get("request_id") or "")
+                if gate != "READY_BOOK_PASS":
+                    reason = gate
+                else:
+                    matches, reason = _matches_open_request(
+                        requests_by_id.get(request_id) or {}, latest_focus
+                    )
+                    if matches and not _request_is_fresh(
+                        requests_by_id.get(request_id), commit_now
+                    ):
+                        matches, reason = False, "REQUEST_STALE"
+                    if matches:
+                        # The exact execution quote, not just the independently
+                        # published Book assessment, must remain fresh at commit.
+                        pending_position = next(
+                            (p for p in state["positions"]
+                             if p.get("paper_id") == event.get("paper_id")),
+                            None,
+                        )
+                        entry = pending_position.get("entry") if isinstance(pending_position, dict) else None
+                        quote = {"timestamp": entry.get("book_timestamp")} if isinstance(entry, dict) else {}
+                        matches, reason = paper_engine.validate_book_freshness(quote, commit_now)
+                        if matches:
+                            matches, reason = paper_engine.validate_book_receipt_age(
+                                entry.get("book_received_at"), commit_now
+                            )
+                    if matches:
+                        continue
+
+                paper_id = event.get("paper_id")
+                rejected_ids.add(paper_id)
+                state["positions"] = [
+                    position for position in state["positions"]
+                    if position.get("paper_id") != paper_id
+                ]
+                # OPENED must never be published for a rolled-back entry.
+                event.clear()
+                event.update(_reject(
+                    request_id, commit_now, "FINAL_COMMIT_" + reason
+                ))
+            if rejected_ids:
+                # Revoke observational SETTLED/MARK events derived from a
+                # cancelled tentative OPEN, but NEVER silently discard a
+                # processed user-request outcome, even if future actions
+                # introduce new dependent events carrying a paper_id.
+                surviving = []
+                for event in events:
+                    if event.get("paper_id") not in rejected_ids:
+                        surviving.append(event)
+                    elif event.get("request_id"):
+                        surviving.append(_reject(
+                            str(event["request_id"]), commit_now,
+                            "DEPENDENT_OPEN_NOT_COMMITTED"
+                        ))
+                events = surviving
+            _finalize_exits_and_marks(state, events, closed_before, commit_now)
+            state["updated_at"] = commit_now.isoformat()
+            _assert_terminal_request_events(events, consumed_request_ids)
+            save_json_atomic(STATE_FILE, state)
+    else:
+        # CLOSE and settlement never require Focus READY. The Paper state lock
+        # already serializes this process; commit against the *current* clock.
+        commit_now = clock()
+        if commit_now.tzinfo is None:
+            raise ValueError("commit clock must be timezone-aware")
+        _finalize_exits_and_marks(state, events, closed_before, commit_now)
+        state["updated_at"] = commit_now.isoformat()
+        _assert_terminal_request_events(events, consumed_request_ids)
+        save_json_atomic(STATE_FILE, state)
     _append_events(events)
 
     # Learning is downstream of committed Paper authority. A queue failure
@@ -962,6 +1262,29 @@ def run_once(
         save_json_atomic(STATE_FILE, state)
 
     return state, events
+
+
+def run_once(
+    now=None,
+    book_loader=book_worker.fetch_book,
+    market_info_loader=fetch_market_info,
+    identity_loader=paper_settlement.resolve_position_identity,
+    settlement_checker=paper_settlement.check_settlement,
+    clock=None,
+):
+    # Lock the entire read -> request processing -> atomic write cycle.
+    # Otherwise two manual or independently supervised Paper workers can
+    # both load the previous state and commit conflicting OPEN requests.
+    # The file is kept for reuse; OS advisory lock is released on exit/crash.
+    with PaperWorkerLock(STATE_FILE.with_suffix(".lock")):
+        return _run_once_unlocked(
+            now=now,
+            book_loader=book_loader,
+            market_info_loader=market_info_loader,
+            identity_loader=identity_loader,
+            settlement_checker=settlement_checker,
+            clock=clock,
+        )
 
 
 def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
@@ -1000,11 +1323,12 @@ def run_forever(interval=DEFAULT_INTERVAL_SECONDS):
 
 
 def self_test():
-    global DATA_DIR, FOCUS_FILE, BOOK_FILE, REQUEST_DIR, STATE_FILE, EVENTS_FILE
+    global DATA_DIR, FOCUS_FILE, FOCUS_STATE_FILE, BOOK_FILE, REQUEST_DIR, STATE_FILE, EVENTS_FILE
 
     original = (
         DATA_DIR,
         FOCUS_FILE,
+        FOCUS_STATE_FILE,
         BOOK_FILE,
         REQUEST_DIR,
         STATE_FILE,
@@ -1016,6 +1340,7 @@ def self_test():
         with tempfile.TemporaryDirectory() as temp:
             DATA_DIR = Path(temp)
             FOCUS_FILE = DATA_DIR / "focused_market.json"
+            FOCUS_STATE_FILE = DATA_DIR / "focus_state.json"
             BOOK_FILE = DATA_DIR / "book_assessment.json"
             REQUEST_DIR = DATA_DIR / "paper_requests"
             STATE_FILE = DATA_DIR / "paper_state.json"
@@ -1044,6 +1369,15 @@ def self_test():
                     "source_generation_id": "GEN-X",
                     "state": "READY",
                     "focus": focus,
+                },
+            )
+            save_json_atomic(
+                FOCUS_STATE_FILE,
+                {
+                    "schema_version": 1,
+                    "updated_at": now.isoformat(),
+                    "last_source_generation_id": "GEN-X",
+                    "engine_state": {"version": 3, "focus": focus},
                 },
             )
             save_json_atomic(
@@ -1083,7 +1417,7 @@ def self_test():
                 return {
                     "market": "condition-a",
                     "asset_id": "token-a",
-                    "timestamp": "1",
+                    "timestamp": str(int(now.timestamp() * 1000)),
                     "hash": "book-x",
                     "bids": [{"price": "0.49", "size": "1000"}],
                     "asks": [{"price": "0.50", "size": "1000"}],
@@ -1154,6 +1488,7 @@ def self_test():
         (
             DATA_DIR,
             FOCUS_FILE,
+            FOCUS_STATE_FILE,
             BOOK_FILE,
             REQUEST_DIR,
             STATE_FILE,

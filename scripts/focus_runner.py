@@ -18,6 +18,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 from machine_common import fresh, save_json_atomic
+from collector_storage_v4.bridge import CollectorLock
 from scripts import focus_engine
 
 try:
@@ -253,37 +254,30 @@ def run_once(now=None):
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
 
-    state = load_engine_state()
-    input_status, payload = read_risk_snapshot(now=now)
+    # The only cross-worker critical section: read durable Focus, apply
+    # a transition, then atomically publish both durable state and its view.
+    # Paper's FINAL OPEN authorization uses this same lock. No RPC or
+    # learning/event append is performed while the lock is held.
+    with CollectorLock(STATE_FILE.with_suffix(".lock")):
+        state = load_engine_state()
+        input_status, payload = read_risk_snapshot(now=now)
 
-    # Input failure is not equivalent to a valid empty Risk generation.
-    # Preserve Focus authority unchanged until a valid current snapshot exists.
-    if input_status != "OK":
-        save_json_atomic(FOCUS_FILE, _view(state, input_status, payload, now))
-        return state, [], input_status
+        if input_status != "OK":
+            # A missing/stale Risk input never erases durable Focus authority.
+            save_json_atomic(FOCUS_FILE, _view(state, input_status, payload, now))
+            return state, [], input_status
 
-    candidates = [
-        row
-        for row in payload["results"]
-        if isinstance(row, dict)
-    ]
+        candidates = [row for row in payload["results"] if isinstance(row, dict)]
+        new_state, events = focus_engine.step(state, candidates, now=now)
+        generation_id = str(payload["source_generation_id"])
 
-    new_state, events = focus_engine.step(state, candidates, now=now)
-    generation_id = str(payload["source_generation_id"])
+        # Lock prevents a Paper OPEN from being finalized between these writes.
+        save_json_atomic(STATE_FILE, _state_wrapper(new_state, generation_id, now))
+        save_json_atomic(FOCUS_FILE, _view(new_state, "OK", payload, now))
 
-    # Durable state is authority. Events and the compatibility view are
-    # downstream projections of the already-committed state transition.
-    save_json_atomic(
-        STATE_FILE,
-        _state_wrapper(new_state, generation_id, now),
-    )
+    # Downstream observational queues/events never hold up Focus authority.
     _append_events(events, generation_id)
     _publish_learning_events(events, new_state, payload)
-    save_json_atomic(
-        FOCUS_FILE,
-        _view(new_state, "OK", payload, now),
-    )
-
     return new_state, events, "OK"
 
 

@@ -6,6 +6,7 @@ No network, file I/O, Telegram, wallet, signing, or order submission.
 
 import math
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -15,6 +16,9 @@ from machine_common import finite_number
 
 
 FEE_DECIMALS = 5
+# Paper-only conservative quote freshness policy, independent of Focus/Book snapshots.
+MAX_EXECUTION_BOOK_AGE_SECONDS = 30
+MAX_BOOK_FUTURE_SKEW_SECONDS = 5
 
 
 def _number(value):
@@ -52,13 +56,72 @@ def validate_book_identity(book, token_id, condition_id):
     asset_id = str(book.get("asset_id") or "").strip()
     market = str(book.get("market") or "").strip()
 
-    if not token_id:
+    if not token_id or not asset_id:
         return False, "TOKEN_ID_MISSING"
-    if asset_id and asset_id != token_id:
+    if asset_id != token_id:
         return False, "TOKEN_ID_MISMATCH"
-    if market and condition_id and market.lower() != condition_id.lower():
+    if not condition_id or not market:
+        return False, "CONDITION_ID_MISSING"
+    if market.lower() != condition_id.lower():
         return False, "CONDITION_ID_MISMATCH"
 
+    return True, "OK"
+
+
+def validate_book_freshness(book, now=None):
+    """Conservative Paper quote gate: CLOB book timestamp is Unix epoch ms.
+
+    The official Polymarket Python SDK represents the response timestamp as a
+    millisecond epoch string. Do not interpret small integers as epoch seconds
+    and never infer quote age from our local Book assessment generated_at.
+    Returns a fail-closed reason; this does not prove remote source integrity.
+    """
+    if not isinstance(book, dict):
+        return False, "BOOK_PAYLOAD_INVALID"
+    raw = book.get("timestamp")
+    if raw is None or raw == "":
+        return False, "BOOK_TIMESTAMP_MISSING"
+    if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+        return False, "BOOK_TIMESTAMP_INVALID"
+    value = str(raw).strip()
+    if len(value) != 13 or not value.isascii() or not value.isdecimal():
+        return False, "BOOK_TIMESTAMP_INVALID"
+    try:
+        timestamp = datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return False, "BOOK_TIMESTAMP_INVALID"
+    now = now if now is not None else datetime.now(timezone.utc)
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        return False, "BOOK_CLOCK_INVALID"
+    age = (now - timestamp).total_seconds()
+    if age < -MAX_BOOK_FUTURE_SKEW_SECONDS:
+        return False, "BOOK_TIMESTAMP_FUTURE"
+    if age > MAX_EXECUTION_BOOK_AGE_SECONDS:
+        return False, "BOOK_TIMESTAMP_STALE"
+    return True, "OK"
+
+
+def validate_book_receipt_age(received_at, now):
+    """Bound how long an already received CLOB response may be used.
+
+    This is a *local* UTC receipt age, not the exchange's book-generation
+    timestamp. Both must pass independently; neither proves execution.
+    """
+    if not isinstance(received_at, str) or not received_at.strip():
+        return False, "BOOK_RECEIPT_MISSING"
+    try:
+        receipt = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return False, "BOOK_RECEIPT_INVALID"
+    if receipt.tzinfo is None or receipt.utcoffset() is None:
+        return False, "BOOK_RECEIPT_INVALID"
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        return False, "BOOK_CLOCK_INVALID"
+    age = (now - receipt).total_seconds()
+    if age < -MAX_BOOK_FUTURE_SKEW_SECONDS:
+        return False, "BOOK_RECEIPT_FUTURE"
+    if age > MAX_EXECUTION_BOOK_AGE_SECONDS:
+        return False, "BOOK_RECEIPT_STALE"
     return True, "OK"
 
 

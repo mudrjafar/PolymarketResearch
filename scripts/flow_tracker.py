@@ -220,6 +220,15 @@ def _strict_aware_time(value):
         raise ValueError("timestamp missing")
     if isinstance(value, datetime):
         dt = value
+    elif isinstance(value, int) and not isinstance(value, bool):
+        # Collector V4 stores Polygon's canonical block timestamp as UNIX
+        # epoch seconds (JSON integer). Never use receipt/detection wall time.
+        if value < 0:
+            raise ValueError("negative blockchain timestamp")
+        try:
+            dt = datetime.fromtimestamp(value, timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            raise ValueError("blockchain timestamp outside UTC range") from None
     else:
         text_value = str(value).strip()
         if not text_value:
@@ -1612,8 +1621,7 @@ def main():
                     "volume24hr": latest_trade.get("volume24hr"),
                     # Canonical trade freshness for downstream Diamond/Risk.
                     "last_trade_at": (
-                        latest_trade.get("block_timestamp")
-                        or latest_trade.get("detected_at")
+                        event_time(latest_trade).isoformat()
                     ),
                 },
                 flow_1m=flow_1m,

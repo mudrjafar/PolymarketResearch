@@ -31,6 +31,7 @@ if not RPC_URL:
     raise SystemExit("Missing POLYMARKET_RPC_URL environment variable.")
 
 GAMMA_API = "https://gamma-api.polymarket.com"
+DATA_API_V2 = "https://data-api.polymarket.com/v2"
 
 # Legacy Polymarket CTF Exchange V2 + NegRisk CTF Exchange V2 (Polygon).
 # EXCHANGES remains the public legacy pair for compatibility with existing
@@ -54,6 +55,9 @@ COLLECTOR_VERSION = 4
 CONFIRMATION_BLOCKS = int(os.getenv('COLLECTOR_CONFIRMATION_BLOCKS', '20'))
 INITIAL_LOOKBACK_BLOCKS = int(os.getenv('COLLECTOR_INITIAL_LOOKBACK_BLOCKS', '500'))
 START_BLOCK = os.getenv('COLLECTOR_START_BLOCK', '').strip()
+# Opt-in only for isolated performance validation. Legacy production remains unchanged.
+GAMMA_BATCH_LOOKUP = os.getenv('COLLECTOR_GAMMA_BATCH_LOOKUP', '0') == '1'
+GAMMA_BATCH_SIZE = 12
 if CONFIRMATION_BLOCKS < 1 or INITIAL_LOOKBACK_BLOCKS < 1:
     raise SystemExit('Collector confirmation depth and initial lookback must be positive')
 
@@ -310,17 +314,30 @@ def _gamma_identity(token_id, market):
         if stored_position != position['position_id']:
             raise StorageError('Gamma V3 position identity does not match asset id')
 
-        if not condition_matches_position(condition, position['condition_id']):
-            raise StorageError('Gamma V3 condition does not match position id')
+        structural = market.get('structural_condition_id')
+        if structural is not None:
+            # V3 Data API uses a structural condition for ERC-1155 identity and
+            # a DISTINCT 32-byte market condition for orderbook/settlement.
+            if not condition_matches_position(structural, position['condition_id']):
+                raise StorageError('V3 structural condition does not match position id')
+            canonical_market = str(condition).strip().lower()
+            if (len(canonical_market) != 66 or not canonical_market.startswith('0x')
+                    or any(ch not in '0123456789abcdef' for ch in canonical_market[2:])):
+                raise StorageError('V3 market condition identity is invalid')
+        else:
+            # Legacy Gamma V3 candidate: only a verified structural condition
+            # and canonical Yes/No labels were accepted by this old pathway.
+            if not condition_matches_position(condition, position['condition_id']):
+                raise StorageError('Gamma V3 condition does not match position id')
+            if outcome.strip().casefold() != expected_outcome_label(position['outcome_index']):
+                raise StorageError('Gamma V3 outcome label does not match position index')
+            canonical_market = position['condition_id']
 
         label = outcome.strip()
-        if label.casefold() != expected_outcome_label(position['outcome_index']):
-            raise StorageError('Gamma V3 outcome label does not match position index')
-
-        return {
+        result = {
             'token_id': position['position_id'],
             'market_id': market_id,
-            'condition_id': position['condition_id'],
+            'condition_id': canonical_market,
             'outcome': label,
             'asset_type': 'POSITION',
             'position_id': position['position_id'],
@@ -331,6 +348,9 @@ def _gamma_identity(token_id, market):
             'position_outcome_index': position['outcome_index'],
             'position_arity': position['arity'],
         }
+        if structural is not None:
+            result['structural_condition_id'] = position['condition_id'] + '00'
+        return result
 
     if asset_type != 'CTF_TOKEN':
         raise StorageError('Gamma asset type is unsupported')
@@ -383,6 +403,8 @@ def _fresh_gamma_entry(identity, market):
             'position_arity',
         ):
             entry[field] = identity[field]
+        if 'structural_condition_id' in identity:
+            entry['structural_condition_id'] = identity['structural_condition_id']
     return entry
 
 
@@ -906,6 +928,103 @@ def lookup_market(token_id):
         _live1f_safe(_live1f_observe, diagnostic, token_id)
 
 
+def _v3_data_token_market(position_id, row):
+    """Validate one authoritative V3 Data API token against on-chain bitfields.
+
+    V3 structural and market condition IDs are different namespaces. The
+    outcome label is market-defined (e.g. sports team), not necessarily Yes/No.
+    Unknown execution/lifecycle metadata stays UNKNOWN, never fabricated.
+    """
+    position = decode_position_id(position_id)
+    if position['classification'] != 'SUPPORTED':
+        raise StorageError('V3 Data API position module unsupported')
+    if not isinstance(row, dict):
+        raise StorageError('V3 Data API token row is invalid')
+    if str(row.get('token_id')) != position_id:
+        raise GammaIdentityConflict('V3 Data API token ID mismatch')
+    expected_module = {'BINARY': 'binary', 'NEG_RISK': 'neg_risk'}[position['module']]
+    if str(row.get('module') or '').strip().casefold() != expected_module:
+        raise GammaIdentityConflict('V3 Data API module mismatch')
+    index = row.get('outcome_index')
+    if isinstance(index, bool) or not isinstance(index, int) or index != position['outcome_index']:
+        raise GammaIdentityConflict('V3 Data API outcome index mismatch')
+    if not condition_matches_position(row.get('structural_condition_id'), position['condition_id']):
+        raise GammaIdentityConflict('V3 Data API structural condition mismatch')
+    condition_id = str(row.get('condition_id') or '').lower()
+    if (len(condition_id) != 66 or not condition_id.startswith('0x')
+            or any(ch not in '0123456789abcdef' for ch in condition_id[2:])):
+        raise GammaIdentityConflict('V3 Data API market condition invalid')
+    outcome = row.get('outcome')
+    if not isinstance(outcome, str) or not outcome.strip():
+        raise GammaIdentityConflict('V3 Data API outcome label missing')
+    opposite = str(row.get('opposite_token_id') or '').strip()
+    try:
+        other = decode_position_id(opposite)
+    except V3IdentityError as exc:
+        raise GammaIdentityConflict('V3 Data API opposite position invalid') from exc
+    if (other['classification'] != 'SUPPORTED'
+            or other['condition_id'] != position['condition_id']
+            or other['module_id'] != position['module_id']
+            or other['outcome_index'] != 1 - position['outcome_index']):
+        raise GammaIdentityConflict('V3 Data API opposite position mismatch')
+    if position['module'] == 'NEG_RISK':
+        question_index = row.get('question_index')
+        if (isinstance(question_index, bool) or not isinstance(question_index, int)
+                or question_index != position['condition_index']):
+            raise GammaIdentityConflict('V3 Data API neg-risk question index mismatch')
+    title = row.get('title')
+    slug = row.get('market_slug')
+    if not isinstance(title, str) or not title.strip() or not isinstance(slug, str) or not slug.strip():
+        raise GammaIdentityConflict('V3 Data API market title/slug missing')
+
+    # These fields are for research identity, NOT an executable/active quote.
+    return {
+        'market_id': None,
+        'condition_id': condition_id,
+        'structural_condition_id': position['condition_id'] + '00',
+        'question': title.strip(),
+        'outcome': outcome.strip(),
+        'market_slug': slug.strip(),
+        'opposite_token_id': other['position_id'],
+        'price': None,
+        'volume24hr': None,
+        'volume': None,
+        'start_date': None,
+        'end_date': None,
+        'active': None,
+        'closed': row.get('closed') if isinstance(row.get('closed'), bool) else None,
+        'accepting_orders': None,
+        'asset_type': 'POSITION',
+        'position_id': position_id,
+        'protocol_version': 'V2',
+        'position_module': position['module'],
+        'position_module_id': position['module_id'],
+        'position_condition_index': position['condition_index'],
+        'position_outcome_index': position['outcome_index'],
+        'position_arity': position['arity'],
+        'metadata_source': 'DATA_API_V2',
+    }
+
+
+def lookup_v3_data_token(position_id):
+    """Resolve by exact ERC-1155 token ID; incomplete answers never commit."""
+    response = requests.get(
+        f'{DATA_API_V2}/tokens', params={'token_id': position_id}, timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get('data'), list):
+        raise StorageError('V3 Data API response shape invalid')
+    data = payload['data']
+    if not data:
+        raise RetryableCollectorError('V3 Data API token metadata unavailable')
+    if len(data) != 1:
+        raise GammaIdentityConflict('V3 Data API token lookup is ambiguous')
+    entry = _v3_data_token_market(position_id, data[0])
+    _gamma_identity(position_id, entry)
+    return entry
+
+
 def lookup_position_market(position_id):
     """Resolve a supported V3 position through Gamma, fail-closed on ambiguity."""
     position_id = str(position_id).strip()
@@ -943,9 +1062,14 @@ def lookup_position_market(position_id):
             "Gamma position metadata is not an eligible V2 binary/NegRisk identity"
         )
 
-    raise RuntimeError(
-        "Aggressor position metadata unavailable; batch will be retried"
-    )
+    # Gamma returned no position for either open or closed market searches.
+    # This is unresolved metadata, not proof of an invalid canonical identity.
+    # Retry the SAME uncommitted block range with the existing bounded backoff;
+    # do not skip the trade or advance the checkpoint.
+    # Gamma cannot resolve some V3 tokens (notably sports team outcomes).
+    # The Data API indexes exact ERC-1155 token IDs including team-label markets.
+    # A missing/ambiguous/malformed API identity still fails the SAME batch.
+    return lookup_v3_data_token(position_id)
 
 
 def load_market_map():
@@ -960,6 +1084,124 @@ def load_market_map():
         f"asset mappings: {len(asset_map)} | V3 positions: {positions}"
     )
     return asset_map
+
+
+def _gamma_batch_legacy_lookup(token_ids):
+    """Resolve a bounded set of exact legacy CTF IDs; never infer missing identities.
+
+    Gamma accepts repeated clob_token_ids parameters. Open and closed are
+    queried separately, with only missing tokens passed into the closed query.
+    Any malformed/conflicting response fails the entire uncommitted scan.
+    """
+    tokens = list(dict.fromkeys(str(value) for value in token_ids))
+    if not 2 <= len(tokens) <= GAMMA_BATCH_SIZE:
+        raise ValueError('Gamma batch must contain 2..12 unique CTF ids')
+    for token in tokens:
+        if not token.isascii() or not token.isdecimal():
+            raise StorageError('Invalid canonical legacy token id for batch')
+    found = {}
+    record = globals().get('_LIVE1C_CURRENT')
+    started = time.perf_counter()
+    try:
+        for closed in (False, True):
+            missing = [token for token in tokens if token not in found]
+            if not missing:
+                break
+            params = {'clob_token_ids': missing, 'closed': closed, 'limit': 100}
+            response = requests.get(f'{GAMMA_API}/markets', params=params, timeout=30)
+            if isinstance(record, dict):
+                record['gamma_batch_http_requests'] = record.get('gamma_batch_http_requests', 0) + 1
+            response.raise_for_status()
+            markets = response.json()
+            if not isinstance(markets, list):
+                raise StorageError('Gamma batched CTF response shape invalid')
+            if len(markets) >= 100:
+                raise RetryableCollectorError('Gamma batched response may be truncated')
+            mapped = build_token_map(markets)
+            for token in tokens:
+                market = mapped.get(token)
+                if market is None:
+                    continue
+                identity = _gamma_identity(token, market)
+                _check_gamma_identity(
+                    _gamma_identity(token, found[token]) if token in found else None,
+                    identity,
+                )
+                if str(market.get('asset_type') or 'CTF_TOKEN').upper() != 'CTF_TOKEN':
+                    raise GammaIdentityConflict('Batch returned non-CTF asset')
+                if token not in found:
+                    found[token] = market
+        return found
+    finally:
+        if isinstance(record, dict):
+            record['gamma_batch_ms'] = record.get('gamma_batch_ms', 0.0) + (
+                time.perf_counter() - started) * 1000.0
+            record['gamma_batch_tokens_requested'] = (
+                record.get('gamma_batch_tokens_requested', 0) + len(tokens))
+            record['gamma_batch_tokens_resolved'] = (
+                record.get('gamma_batch_tokens_resolved', 0) + len(found))
+
+
+def _prefetch_legacy_assets(logs, by_number, token_map):
+    """Preload unique unknown legacy identities before any SQLite commit.
+
+    This prepass validates canonical block/log identity and uses the same
+    taker-aggressor filter as scan_once. V3 is left on the original strict
+    Gamma -> Data API route. Never skips an unresolved legacy token.
+    """
+    unknown = []
+    seen = set()
+    hits = 0
+    v3_events = 0
+    for log in logs:
+        n = int(log['blockNumber'], 16)
+        header = by_number.get(n)
+        if header is None or log.get('removed') or log['blockHash'].lower() != header['block_hash'].lower():
+            raise StorageError('Log does not match requested canonical batch')
+        trade = decode_order_filled(log)
+        exchange = log['_exchange_address']
+        if trade['taker'].lower() != exchange.lower():
+            continue
+        if exchange.lower() == EXCHANGE_V3.lower():
+            v3_events += 1
+            continue
+        token = trade['asset_id']
+        if token in token_map:
+            hits += 1
+        elif token not in seen:
+            seen.add(token)
+            unknown.append(token)
+    record = globals().get('_LIVE1C_CURRENT')
+    if isinstance(record, dict):
+        record['gamma_cache_hit_events'] = record.get('gamma_cache_hit_events', 0) + hits
+        record['gamma_cache_miss_unique_legacy'] = (
+            record.get('gamma_cache_miss_unique_legacy', 0) + len(unknown))
+        record['gamma_v3_events_unbatched'] = (
+            record.get('gamma_v3_events_unbatched', 0) + v3_events)
+    if len(unknown) < 2:
+        return
+    # Resolve before mutating the cache. Failures preserve the SQLite cursor.
+    staged = {}
+    for start in range(0, len(unknown), GAMMA_BATCH_SIZE):
+        chunk = unknown[start:start + GAMMA_BATCH_SIZE]
+        if len(chunk) == 1:
+            # Preserve singleton lookup semantics and diagnostic instrumentation.
+            staged[chunk[0]] = lookup_market(chunk[0])
+        else:
+            matched = _gamma_batch_legacy_lookup(chunk)
+            for token in chunk:
+                if token in matched:
+                    staged[token] = matched[token]
+                else:
+                    # Gamma may omit an ID in a filtered query; original
+                    # singleton lookup must still confirm open/closed or fail.
+                    staged[token] = lookup_market(token)
+    for token in unknown:
+        if isinstance(token_map, GammaTokenMap):
+            token_map.remember_fallback(token, staged[token])
+        else:
+            identity = _gamma_identity(token, staged[token])
+            token_map[token] = _fresh_gamma_entry(identity, staged[token])
 
 
 def normalize_trade(log, trade, market, header):
@@ -1034,6 +1276,10 @@ def normalize_trade(log, trade, market, header):
         "trade_to_volume_ratio": ratio,
         "fee": trade["fee"],
     }
+    # Preserve byte-for-byte legacy CTF payload shape; V3 adds provenance only.
+    if exchange.lower() == EXCHANGE_V3.lower():
+        saved['structural_condition_id'] = market.get('structural_condition_id')
+        saved['metadata_source'] = market.get('metadata_source')
     saved['block_hash'] = log['blockHash']
     saved['block_timestamp'] = header['block_timestamp']
     return saved
@@ -1074,6 +1320,8 @@ def scan_once(store, token_map):
     by_number = {header['block_number']: header for header in headers}
     # get_order_filled_logs returns only after ALL monitored exchanges succeed.
     logs = get_order_filled_logs(from_block, to_block)
+    if GAMMA_BATCH_LOOKUP and len(logs) > 1:
+        _prefetch_legacy_assets(logs, by_number, token_map)
     rows = []
     for log in logs:
         n = int(log['blockNumber'], 16)
@@ -1107,11 +1355,18 @@ def scan_once(store, token_map):
 
         market = token_map.get(asset_id)
         if market is None:
-            market = (
-                lookup_position_market(asset_id)
-                if is_v3
-                else lookup_market(asset_id)
-            )
+            if is_v3:
+                v3_started = time.perf_counter()
+                try:
+                    market = lookup_position_market(asset_id)
+                finally:
+                    record = globals().get('_LIVE1C_CURRENT')
+                    if isinstance(record, dict):
+                        record['gamma_v3_lookup_count'] = record.get('gamma_v3_lookup_count', 0) + 1
+                        record['gamma_v3_lookup_ms'] = record.get('gamma_v3_lookup_ms', 0.0) + (
+                            time.perf_counter() - v3_started) * 1000.0
+            else:
+                market = lookup_market(asset_id)
             if isinstance(token_map, GammaTokenMap):
                 market = token_map.remember_fallback(asset_id, market)
             else:
