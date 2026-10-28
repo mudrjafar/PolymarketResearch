@@ -1124,3 +1124,125 @@ def test_old_source_with_fresh_http_receipt_is_conservatively_rejected_for_open(
     )
     assert state["positions"] == []
     assert any(e["reason_code"] == "BOOK_TIMESTAMP_STALE" for e in events)
+
+
+# GENERAL1-REQUEST-INTEGRITY-FINAL: multi-request negative regressions.
+
+
+def _request_with_time(paths, request_id, when):
+    path = paths["requests"] / f"{request_id}.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["requested_at"] = when
+    save_json_atomic(path, record)
+
+
+def test_manual_requests_sort_by_utc_submission_time_not_random_filename(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    # A close filename sorts before the open, but its submission time is later.
+    write_open_request(paths, request_id="REQ-z-open")
+    write_close_request(paths, "PAPER-z-open", request_id="REQ-a-close")
+    _request_with_time(paths, "REQ-z-open", (NOW - timedelta(seconds=2)).isoformat())
+    _request_with_time(paths, "REQ-a-close", (NOW - timedelta(seconds=1)).isoformat())
+    loaded = [req_id for req_id, _ in paper_worker._load_requests()]
+    assert loaded == ["REQ-z-open", "REQ-a-close"]
+
+
+def test_same_tick_close_of_tentative_open_is_rejected_but_open_may_commit(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-a-open")
+    write_close_request(paths, "PAPER-a-open", request_id="REQ-b-close")
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert len(state["positions"]) == 1
+    assert state["positions"][0]["status"] == "OPEN"
+    outcome = {e["request_id"]: e for e in events if e.get("request_id")}
+    assert outcome["REQ-a-open"]["type"] == "OPENED"
+    assert outcome["REQ-b-close"]["type"] == "REJECTED"
+    assert outcome["REQ-b-close"]["reason_code"] == "POSITION_NOT_COMMITTED"
+    assert {"REQ-a-open", "REQ-b-close"}.issubset(set(state["processed_request_ids"]))
+
+
+def test_failed_tentative_open_keeps_dependent_close_rejection_event(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-a-open")
+    write_close_request(paths, "PAPER-a-open", request_id="REQ-b-close")
+    def revoke_before_final(_token):
+        # This runs during OPEN's Book fetch, while Focus isn't locked.
+        state = json.loads(paths["focus_state"].read_text(encoding="utf-8"))
+        state["engine_state"]["focus"] = None
+        save_json_atomic(paths["focus_state"], state)
+        return raw_book()
+    state, events = run_worker(now=NOW, book_loader=revoke_before_final,
+                               market_info_loader=lambda _: market_info())
+    outcome = {e["request_id"]: e for e in events if e.get("request_id")}
+    assert state["positions"] == []
+    assert outcome["REQ-a-open"]["type"] == "REJECTED"
+    assert outcome["REQ-b-close"]["type"] == "REJECTED"
+    assert outcome["REQ-b-close"]["reason_code"] == "POSITION_NOT_COMMITTED"
+    assert len(outcome) == 2
+    assert set(state["processed_request_ids"]) == set(outcome)
+
+
+def test_invalid_submission_time_gets_explicit_rejection(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-invalid-time")
+    _request_with_time(paths, "REQ-invalid-time", "not-a-time")
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert state["positions"] == []
+    assert events[0]["type"] == "REJECTED"
+    assert events[0]["reason_code"] == "REQUEST_TIMESTAMP_INVALID"
+
+
+def test_same_instant_requests_tie_break_by_id(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-z-open")
+    write_open_request(paths, request_id="REQ-a-open")
+    assert [req_id for req_id, _ in paper_worker._load_requests()] == [
+        "REQ-a-open", "REQ-z-open"
+    ]
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert [event["request_id"] for event in events if event.get("request_id")] == [
+        "REQ-a-open", "REQ-z-open"
+    ]
+    assert len(state["positions"]) == 1
+    assert any(e["reason_code"] == "POSITION_ALREADY_OPEN" for e in events if e["type"] == "REJECTED")
+
+
+def test_two_close_requests_for_committed_position_have_one_closed_event(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths)
+    state, _ = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                          market_info_loader=lambda _: market_info())
+    pid = state["positions"][0]["paper_id"]
+    write_close_request(paths, pid, request_id="REQ-close-1")
+    write_close_request(paths, pid, request_id="REQ-close-2")
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert state["positions"][0]["status"] == "CLOSED"
+    assert sum(e["type"] == "CLOSED" for e in events) == 1
+    assert sum(e["type"] == "REJECTED" and e["reason_code"] == "OPEN_POSITION_NOT_FOUND" for e in events) == 1
+
+
+def test_open_close_open_same_tick_preserves_each_request_outcome(monkeypatch, tmp_path):
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-a-open")
+    write_close_request(paths, "PAPER-a-open", request_id="REQ-b-close")
+    write_open_request(paths, request_id="REQ-c-open")
+    state, events = run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                               market_info_loader=lambda _: market_info())
+    assert len(state["positions"]) == 1
+    assert state["positions"][0]["status"] == "OPEN"
+    outcomes = {e["request_id"]: e["type"] for e in events if e.get("request_id")}
+    assert outcomes == {
+        "REQ-a-open": "OPENED", "REQ-b-close": "REJECTED",
+        "REQ-c-open": "REJECTED"
+    }
