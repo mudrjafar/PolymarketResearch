@@ -1375,3 +1375,26 @@ def test_different_market_open_request_cannot_use_current_focus(monkeypatch, tmp
     assert state["positions"][0]["token_id"] == "token-a"
     assert [e["type"] for e in events] == ["OPENED", "REJECTED"]
     assert events[1]["reason_code"] == "REQUEST_TOKEN_ID_MISMATCH"
+
+
+def test_terminal_event_accounting_fails_closed_before_paper_state_save(
+    monkeypatch, tmp_path
+):
+    """A future event-filter regression must never commit an unlogged request."""
+    paths = configure(monkeypatch, tmp_path)
+    write_gate(paths)
+    write_open_request(paths, request_id="REQ-a-open")
+    original = paper_worker._finalize_exits_and_marks
+
+    def deliberately_erase_event(state, events, previous, commit_now):
+        original(state, events, previous, commit_now)
+        events[:] = [e for e in events if not e.get("request_id")]
+
+    monkeypatch.setattr(
+        paper_worker, "_finalize_exits_and_marks", deliberately_erase_event
+    )
+    with pytest.raises(paper_worker.PaperStateError, match="REQUEST_TERMINAL_EVENT_INCOMPLETE"):
+        run_worker(now=NOW, book_loader=lambda _: raw_book(),
+                   market_info_loader=lambda _: market_info())
+    assert not paths["state"].exists()
+    assert not paths["events"].exists()
