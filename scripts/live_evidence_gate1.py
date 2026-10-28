@@ -161,6 +161,43 @@ def snapshot(data_dir):
     return out
 
 
+def _collector_diagnostics(path):
+    """Aggregate canonical LIVE-1C batch records; never return raw log content."""
+    counts = Counter()
+    totals = Counter()
+    if not path.is_file():
+        return {"status": "NO_LOG"}
+    with path.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            if "[COLLECTOR] RETRYABLE_BATCH" in line:
+                counts["RETRYABLE_LOG_LINE"] += 1
+            if "[LIVE-1C] " not in line:
+                continue
+            try:
+                row = json.loads(line.split("[LIVE-1C] ", 1)[1])
+                if not isinstance(row, dict):
+                    continue
+                status = str(row.get("status"))
+                counts[status if status in (
+                    "SUCCESS", "RETRYABLE_FAILURE", "FATAL_FAILURE",
+                    "PARTIAL", "DEGRADED") else "OTHER_BATCH"] += 1
+                for key in ("blocks", "trade_count", "rpc_calls", "rpc_retries",
+                            "gamma_lookup_count", "gamma_lookup_ms",
+                            "gamma_v3_lookup_count", "gamma_v3_lookup_ms",
+                            "v3_unsupported_events", "raw_log_count"):
+                    value = row.get(key)
+                    if isinstance(value, (float, int)) and not isinstance(value, bool):
+                        totals[key] += value
+                totals["gamma_miss_count"] += len(row.get("gamma_misses") or [])
+                if isinstance(row.get("outer_retries"), int):
+                    totals["max_outer_retry_streak"] = max(
+                        totals["max_outer_retry_streak"], row["outer_retries"])
+            except (ValueError, TypeError, IndexError):
+                counts["MALFORMED_DIAGNOSTIC"] += 1
+    return {"status": "PARSED", "batch_statuses": dict(sorted(counts.items())),
+            "total_metrics": dict(sorted(totals.items()))}
+
+
 def _env_rpc(env_file):
     rpc = os.environ.get("POLYMARKET_RPC_URL", "").strip()
     if not rpc and env_file is not None:
@@ -258,6 +295,7 @@ def live_gate(seconds, env_file):
             handle.close()
     ended = datetime.now(timezone.utc)
     data_snapshot = snapshot(data)
+    collector_diagnostics = _collector_diagnostics(logs / "collector.log")
     first = next((x for x in observations if x.get("lag_blocks") is not None), None)
     last = next((x for x in reversed(observations) if x.get("lag_blocks") is not None), None)
     real_seconds = (ended - started).total_seconds()
@@ -283,6 +321,7 @@ def live_gate(seconds, env_file):
         "lag_last": last["lag_blocks"] if last else None,
         "lag_delta": last["lag_blocks"] - first["lag_blocks"] if first and last else None,
         "samples": observations, "data": data_snapshot,
+        "collector_diagnostics": collector_diagnostics,
         "collector_live": "INCONCLUSIVE",
         "natural_ready": ("OBSERVED" if data_snapshot.get("focus_events", {}).get("READY", 0)
                           else "NOT_OBSERVED_IN_WINDOW"),
