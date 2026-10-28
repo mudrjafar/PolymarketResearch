@@ -1,0 +1,26 @@
+name: GENERAL1 Live Evidence Gate 1 Offline Safety
+on:
+  push:
+    branches:
+      - audit/general1-live-evidence-gate1-20261028
+  workflow_dispatch:
+
+jobs:
+  observer-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Test isolated observer (no credentials, no network)
+        run: |
+          python -m pip install pytest
+          python -m py_compile scripts/live_evidence_gate1.py scripts/quant_validation1.py
+          python -m pytest -q tests/test_live_evidence_gate1.py tests/test_quant_validation1.py
+      - name: Confirm live gate defaults to read-only and never invents data
+        run: |
+          mkdir -p /tmp/general1_livegate_empty
+          python scripts/live_evidence_gate1.py --data-dir /tmp/general1_livegate_empty > /tmp/general1_livegate_empty_result.json
+          python -c "import json; d=json.load(open('/tmp/general1_livegate_empty_result.json')); assert d['data']['collector']['status']=='MISSING'; assert d['data']['paper_worker_started_by_gate'] is False; assert d['strategy_edge']=='INCONCLUSIVE'"
