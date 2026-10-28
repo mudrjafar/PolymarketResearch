@@ -212,7 +212,10 @@ def live_gate(seconds, env_file):
     unexpected_exits = []
     started = datetime.now(timezone.utc)
     started_monotonic = time.monotonic()
-    env = dict(os.environ)
+    # Strictly minimize child environment: no Telegram or trading secrets.
+    safe_env_keys = ("PATH", "HOME", "LANG", "LC_ALL", "SSL_CERT_FILE",
+                     "SSL_CERT_DIR", "SYSTEMROOT", "WINDIR", "TMP", "TEMP", "TMPDIR")
+    env = {key: os.environ[key] for key in safe_env_keys if key in os.environ}
     env["POLYMARKET_RPC_URL"] = rpc
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
