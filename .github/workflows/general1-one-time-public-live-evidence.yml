@@ -17,7 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
-      POLYMARKET_RPC_URL: https://polygon.api.onfinality.io/public
       COLLECTOR_INITIAL_LOOKBACK_BLOCKS: "30"
       COLLECTOR_CONFIRMATION_BLOCKS: "20"
     steps:
@@ -27,6 +26,51 @@ jobs:
           python-version: "3.11"
       - name: Install project runtime dependencies
         run: python -m pip install -r requirements.txt
+      - name: Probe public Polygon read-only RPC providers
+        run: |
+          python - <<'PY'
+          import os, json, sys, urllib.request
+          endpoints = (
+              "https://polygon.drpc.org",
+              "https://polygon-bor-rpc.publicnode.com",
+              "https://rpc-polygon.blockmachine.io",
+              "https://poly.api.pocket.network",
+          )
+          def call(endpoint, method, params):
+              data = json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+              req = urllib.request.Request(endpoint, data=data, headers={
+                  "Content-Type":"application/json",
+                  "User-Agent":"PolymarketResearch-ReadOnly-Evidence/1.0"})
+              with urllib.request.urlopen(req, timeout=12) as response:
+                  payload = json.load(response)
+              if "error" in payload or "result" not in payload:
+                  raise ValueError("JSON_RPC_FAILURE")
+              return payload["result"]
+          for endpoint in endpoints:
+              try:
+                  chain = int(call(endpoint, "eth_chainId", []), 16)
+                  if chain != 137:
+                      raise ValueError("NOT_POLYGON")
+                  head = int(call(endpoint, "eth_blockNumber", []), 16)
+                  assert head > 0
+                  logs = call(endpoint, "eth_getLogs", [{
+                      "fromBlock": hex(head - 1), "toBlock": hex(head),
+                      "address": "0xE111180000d2663C0091e4f400237545B87B996B",
+                  }])
+                  if not isinstance(logs, list):
+                      raise ValueError("INVALID_LOGS")
+              except Exception as exc:
+                  print("RPC_PROBE_REJECT", endpoint.split("/")[2],
+                        type(exc).__name__)
+                  continue
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as stream:
+                  stream.write("POLYMARKET_RPC_URL=" + endpoint + "\n")
+              print("RPC_PROBE_PASS", endpoint.split("/")[2])
+              break
+          else:
+              print("RPC_PROBE_NO_WORKING_PUBLIC_PROVIDER")
+              sys.exit(2)
+          PY
       - name: Prepare disposable, isolated livegate worktree
         run: |
           git worktree add --detach "$RUNNER_TEMP/livegate-github1" "$GITHUB_SHA"
