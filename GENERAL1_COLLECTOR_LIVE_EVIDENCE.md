@@ -1,43 +1,28 @@
-# GENERAL1 — Collector Live Evidence (30 October 2026)
+# GENERAL1 — Collector Live Evidence · 30 October 2026
 
-## Scope and provenance
+## Verified real-world observations
 
-Two completed independent **real Polygon public-data observations** took place on ephemeral GitHub Actions Ubuntu/Python 3.11 runners. They used the public RPC provider `polygon.drpc.org`, a standalone empty worktree, 20 confirmation blocks, and exclusively public reads. No Paper worker, Telegram, real-money order or private credentials were used. The two live runs mistakenly retained the Collector's default **500-block lookback**, because the sandbox launcher did not forward the `COLLECTOR_INITIAL_LOOKBACK_BLOCKS=30` environment setting. This launcher defect has been fixed on the audit branch and regression-tested (CI 566 full tests + 61 subtests, 17 targeted tests).
+**Run 1:** [Actions 41066783110](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41066783110), 75.50s, 15 blocks/281 trades, rate 0.2488 vs chain 0.6799 blocks/s, lag 529→555, one fatal Collector exit (root exception text not available in sanitized first artifact). FAILED single-run smoke.
 
-**Crucial distinction:** Results below measure *catch-up from a large backlog*, not the intended 30-block near-tip startup.
+**Run 2:** [Actions 41067595593](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41067595593), 300.04s, 220 blocks/6,532 trades from 772 conditions, 44 successful batches and zero unexpected exits. Collector 0.7721 vs chain 0.6654 blocks/s; lag 529→500. 862 Gamma fallback resolutions were classified 831 active/open, 31 historical, 0 actual lookup failures. **PASS for sustained backlog catch-up throughput; not near-tip readiness.**
 
-## Run 1 — aborted after 75.50 seconds
+**Run 3 — target configuration:** [Actions 41068606756](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41068606756), HEAD `e9921344961b9803347ec66ce7697fe6cf2d6a5e`; 2026-10-30 14:04:44Z to 14:09:44Z, **300.03s**, Python 3.11 GitHub runner, public `polygon.drpc.org`:
+- Verified effective settings: **30 initial lookback**, **20 confirmations**, optional Gamma batching OFF.
+- **227 consecutive durably stored blocks**, 5,619 normalized fills, 787 distinct condition IDs; all persisted records classified `CTF_TOKEN`.
+- **Collector 0.8006 blocks/s vs Polygon 0.6684 blocks/s** (~1.20× chain rate). Head-checkpoint lag **60→24** (−36 blocks). The raw head/checkpoint lag includes the configured confirmation depth; no claim of zero age.
+- **63 SUCCESS batches, zero fatal failures, zero unexpected worker exits**, zero RPC retries across 542 RPC calls.
+- **813 Gamma fallback observations**, 812 active/open and 1 historical/inactive; total measured Gamma lookup time 141.98 seconds, which is a major potential performance cost. These are **successful metadata fallback classifications, not 813 failures**.
+- 15,573 raw exchange logs inspected; 5,619 normalized fills committed; a raw log is not by definition a supported eligible trade. 73 V3 unsupported events; 0 V3 POSITION persisted. No claim of V3 execution support.
+- At the end the active pipeline had 11 verified Flow states, 13 Diamonds, 11 Risk PASS, a natural Focus WAIT 2/3, but **no READY, Book PASS or Paper OPEN**.
 
-- [GitHub Actions 41066783110](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41066783110), head `6d6cb9e7e56d9bdd2ea020e77a22c7355307cf17`.
-- 15 durable blocks; 281 trades; 82 distinct conditions.
-- Collector rate **0.2488 blocks/s**, chain **0.6799 blocks/s**; measured lag **529 → 555** (+26).
-- Collector unexpectedly exited; LIVE-1C emitted 3 successful batches and 1 `FATAL_FAILURE`. Exact error reason is not contained in that earlier sanitized artifact.
-- 105 Gamma fallback lookup observations; cumulative lookup time ~28.08 seconds; 0 RPC retries.
-- Only `CTF_TOKEN` trades persisted; no V3 POSITION trades.
-- Flow 98 tokens, 0 verified; all 98 current Diamond classes `DATA_RISK`; Risk PASS 0; natural READY 0; Book PASS 0.
+## Technical root-cause and remediation
 
-**Decision:** FAIL for this observed run; no systemic failure rate inferred from one short sample.
+The earlier 500-block default start was the fault of the **audit runner's environment whitelist**, not a proven Collector bug. Even though the GitHub workflow requested `COLLECTOR_INITIAL_LOOKBACK_BLOCKS=30`, the child environment did not inherit it. We repaired `scripts/live_evidence_gate1.py` to validate and forward only the nonsecret Collector lookback/confirmation/batching controls and echo effective numeric settings in the sanitized report. Regression tests also prove sensitive Telegram and wallet variables are not forwarded. The actual near-tip test confirmed the fix.
 
-## Run 2 — completed full 300.04 seconds
+An earlier transient fatal Collector event is **not reproducible** in the following two full 300s runs; do not speculate about its underlying exception. No Collector error-handling, metadata identity rule, Risk policy or trading threshold was relaxed.
 
-- [GitHub Actions 41067595593](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41067595593), head `ac970b6feba08ede99a6c2ef33c0f542f6849268`.
-- 220 durable blocks; 6,532 trades; 772 distinct market conditions; `CTF_TOKEN` only.
-- Collector rate **0.7721 blocks/s**, chain rate **0.6654 blocks/s**; measured lag **529 → 500** (improved by 29).
-- **44 successful Collector batches, no fatal failures and no unexpected worker exits**.
-- **440** RPC calls, 0 retries; 17,899 raw log entries inspected; 6,532 persisted normalized trades (other logs are not all persisted fills).
-- **862 Gamma fallback observations**, 179.36 cumulative lookup seconds. Classification: **831 ACTIVE_OPEN**, **31 CLOSED_INACTIVE_HISTORICAL**, **0 classified lookup failures**. A fallback cache miss is NOT automatically a metadata resolution failure.
-- 74 unsupported V3 events logged, 0 V3 POSITION records committed. V3 coverage therefore cannot be inferred from legacy CTF counts.
-- Current Flow: 554 tokens, 0 verified; latest Diamond: 539 `DATA_RISK` classes; Risk: 0 PASS / 539 blocked; Focus IDLE/0 READY; Book not ready; zero Paper starts.
-- Learning database: 7,893 historical *generation observations* and 7,893 BLOCK decisions in this sandbox; these are NOT independent markets and must not be interpreted as 7,893 unique trades.
+## Decision
 
-**Decision:** PASS for a *bounded 300s uninterrupted throughput smoke test while catching up*; **NOT** a near-tip PASS or economically usable signal pipeline. Even after rate > chain for this window, 500 blocks of backlog remained and all downstream trade-age gates remained blocked.
+**COLLECTOR LIVE: PASS for a bounded 300s near-tip throughput and stability smoke test on the public GitHub runner.** Not a production uptime SLA, not proof of complete V3 coverage, not verification of the user's own QuickNode RPC or Linux/Python3.14 environment. Book/Paper E2E and economic advantage remain inconclusive.
 
-## Root cause discovery
-
-The intended `COLLECTOR_INITIAL_LOOKBACK_BLOCKS=30` was set in workflow YAML but was absent from the isolated child-process environment whitelist in `scripts/live_evidence_gate1.py`. The ~529-block initial head/checkpoint lag agrees with the untouched 500-block fallback plus confirmations/startup. The launcher now validates and forwards the collector's lookback, confirmation depth and optional batching switch, and records those settings in the sanitized report. This does NOT change the Collector's default or any trading/risk threshold.
-
-## Next evidence
-
-A third isolated public observation with *actual 30-block lookback*, expected in [near-tip GitHub Actions 41068606756](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41068606756), is a separate experiment; do not combine its sample counts with 500-block catch-up runs. Results must be added only after the completed exact-HEAD artifact is read and validated.
-
-**Provisional Collector verdict: CONDITIONAL.** It demonstrated sustained above-chain throughput under one public-provider configuration but has not yet established near-tip fresh-signal coverage, fail-free repeatability or equivalence to the user's own Linux/QuickNode environment. Real-money and automatic Paper permissions remain NO-GO.
+Best next action is to observe a **natural WAIT 2/3→READY event** in a persistent, isolated data-only session while preserving the current immutable focus and evidence; never synthesize or accelerate confirmations.
