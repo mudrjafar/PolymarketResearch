@@ -236,7 +236,8 @@ def _env_rpc(env_file):
 
 def _rpc_call(rpc_url, method):
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": []}).encode()
-    req = request.Request(rpc_url, body, {"Content-Type": "application/json"})
+    req = request.Request(rpc_url, body, {"Content-Type": "application/json",
+                                          "User-Agent": "PolymarketResearch-ReadOnly-Evidence/1.0"})
     with request.urlopen(req, timeout=10) as stream:
         payload = json.load(stream)
     if not isinstance(payload, dict) or "error" in payload or "result" not in payload:
