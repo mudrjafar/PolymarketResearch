@@ -282,6 +282,32 @@ def _write_report(path, report):
                     encoding="utf-8")
 
 
+def _build_worker_env(rpc):
+    """Whitelist observational controls; never propagate Telegram or wallet secrets."""
+    safe_keys = ("PATH", "HOME", "LANG", "LC_ALL", "SSL_CERT_FILE",
+                 "SSL_CERT_DIR", "SYSTEMROOT", "WINDIR", "TMP", "TEMP", "TMPDIR")
+    child = {key: os.environ[key] for key in safe_keys if key in os.environ}
+    child["POLYMARKET_RPC_URL"] = rpc
+    child["PYTHONUNBUFFERED"] = "1"
+    child["PYTHONDONTWRITEBYTECODE"] = "1"
+    settings = {}
+    for key, default, ceiling in (
+        ("COLLECTOR_INITIAL_LOOKBACK_BLOCKS", 500, 1000),
+        ("COLLECTOR_CONFIRMATION_BLOCKS", 20, 100),
+        ("COLLECTOR_GAMMA_BATCH_LOOKUP", 0, 1),
+    ):
+        raw = os.environ.get(key, str(default))
+        if not raw.isascii() or not raw.isdecimal():
+            raise ValueError("INVALID_COLLECTOR_OBSERVER_CONFIG")
+        value = int(raw)
+        minimum = 0 if key == "COLLECTOR_GAMMA_BATCH_LOOKUP" else 1
+        if value < minimum or value > ceiling:
+            raise ValueError("INVALID_COLLECTOR_OBSERVER_CONFIG")
+        child[key] = str(value)
+        settings[key] = value
+    return child, settings
+
+
 def live_gate(seconds, env_file):
     """Only call in a fresh dedicated worktree; never touch an existing data root."""
     if "livegate" not in BASE.name.lower():
@@ -304,13 +330,8 @@ def live_gate(seconds, env_file):
     unexpected_exits = []
     started = datetime.now(timezone.utc)
     started_monotonic = time.monotonic()
-    # Strictly minimize child environment: no Telegram or trading secrets.
-    safe_env_keys = ("PATH", "HOME", "LANG", "LC_ALL", "SSL_CERT_FILE",
-                     "SSL_CERT_DIR", "SYSTEMROOT", "WINDIR", "TMP", "TEMP", "TMPDIR")
-    env = {key: os.environ[key] for key in safe_env_keys if key in os.environ}
-    env["POLYMARKET_RPC_URL"] = rpc
-    env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Pass only validated public-read configuration, never tokens or private keys.
+    env, collector_settings = _build_worker_env(rpc)
     try:
         for name, args in SERVICES.items():
             handle = (logs / (name + ".log")).open("w", encoding="utf-8")
@@ -364,6 +385,7 @@ def live_gate(seconds, env_file):
         "elapsed_s": round(real_seconds, 2),
         "requested_s": seconds,
         "start_chain_head": starting_head,
+        "collector_runtime_settings": collector_settings,
         "service_names": list(SERVICES),
         "unexpected_exits": unexpected_exits,
         "collector_blocks_per_second": (
