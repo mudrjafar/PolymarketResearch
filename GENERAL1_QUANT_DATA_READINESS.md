@@ -1,21 +1,37 @@
-# GENERAL1 QUANT DATA READINESS
+# GENERAL1 — Quantitative Observation Readiness (30 October 2026)
 
-**Status: BLOCKED / NOT YET MEASURABLE.**
+**Research classification: BLOCKED; STRATEGIC EDGE: INCONCLUSIVE.**
 
-The existing Learning sidecar records selected candidate classes only. `scripts/learning_queue.py` does not enqueue LOW-only generations; thus there is no complete no-signal "at-risk" denominator in the Learning DB. `book_decisions` provides Focus-linked preliminary Book observations, not complete bid/ask snapshots for all candidate and matched non-signal markets at 0, 5, 15, 60 minute horizons. User-selected Paper OPENs are not unbiased trade observations.
+## What is actually measurable
 
-## Prospective unmodified strategy comparison
+The isolated 300.04s public live catch-up run [41067595593](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41067595593) produced 220 durable blocks, 6,532 normalized legacy CTF trades from 772 distinct market conditions, 554 tracked Flow tokens, and 7,893 Learning signal-generation observations with corresponding Risk BLOCK decisions. It did **not** produce verified Flow, a Diamond, Risk PASS, natural Focus READY, Book PASS or any Paper trade. All 539 latest Diamond observations were `DATA_RISK`. Reason-code histograms count overlapping causes, not independent rejected candidates.
 
-A = Full Diamond + Risk PASS + natural Focus READY;
-B = fixed simple positive 5m/15m BUY Flow rule;
-C = matched at-risk non-signal market observations.
+The runner accidentally used the 500-block default lookback and finished 500 blocks behind the head. These market observations are real but cannot be treated as near-tip actionable signal evidence. A corrected 30-block test is tracked separately.
 
-For all three, collect **as-of** outcome/market identity, timestamp of source event and independent receipt/decision times, market type/category, price/expiry strata, both-sided book depth and freshness, fee metadata, predeclared exclusion rules, at-risk population including LOW and rejected candidates, and eventual settlement identity/outcome. Use separate first_signal/LOCKED/READY and +5/+15/+60m timestamps. No post-event lookahead.
+## Why an A/B/C performance test cannot yet be run
 
-Shadow P&L = simulated ask VWAP entry to future bid VWAP exit with full depth, taker fees, quoted slippage and explicit failed/missing fills. Compare market/event-clustered held-out net A-B and A-C with uncertainty bands. Do not train weights or modify Risk/Focus based on early data. Overlapping windows and multiple outcomes of the same condition are statistically dependent.
+- Learning's `scripts/learning_queue.py` excludes LOW-only generations. A no-signal eligible market denominator is absent: **selection bias**.
+- A) Full Diamond/Focus READY observations: **zero during this 500-block catch-up run**.
+- B) Simple independent BUY-flow baseline: possible to define but must be evaluated on the same full predeclared market universe, which is unavailable in Learning.
+- C) Matched no-signal baseline: no unbiased at-risk control population.
+- Book snapshots: no time-indexed full two-sided depth for matched non-signals or 5/15/60min price markouts; the engine's `Book PASS` is not net-EV proof.
+- No platform-validated executable quote age, fees at actual ask/bid depth, matched expiry/price categories or outcome settlement series in a usable prospective sample.
+- Paper P&L: no automatic Paper worker was started, and separately selected manual trades are not an unbiased test.
 
-## Minimal instrumentation decision
+**No hit-rate, win-rate, uplift, realized expected return, MFE/MAE, Brier score, Sharpe or calibration estimate may be claimed from this sample.**
 
-No trading-logic instrumentation was wired in this first live gate, because the chain-tip Collector and natural Focus READY haven't been shown to work in a current live test. The new observer is passive; it does not mutate Learning SQL schema or gate outcomes. If local diagnostics show a functioning pipeline, the subsequent tightly scoped effort should add a passive **full-universe + timed bid/ask observer**, not redesign Diamond.
+## Minimal preregistered validation when near-tip viability is established
 
-**No out-of-sample results, MFE/MAE, win-rate, resolution calibration or net returns are established by this branch.**
+A = first naturally eligible Full Diamond+Risk PASS+Focus READY (record first seen/LOCK/READY separately).
+
+B = fixed rule on 5m/15m net BUY Flow using only information available at decision time and the same condition/token universe.
+
+C = predeclared at-risk market times without signal, matched by event category, price decile, market expiry band, orderbook liquidity and calendar time.
+
+Collect non-signals, rejected candidates, provenance and exchange-source timestamps at all relevant cycles. Save separate bid/ask/depth snapshots at signal, LOCK, READY, 5/15/60 minutes and resolution. Calculate hypothetical net orderbook VWAP entry vs future executable bid minus fee; report no-fill and missing-book censoring transparently. Use market/event-clustered uncertainty and a chronological holdout, never random splitting overlapping repeated-generation observations.
+
+## Scope of the next implementation
+
+The Live Evidence Gate branch deliberately adds **no new trading model, Signal threshold or Risk/Focus bypass**. If the near-tip run proves viable, the next narrow branch should implement a **passive full at-risk universe plus sampled, two-sided CLOB quote recorder**. The recorder must not call any paper/order/open action or modify Decision authority. Historical performance cannot be reconstructed from only the last-trade price.
+
+**Current decision:** QUANT VALIDATION READINESS = BLOCKED; REAL MONEY = NO-GO.
