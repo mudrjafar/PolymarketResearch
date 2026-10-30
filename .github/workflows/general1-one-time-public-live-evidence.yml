@@ -1,5 +1,5 @@
 name: GENERAL1 One-Time Public RPC Live Evidence
-# Final forensic repeat with safe fatal/Gamma classifications: 15 audit tests pass.
+# Correct near-tip observation: forward tested 30-block lookback and 20 confirmations.
 
 # Only adding or editing THIS workflow on the isolated audit branch can trigger
 # a single public, read-only 300s observation. Other branch pushes do not.
