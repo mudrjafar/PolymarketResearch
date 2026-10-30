@@ -171,3 +171,31 @@ def test_fatal_and_gamma_reason_classification_never_leaks_raw_ids(tmp_path):
         "CLOSED_INACTIVE_HISTORICAL": 1, "LOOKUP_FAILED": 1
     }
     assert "PRIVATE_IDENTIFIER" not in json.dumps(result)
+
+
+def test_isolated_worker_receives_explicit_collector_lookback_without_secrets(monkeypatch):
+    monkeypatch.setenv("COLLECTOR_INITIAL_LOOKBACK_BLOCKS", "30")
+    monkeypatch.setenv("COLLECTOR_CONFIRMATION_BLOCKS", "20")
+    monkeypatch.setenv("COLLECTOR_GAMMA_BATCH_LOOKUP", "0")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "private-bot-token")
+    monkeypatch.setenv("TRADING_PRIVATE_KEY", "private-wallet-key")
+    child, settings = gate._build_worker_env("https://polygon.drpc.org")
+    assert child["COLLECTOR_INITIAL_LOOKBACK_BLOCKS"] == "30"
+    assert child["COLLECTOR_CONFIRMATION_BLOCKS"] == "20"
+    assert settings["COLLECTOR_INITIAL_LOOKBACK_BLOCKS"] == 30
+    assert "TELEGRAM_BOT_TOKEN" not in child
+    assert "TRADING_PRIVATE_KEY" not in child
+    assert "private-bot-token" not in json.dumps(child)
+
+
+def test_observer_rejects_invalid_collector_scope(monkeypatch):
+    monkeypatch.setenv("COLLECTOR_INITIAL_LOOKBACK_BLOCKS", "0")
+    with pytest.raises(ValueError, match="INVALID_COLLECTOR_OBSERVER_CONFIG"):
+        gate._build_worker_env("https://polygon.drpc.org")
+    monkeypatch.setenv("COLLECTOR_INITIAL_LOOKBACK_BLOCKS", "3000")
+    with pytest.raises(ValueError, match="INVALID_COLLECTOR_OBSERVER_CONFIG"):
+        gate._build_worker_env("https://polygon.drpc.org")
+    monkeypatch.setenv("COLLECTOR_INITIAL_LOOKBACK_BLOCKS", "30")
+    monkeypatch.setenv("COLLECTOR_GAMMA_BATCH_LOOKUP", "invalid")
+    with pytest.raises(ValueError, match="INVALID_COLLECTOR_OBSERVER_CONFIG"):
+        gate._build_worker_env("https://polygon.drpc.org")
