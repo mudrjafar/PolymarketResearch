@@ -135,3 +135,16 @@ def test_preexisting_flow_paper_summary_is_sanitized(tmp_path):
     assert result["paper_existing_event_line_count"] == 1
     assert "secret-id" not in json.dumps(result)
     assert "secret-request" not in json.dumps(result)
+
+
+def test_public_rpc_uses_same_identifiable_headers_as_provider_probe(monkeypatch):
+    import io
+
+    def fake_urlopen(req, timeout):
+        assert req.get_header("User-agent") == "PolymarketResearch-ReadOnly-Evidence/1.0"
+        assert req.get_header("Content-type") == "application/json"
+        assert timeout == 10
+        return io.BytesIO(b'{"jsonrpc":"2.0","id":1,"result":"0x89"}')
+
+    monkeypatch.setattr(gate.request, "urlopen", fake_urlopen)
+    assert gate._rpc_call("https://polygon.drpc.org", "eth_chainId") == 137
