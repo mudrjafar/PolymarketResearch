@@ -1,35 +1,29 @@
-# GENERAL1 — Signal Funnel: Real Data (30 October 2026)
+# GENERAL1 — Natural Signal Funnel · 30 October 2026
 
-**Scope:** Source: 300.04-second public Polygon observation, [GitHub run 41067595593](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41067595593). This experiment used the 500-block Collector default lookback due to a previously identified test-harness bug; it is a *backlog catch-up* sample, not a near-tip freshness proof.
+**Primary evidence:** [public Polygon near-tip observation, Actions run 41068606756](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41068606756), 300.03s, effective 30-block initial lookback and 20 confirmations. This is an independently observed real network run, not simulated input.
 
-| Stage | Observed latest count | Main blockers or caveats |
-| --- | ---: | --- |
-| Persisted normalized trades | 6,532 | Legacy CTF only; 772 market conditions |
-| Flow token states | 554 | 0 `verified` |
-| Diamond analyzed (latest) | 539 | 539 `DATA_RISK`, 0 DIAMOND |
-| Risk decisions (latest) | 539 BLOCK / 0 PASS | 539 STALE_TRADE, 539 STALE_FLOW_TRADE, 539 NOT_DIAMOND, 539 FLOW_NOT_VERIFIED, among *overlapping* reason codes |
-| Focus LOCKED | 0 | No eligible Risk PASS |
-| Focus WAIT | 0 | No LOCKED |
-| Focus READY | 0 | No valid evidence lifecycle |
-| Book PASS | 0 | Book `NOT_READY` and reason `FOCUS_NOT_READY` |
-| Paper OPEN | 0 (forbidden) | Paper worker deliberately not launched |
+| Pipeline stage | Actual observed (last snapshot except events) | Interpretation |
+|---|---:|---|
+| Legacy CTF fills persisted | 5,619 | 227 blocks, 787 distinct market condition IDs |
+| Flow token states | 950 | 11 verified |
+| Diamond analyzed | 914 | 13 DIAMOND, 26 CANDIDATE, 9 VERIFYING, 583 DATA_RISK, 63 LOW, 220 WATCH |
+| Risk assessed | 914 | **11 PASS**, 903 BLOCK (overlapping reasons) |
+| Focus LOCKED | **1 event** | Naturally generated |
+| Focus WAIT | **2 events** | Engine ended at WAIT 2/3 |
+| Focus READY | **0** | Not observed in the 300s bounded window |
+| Book PASS | **0** | Status NOT_READY, blocker FOCUS_NOT_READY |
+| Paper OPEN | **0 by design** | Paper worker never started |
 
-The Learning sidecar recorded 7,893 selected generation signal rows, all `DATA_RISK`, and 7,893 corresponding Risk BLOCK rows. This is a repeated snapshot population, not 7,893 independent predictions.
+**Important distinction:** The Learning sidecar archived 7,518 selected signal-generation rows and 7,518 corresponding Risk decisions, with 113 PASS and 7,405 BLOCK, **not 113 independent live signals**. A market may recur in many generated snapshots. The 11 Risk-PASS entries in the latest snapshot and the 113 Learning PASS rows refer to different denominators.
 
-Risk reason codes are **not mutually exclusive**. Counts must not be summed as if they described separate markets. Missing Risk PASS is upstream of Focus and Book; neither Focus exclusivity nor Book market depth can be evaluated economically without natural READY.
+Selected latest BLOCK reasons: `CONFIRMATIONS_LOW` 899; `FLOW_NOT_VERIFIED` 899; `WHALE_CONCENTRATION` 643; `STALE_TRADE` 579. Each market may have several reasons simultaneously; do not add these totals.
 
-### Why stale data prevailed
+Focus evidence was sufficient for **LOCKED + WAIT 1/3 + WAIT 2/3**, with the immutable market/outcome/cursor and ≥60-second evidence-time spacing gates left intact. Missing READY is properly classified NOT OBSERVED IN WINDOW, **not** a strategy failure. The last Book assessment said `FOCUS_NOT_READY`; no CLOB depth/quote success or execution realism was established.
 
-The start configuration was incorrectly forwarded, creating an initial head/checkpoint lag of 529 blocks instead of the intended ~30-block lookback plus 20 confirmations. Although the Collector exceeded observed chain rate during the 300s run and the backlog decreased by 29 blocks, there were still 500 blocks of lag when the test ended. A recent Flow trade from those blocks was therefore too old for fresh Risk inputs. Distinguish event-time age from processing-time freshness.
+## Contrast with stale catch-up
 
-### What could and could not be verified
+The previous full 300s run [41067595593](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41067595593) inadvertently used 500 initial lookback, ended at lag500, had 554 Flow tracked tokens but 0 verified, 539 DATA_RISK Diamond rows and 0 Risk PASS or Focus events. The corrected near-tip test ended at lag24, with 11 verified, 13 Diamond, 11 Risk PASS and Focus 2/3. These are independent 300-second observational cohorts, not a controlled randomized strategy experiment, so the difference must **not** be ascribed solely to one code change or confused with future profit.
 
-**Observed:** Real Collector→Flow→Diamond→Risk data processing and Learning archival from 6,532 real normalized fills; fail-closed stale-data decisions; Focus IDLE; Book NOT_READY. Workloads ran throughout 300s with zero unexpected exits.
+## Remaining evidence gate
 
-**Not observed:** Verified BUY Flow, DIAMOND classification, Risk PASS, a genuine LOCK/WAIT/READY, Book PASS, quote-age distributions or any Paper OPEN/CLOSE/settlement.
-
-**Inconclusive:** Signal effectiveness; wait-to-READY price decay; true CLOB execution coverage. Not seeing READY during a deliberately stale catch-up trial cannot be interpreted as failure of the underlying quantitative strategy.
-
-A corrected 30-block near-tip run, [GitHub Actions 41068606756](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41068606756), is separate. Its stage counts should be reported separately once verified.
-
-**No changes to Diamond, Risk, Focus thresholds or lifecycle were made.**
+Observe a naturally generated 3/3 READY and a **fresh identity-bound Book PASS** with real quote-source timestamps; then, subject to independent review, user-controlled Paper OPEN remains separately authorized and not automated. Record signal/LOCK/READY prices, exact event and receipt times, book source age and blocked causes. This observation must be done without lowering any Risk or Focus threshold.
