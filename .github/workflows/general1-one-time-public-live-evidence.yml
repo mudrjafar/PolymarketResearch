@@ -1,0 +1,53 @@
+name: GENERAL1 One-Time Public RPC Live Evidence
+
+# Only adding or editing THIS workflow on the isolated audit branch can trigger
+# a single public, read-only 300s observation. Other branch pushes do not.
+on:
+  push:
+    branches:
+      - audit/general1-live-evidence-gate1-20261028
+    paths:
+      - .github/workflows/general1-one-time-public-live-evidence.yml
+
+permissions:
+  contents: read
+
+jobs:
+  public-runtime-observation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      POLYMARKET_RPC_URL: https://polygon.api.onfinality.io/public
+      COLLECTOR_INITIAL_LOOKBACK_BLOCKS: "30"
+      COLLECTOR_CONFIRMATION_BLOCKS: "20"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install project runtime dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Prepare disposable, isolated livegate worktree
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/livegate-github1" "$GITHUB_SHA"
+          test ! -e "$RUNNER_TEMP/livegate-github1/data"
+      - name: Run 300-second public RPC observation (no Paper, Telegram or orders)
+        run: |
+          cd "$RUNNER_TEMP/livegate-github1"
+          python -u scripts/live_evidence_gate1.py --run-seconds 300 > "$RUNNER_TEMP/general1_livegate_summary.json"
+          python -c "import json,os; p=os.path.join(os.environ['RUNNER_TEMP'],'general1_livegate_summary.json'); d=json.load(open(p)); assert d['mode']=='ISOLATED_PUBLIC_READS_NO_PAPER'; assert d['data']['paper_worker_started_by_gate'] is False; print('LIVEGATE_BOUNDED_READ_ONLY_COMPLETE')"
+      - name: Print sanitized performance only
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/general1_livegate_summary.json"; then
+            python -c "import json,os; d=json.load(open(os.path.join(os.environ['RUNNER_TEMP'],'general1_livegate_summary.json'))); print(json.dumps({k:d.get(k) for k in ('elapsed_s','unexpected_exits','collector_blocks_per_second','chain_blocks_per_second','lag_first','lag_last','lag_delta','natural_ready','strategy_edge')},sort_keys=True))"
+          else
+            echo "LIVEGATE_FAILED_BEFORE_SANITIZED_REPORT"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: general1-livegate-public-sanitized
+          path: ${{ runner.temp }}/general1_livegate_summary.json
+          if-no-files-found: warn
+          retention-days: 7
