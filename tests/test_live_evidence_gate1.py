@@ -148,3 +148,26 @@ def test_public_rpc_uses_same_identifiable_headers_as_provider_probe(monkeypatch
 
     monkeypatch.setattr(gate.request, "urlopen", fake_urlopen)
     assert gate._rpc_call("https://polygon.drpc.org", "eth_chainId") == 137
+
+
+def test_fatal_and_gamma_reason_classification_never_leaks_raw_ids(tmp_path):
+    path = tmp_path / "collector.log"
+    rows = [
+        "[COLLECTOR] Storage/chain history conflict: Gamma asset identity is unavailable for token PRIVATE_IDENTIFIER",
+        "[LIVE-1C] " + json.dumps({"status": "FATAL_FAILURE",
+            "gamma_misses": [
+                {"token_id": "PRIVATE_IDENTIFIER", "lookup_succeeded": True,
+                 "market_classification": "CLOSED_INACTIVE_HISTORICAL"},
+                {"token_id": "PRIVATE_IDENTIFIER_2", "lookup_succeeded": False,
+                 "market_classification": "LOOKUP_FAILED"}
+            ]})
+    ]
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    result = gate._collector_diagnostics(path)
+    assert result["fatal_reason_classes"] == {
+        "GAMMA_IDENTITY_OR_METADATA_CONFLICT": 1
+    }
+    assert result["gamma_lookup_categories"] == {
+        "CLOSED_INACTIVE_HISTORICAL": 1, "LOOKUP_FAILED": 1
+    }
+    assert "PRIVATE_IDENTIFIER" not in json.dumps(result)
