@@ -1,4 +1,5 @@
 name: GENERAL1 One-Time Public RPC Live Evidence
+# Attempt 3 after preflight/runtime User-Agent parity regression: 14 audit tests pass.
 
 # Only adding or editing THIS workflow on the isolated audit branch can trigger
 # a single public, read-only 300s observation. Other branch pushes do not.
