@@ -1,67 +1,78 @@
-# GENERAL1 LIVE EVIDENCE GATE 1 — FINAL DECISION
+# GENERAL1-LIVE-EVIDENCE-GATE-1 — FINAL INDEPENDENT DECISION
 
-**Date:** 2026-10-28.
-**Mode:** repo/CI inspection, passive observer implementation, negative tests; **no user-local live run**.
+**Date:** 30 October 2026
+**Mode:** Existing-main/PR read-only inspection, bounded public Polygon live collection in ephemeral isolated GitHub Actions worktrees, new diagnostics and tests on the audit branch only. **No core strategy threshold changes, no merge, no Paper worker, no orders.**
 
-## A. Verified baseline
+## A. Verified integration baseline
 
-- `main`: `97d881311a68c54ec15a4f537d8a055e04729f44`.
-- PR #52: `f379ac3af68d3fbe8159226ec2cd4cca9059dc26` (OPEN, not merged; 549 full pytest + 61 subtests and machine self-tests green in exact HEAD GitHub Actions `40678873832`).
-- Audit predecessor: `audit/general1-quant-validation1-20261028`, `c1cfb59ca50b4d47a6de51ad1f11ecb55781d3fa`, four audit tests PASS.
-- Current isolated gate: `audit/general1-live-evidence-gate1-20261028`, based on prior audit HEAD. Adds `scripts/live_evidence_gate1.py`, `tests/test_live_evidence_gate1.py`, dedicated offline CI, these reports. Core Collector, Flow, Diamond, Risk, Focus, Book, Paper and Trading policies UNCHANGED.
-- Historical PR #43 815.03-second run was PARTIAL: collector 225 blocks/5,870 trades, 0.276 vs 0.667 blocks/s, lag 521→630, six restarts. Different branch/time; not evidence the new branch is now working.
+- `main` HEAD: `97d881311a68c54ec15a4f537d8a055e04729f44` (unchanged).
+- PR #52: `f379ac3af68d3fbe8159226ec2cd4cca9059dc26` OPEN, not merged, CI 549 Pytest +61 subtests; PR #51 is an alternative sibling, not an additional merge layer.
+- This work: `audit/general1-live-evidence-gate1-20261028` based on the previous Quant audit; adds only isolated observer, telemetry, safe test launcher, Github CI and documentation. It never changes existing production Collector/Risk/Focus/Book/Paper decision functions or the user/local DB.
+- Latest verified code CI prior to final report: [GitHub Actions 41067915470](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41067915470), **566 Pytest, 61 subtests, 17 targeted observer tests and machine self-test PASS**. Exact-head CI after final docs should also be checked before using any merged code.
 
-## B. Actual live results
+## B. Actual live runtime evidence
 
-**NOT RUN HERE — NO CONFIGURED POLYGON RPC AND NO USER-LOCAL DATA ROOT.** This session cannot access the user's Linux laptop or execute its network/configuration-dependent services. GitHub CI is offline. The script provides a safe local procedure; no measured current chain rates, retry counts, runtime restarts, metadata conflicts or fresh CLOB quote ages exist to report.
+Real public Polygon PoS chain observations, independent GitHub Ubuntu/Python3.11 runner, public `polygon.drpc.org`, 20 confirmations:
 
-## C. Signal Funnel
+| Metric | Aborted initial, 500-block default | Full catch-up, 500-block default | **Corrected near-tip, 30-block lookback** |
+|---|---:|---:|---:|
+| GitHub run | [41066783110](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41066783110) | [41067595593](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41067595593) | **[41068606756](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41068606756)** |
+| Actual seconds | 75.50 | 300.04 | **300.03** |
+| Durable blocks | 15 | 220 | **227** |
+| Normalized trades | 281 | 6,532 | **5,619** |
+| Distinct market conditions | 82 | 772 | **787** |
+| Collector/chain blocks per second | 0.2488/0.6799 | 0.7721/0.6654 | **0.8006/0.6684** |
+| Head-checkpoint lag | 529→555 | 529→500 | **60→24** |
+| Unexpected exits | 1 | 0 | **0** |
+| Successful batches | 3 | 44 | **63** |
 
-See `GENERAL1_SIGNAL_FUNNEL_REPORT.md`. No natural READY witnessed in the current session. A READY not observed in a short run is not a FAIL. Book/Paper E2E is **not** considered demonstrated.
+At the near-tip run, 542 RPC calls had 0 recorded retries, 813 Gamma fallback lookups (812 active/open, 1 historical), 0 classified lookup failures, cumulative Gamma lookup time 141.98s, 73 V3 unsupported events, only legacy `CTF_TOKEN` normalized trades persisted. Counted raw logs are **not** all eligible persisted CTF fills. V3 Paper execution remains unsupported.
 
-## D. Economics
+**P0 configuration correction:** The launcher originally failed to forward `COLLECTOR_INITIAL_LOOKBACK_BLOCKS=30`, accidentally using default 500. This caused the first two experiments' ~529-block initial lag and stale signals. Fixed in `scripts/live_evidence_gate1.py:_build_worker_env`, with fail-closed validation, verified child-environment credential exclusion and negative regression tests. The third run explicitly attests 30 initial lookback, 20 confirmations, Gamma batching OFF. No core Collector code was changed.
 
-**BLOCKED** for a valid A (Diamond), B (simple Momentum), C (matched control) comparison. Current Learning excludes LOW-only/no-signal market universe; future executable two-sided CLOB quotes and matched category/time conditions are missing. No net positive expectancy claim is authorized.
+## C. Naturally observed signal funnel — third run only
 
-## E. Classified findings
+- 950 Flow token states; **11 VERIFIED**.
+- Final Diamond snapshot: 914 analyzed including **13 DIAMOND**, 26 CANDIDATE, 9 VERIFYING, 583 DATA_RISK, 63 LOW, 220 WATCH.
+- Final Risk: 914 assessed, **11 PASS**, 903 BLOCK. Reason codes overlap (e.g., 899 CONFIRMATIONS_LOW, 643 WHALE_CONCENTRATION, 579 STALE_TRADE); sums do not equal separate markets.
+- **Focus LOCKED 1, WAIT events 2, final WAIT 2/3**, from natural real evidence. **READY 0**.
+- Book latest `NOT_READY` / `FOCUS_NOT_READY`; Book PASS 0. Paper never started, 0 OPEN.
+- Learning archive: 7,518 repeated generation observations (113 PASS, 7,405 BLOCK), NOT 7,518 independent signal tests or 113 independent profitable trades.
 
-| Severity | Evidence | Operational/economic impact | Minimum next action |
-| --- | --- | --- | --- |
-| HIGH | PR #43 original runtime report | Collector fell further behind chain in historical real run; no proof latest patches fixed it | New sandbox chain-tip test |
-| HIGH | `scripts/learning_queue.py` filters LOW-only generations | No unbiased C baseline or complete denominator | Passive at-risk control snapshots, AFTER runtime verified |
-| HIGH | No user-local `collector.sqlite3`/`learning.sqlite3` attached | Current counts and natural READY unmeasurable | Run read-only diagnostics locally |
-| MEDIUM | `focus_engine.py` 3 confirmations >=60s | Signal-to-READY price edge may decay | Compare signal-time vs READY and forward bid markouts |
-| MEDIUM | `dashboard.py` paper_trades legacy read; #52 F3/F4 | Dashboard/journal cannot be treated as audit-grade Paper truth | Use authoritative paper_state and reconcile before reporting P&L |
-| MEDIUM | `book_engine.py` book_ok checks depth and identity, not alpha | Book PASS does not imply positive net EV | Record executable ask/bid, fee and markout |
+This independently establishes an actual Polygon→Collector→Flow→Diamond→Risk→Focus WAIT2/3 chain **without synthetic READY or safety-gate bypass**. An entire Focus→Book→Paper lifecycle and quote execution have NOT been observed.
 
-## F. Binding decision
+## D. Economics and experimental readiness
 
-- **COLLECTOR LIVE: INCONCLUSIVE**
-- **PIPELINE E2E: INCONCLUSIVE**
-- **NATURAL FOCUS READY: NOT OBSERVED IN CURRENT SESSION**
-- **PAPER TEST READINESS: NO-GO**
-- **QUANT VALIDATION READINESS: BLOCKED**
-- **REAL-MONEY READINESS: NO-GO**
+**NOT YET MEASURABLE / BLOCKED.** Positive predictive alpha cannot be inferred from genuine Diamonds, Risk PASS or WAIT. An unbiased A/B/C test still lacks (1) full LOW/non-signal at-risk market population because `scripts/learning_queue.py` filters LOW-only generations, (2) synchronized two-sided bid/ask/depth and actual fees at signal/LOCK/READY and +5/15/60 minute horizons for candidates and matched controls, (3) sufficient held-out independent events and settlement outcomes. Observations repeated within a condition are correlated. No statistical edge, net expectancy, confidence interval, win-rate or Sharpe result is claimed.
 
-## G. Minimal executable next step (Ubuntu/Linux)
+## E. Findings and smallest fixes
 
-Do this from an existing authenticated local clone (`~/PolymarketResearch` is an example) with a trusted non-secret `.env` containing `POLYMARKET_RPC_URL`. **Do not paste the .env, API URL, private keys or local raw logs.**
+| Severity | Grounded finding | Impact | Minimal action |
+|---|---|---|---|
+| HIGH — FIXED IN AUDIT HARNESS | `scripts/live_evidence_gate1.py` omitted Collector lookback from sanitized child env | Initial 500-backlog mislabeled near-tip; stale data | Forward and attest validated 30/20 setting; negative test green; confirmed in run 3 |
+| HIGH — STILL OPEN | Natural Focus READY 3/3 and fresh Book PASS not witnessed | Paper/E2E readiness not proven | Continue a controlled, persistent passive session to natural READY; record exact binding/quote age |
+| HIGH — STILL OPEN | `scripts/learning_queue.py` LOW-only exclusion; no forward executable CLOB history | Cannot estimate unbiased A/B/C net advantage | Add independent passive full-universe + timed bid/ask observer, no trading authority |
+| MEDIUM — MONITOR | Gamma fallback 813 lookups, 141.98s cumulative in 300s near-tip | Performance sensitivity and rate-limit risk | Observe p95/latency/caching only if lag/throughput deteriorates; no premature refactor |
+| MEDIUM — OPEN | `dashboard.py` reads legacy `paper_trades.json` vs authoritative `paper_state.json`; historical F3 event-journal crash gap, F4 limited dedup | Future Paper P&L evidence may be wrong | Direct authoritative state reconciliation before any claimed E2E P&L |
+| MEDIUM — LIMIT | Public GitHub runner with dRPC and Ubuntu3.11, not user Linux/QuickNode; V3 unsupported | External generalizability incomplete | Short identical user-host isolated replay after independent approval |
 
-```bash
-cd ~/PolymarketResearch
-git fetch origin audit/general1-live-evidence-gate1-20261028
-git worktree add --detach "$HOME/PolymarketResearch-livegate-1" FETCH_HEAD
-cd "$HOME/PolymarketResearch-livegate-1"
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python scripts/live_evidence_gate1.py --run-seconds 300 --env-file "$HOME/PolymarketResearch/.env" > "$HOME/general1_livegate_result.json"
-```
+One initial short Collector abort did not repeat in either 300-second run. Its error detail was not in the original sanitized artifact; root cause is **unproven**. Do not attribute it to Gamma, exchange identity or RPC without evidence.
 
-The separate worktree must not contain prior `data/`; this is enforced. If the originating repo is at a different path, adapt the two `~/PolymarketResearch` occurrences. If your Polygon RPC is *already in the calling process's environment*, the `--env-file` option may be omitted. The tool only reads that one setting from the file and never copies `.env` to the sandbox.
+## F. Binding gate decisions
 
-- This starts public read-only Polygon/Gamma/CLOB collection and the seven allowlisted observational workers, writing **only under the fresh worktree's data/**. No Paper, Telegram, real orders or automatic requests are started.
-- The `> "$HOME/general1_livegate_result.json"` file contains only sanitized counters and clock/head/checkpoint metrics. The same output is saved inside the sandbox as `data/livegate_sanitized_report.json`. **Only provide this sanitized JSON back**, never the raw sandbox logs or databases.
-- To check *existing* local data, use the READ-ONLY original audit: `python3 scripts/quant_validation1.py --data-dir /path/to/existing/data` (output contains local path and possibly user-selected P&L, so review/redact that output before sharing); alternatively the sanitized `live_evidence_gate1.py --data-dir /path/to/existing/data`.
-- The 300s wall-time and performance are estimates only for user-controlled sandbox; no result or LIVE PASS is implied until reviewed.
+| Gate | Decision | Rationale |
+|---|---|---|
+| **COLLECTOR LIVE** | **PASS — bounded near-tip smoke only** | 300s uninterrupted, >chain block rate, decreasing lag, 0 unexpected exits |
+| **PIPELINE E2E** | **INCONCLUSIVE** | Natural Risk PASS→Focus WAIT 2/3 verified; no READY→Book PASS→Paper |
+| **NATURAL FOCUS READY** | **NOT OBSERVED IN WINDOW** | Focus was progressing through natural LOCKED and WAIT states |
+| **PAPER TEST READINESS** | **NO-GO for now** | No natural READY, no Book PASS, unmerged candidate integration reviews and local target-runtime gate remain |
+| **QUANT VALIDATION READINESS** | **BLOCKED** | Missing unbiased control population and future executable quote history |
+| **REAL-MONEY READINESS** | **NO-GO** | No calibrated positive net expectancy or live trading authorization |
 
-**Next decision after sanitized report:** a) identify if Collector catches up and all services stay alive; b) if no, fix the single dominant bottleneck; c) if yes, schedule a longer naturally sampled READY/quote and full-universe shadow observation. Do not automatically approve Paper or change strategy thresholds.
+## G. No-more-than-three next actions
+
+1. **Observe Focus 2/3→3/3 naturally and fresh identity-bound Book PASS** in a persistent user-authorized isolated data-only runtime. Keep existing Evidence, Risk and Focus gates. A new ephemeral GitHub run starts fresh; it cannot resume the previously locked Focus state, so prefer a persistent sandbox when practical.
+2. **Independently review PR #52 integration** against its #48→#49→#50 stack and alternative #51; consolidate only with explicit user approval. Verify Linux/Python3.14 or Windows target runtime; no automatic Paper action or main merge without approval.
+3. **Introduce a separate passive full-market/quote research recorder**, after runtime observability is established, for a preregistered A (Diamond), B (simple Flow), C (matched no-signal) executable net markout test.
+
+**Executive conclusion:** The engine has passed a real 300s near-tip Collector/Flow/Risk/Focus observation and produces authentic Diamonds and evidence-driven Focus WAIT states. It is **not** yet a verified profitable quantitative strategy or a fully proven paper-trading system. Stop feature expansion until natural READY/Book and economic controls are measured.
