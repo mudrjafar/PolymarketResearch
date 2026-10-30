@@ -1,37 +1,29 @@
-# GENERAL1 — Quantitative Observation Readiness (30 October 2026)
+# GENERAL1 — Quantitative Data Readiness · 30 October 2026
 
-**Research classification: BLOCKED; STRATEGIC EDGE: INCONCLUSIVE.**
+**Readiness: BLOCKED. Strategic edge: INCONCLUSIVE.** However, the technical collection prerequisites improved materially.
 
-## What is actually measurable
+## Now established by real 300-second near-tip data
 
-The isolated 300.04s public live catch-up run [41067595593](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41067595593) produced 220 durable blocks, 6,532 normalized legacy CTF trades from 772 distinct market conditions, 554 tracked Flow tokens, and 7,893 Learning signal-generation observations with corresponding Risk BLOCK decisions. It did **not** produce verified Flow, a Diamond, Risk PASS, natural Focus READY, Book PASS or any Paper trade. All 539 latest Diamond observations were `DATA_RISK`. Reason-code histograms count overlapping causes, not independent rejected candidates.
+[Actions 41068606756](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41068606756) demonstrated 5,619 actual stored CTF fills over 227 blocks and 787 conditions, 950 Flow tokens (11 verified), 13 latest DIAMOND, 11 latest Risk PASS, and a naturally progressing Focus LOCKED→WAIT 1/3→WAIT 2/3. Therefore this engine is no longer merely an offline indicator: the real pipeline has progressed to Focus 2/3. Collector 0.8006 blocks/s versus 0.6684 Polygon, lag60→24 with no unexpected worker exits.
 
-The runner accidentally used the 500-block default lookback and finished 500 blocks behind the head. These market observations are real but cannot be treated as near-tip actionable signal evidence. A corrected 30-block test is tracked separately.
+**Not yet observed:** Focus READY 3/3, Book PASS with executable quotes, user Paper OPEN/EXIT, settled profits or any out-of-sample net predictive uplift.
 
-## Why an A/B/C performance test cannot yet be run
+## Deficiencies that still prohibit an A/B/C trading backtest
 
-- Learning's `scripts/learning_queue.py` excludes LOW-only generations. A no-signal eligible market denominator is absent: **selection bias**.
-- A) Full Diamond/Focus READY observations: **zero during this 500-block catch-up run**.
-- B) Simple independent BUY-flow baseline: possible to define but must be evaluated on the same full predeclared market universe, which is unavailable in Learning.
-- C) Matched no-signal baseline: no unbiased at-risk control population.
-- Book snapshots: no time-indexed full two-sided depth for matched non-signals or 5/15/60min price markouts; the engine's `Book PASS` is not net-EV proof.
-- No platform-validated executable quote age, fees at actual ask/bid depth, matched expiry/price categories or outcome settlement series in a usable prospective sample.
-- Paper P&L: no automatic Paper worker was started, and separately selected manual trades are not an unbiased test.
+1. The Learning queue excludes LOW-only generations; no unbiased, predeclared at-risk non-signal **C** denominator (selection bias).
+2. Repeated generation snapshots cannot count as independent trials. Run 3 Learning had 7,518 signal observations with 113 PASS, not 113 independent market opportunities.
+3. No systematic two-sided executable CLOB bid/ask/depth history on the same candidate and control population at signal/LOCK/READY and 5/15/60 minutes.
+4. Missing synchronized source-event, receipt and decision timestamp lineage on all controls plus explicit expiry/category/price strata, fees, exit costs, and final settlement.
+5. No natural READY or Book PASS occurred in this bounded run. Stale/illiquid quotes must be marked unobserved, not zero P&L.
 
-**No hit-rate, win-rate, uplift, realized expected return, MFE/MAE, Brier score, Sharpe or calibration estimate may be claimed from this sample.**
+## Required prospective, read-only validation
 
-## Minimal preregistered validation when near-tip viability is established
+A: current immutable Full Diamond+Risk PASS+natural Focus READY pipeline.
 
-A = first naturally eligible Full Diamond+Risk PASS+Focus READY (record first seen/LOCK/READY separately).
+B: fixed non-optimized BUY momentum using 5m/15m net flow, measured at its own available decision time.
 
-B = fixed rule on 5m/15m net BUY Flow using only information available at decision time and the same condition/token universe.
+C: predeclared at-risk market times with no signal, matched on category, price decile, liquidity, time-to-expiry and clock time. Include LOW and rejected candidates; otherwise C is biased.
 
-C = predeclared at-risk market times without signal, matched by event category, price decile, market expiry band, orderbook liquidity and calendar time.
+Collect *observational* bid/ask depth, fees and outcome metadata with immutable as-of and receipt times. Simulate only hypothetical matched VWAP entry at ask and exit at future bid, including fees and no-fill reporting. Compute market/event-clustered CIs, 5/15/60m net markouts, MFE/MAE and settlement calibration only after sample availability. Use chronological held-out evaluation. Do not tune live Risk/Focus based on the test set.
 
-Collect non-signals, rejected candidates, provenance and exchange-source timestamps at all relevant cycles. Save separate bid/ask/depth snapshots at signal, LOCK, READY, 5/15/60 minutes and resolution. Calculate hypothetical net orderbook VWAP entry vs future executable bid minus fee; report no-fill and missing-book censoring transparently. Use market/event-clustered uncertainty and a chronological holdout, never random splitting overlapping repeated-generation observations.
-
-## Scope of the next implementation
-
-The Live Evidence Gate branch deliberately adds **no new trading model, Signal threshold or Risk/Focus bypass**. If the near-tip run proves viable, the next narrow branch should implement a **passive full at-risk universe plus sampled, two-sided CLOB quote recorder**. The recorder must not call any paper/order/open action or modify Decision authority. Historical performance cannot be reconstructed from only the last-trade price.
-
-**Current decision:** QUANT VALIDATION READINESS = BLOCKED; REAL MONEY = NO-GO.
+**Next narrow engineering scope:** Passive complete-market plus scheduled executable quote recorder, after natural READY and Book coverage is characterized. No changes to Decision authority, no autonomous Paper or real-money orders.
