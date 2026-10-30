@@ -1,31 +1,43 @@
-# GENERAL1 COLLECTOR LIVE EVIDENCE
+# GENERAL1 — Collector Live Evidence (30 October 2026)
 
-**Status:** NOT EXECUTED IN THIS SESSION / INCONCLUSIVE.
+## Scope and provenance
 
-The current working environment has no GitHub clone at a local filesystem path and no `POLYMARKET_RPC_URL` setting. GitHub connector can inspect code and CI but cannot run the user's Linux host or access its local private RPC. A 300-second run was therefore NOT claimed.
+Two completed independent **real Polygon public-data observations** took place on ephemeral GitHub Actions Ubuntu/Python 3.11 runners. They used the public RPC provider `polygon.drpc.org`, a standalone empty worktree, 20 confirmation blocks, and exclusively public reads. No Paper worker, Telegram, real-money order or private credentials were used. The two live runs mistakenly retained the Collector's default **500-block lookback**, because the sandbox launcher did not forward the `COLLECTOR_INITIAL_LOOKBACK_BLOCKS=30` environment setting. This launcher defect has been fixed on the audit branch and regression-tested (CI 566 full tests + 61 subtests, 17 targeted tests).
 
-## Actual new implementation
+**Crucial distinction:** Results below measure *catch-up from a large backlog*, not the intended 30-block near-tip startup.
 
-- `scripts/live_evidence_gate1.py --run-seconds 300 --env-file ...` starts a **fixed allowlist only**: collector, flow, diamond, risk, focus, book, learning.
-- Explicitly does not start `paper_worker.py`, `telegram_bot.py`, the supervisor or any wallet/real-money execution.
-- Refuses startup unless `BASE.name` contains `livegate` **and** its local `data/` is empty/absent.
-- Reads Polygon chain ID 137 and head via the configured HTTPS RPC; never reports or stores the RPC URL in sanitized output; it parses only `POLYMARKET_RPC_URL` from an optional .env text file.
-- Samples chain head and durable Collector checkpoint up to every 15 seconds; captures sample lag, trade counts, chain and collector block rates, stages, and process exits.
-- Stores raw process logs **locally**, not for sharing, at `data/livegate_logs/`; saves only aggregated counts and reason codes to `data/livegate_sanitized_report.json`.
-- The result is not an automatic PASS: inspect source identity, exit codes, lag trend and logs before any trading gate approval.
+## Run 1 — aborted after 75.50 seconds
 
-## Verifiable predecessor evidence — separate legacy run
+- [GitHub Actions 41066783110](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41066783110), head `6d6cb9e7e56d9bdd2ea020e77a22c7355307cf17`.
+- 15 durable blocks; 281 trades; 82 distinct conditions.
+- Collector rate **0.2488 blocks/s**, chain **0.6799 blocks/s**; measured lag **529 → 555** (+26).
+- Collector unexpectedly exited; LIVE-1C emitted 3 successful batches and 1 `FATAL_FAILURE`. Exact error reason is not contained in that earlier sanitized artifact.
+- 105 Gamma fallback lookup observations; cumulative lookup time ~28.08 seconds; 0 RPC retries.
+- Only `CTF_TOKEN` trades persisted; no V3 POSITION trades.
+- Flow 98 tokens, 0 verified; all 98 current Diamond classes `DATA_RISK`; Risk PASS 0; natural READY 0; Book PASS 0.
 
-PR #43 `GENERAL1_E2E2_PRELIVE_REPORT.md` records a previous 815.03s Windows experiment: 225 blocks, 5,870 trades, collector 0.276 blocks/s vs chain 0.667 blocks/s, lag 521→630, 6 collector restarts. That particular system did not catch up. Later offline changes might address bottlenecks, but have not been proven by this new run.
+**Decision:** FAIL for this observed run; no systemic failure rate inferred from one short sample.
 
-## Exact local follow-up
+## Run 2 — completed full 300.04 seconds
 
-A fresh Git worktree and a user-owned valid Polygon RPC are required. See the step-by-step commands in `GENERAL1_LIVE_EVIDENCE_FINAL_DECISION.md`. No live numbers exist for this audit yet.
+- [GitHub Actions 41067595593](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41067595593), head `ac970b6feba08ede99a6c2ef33c0f542f6849268`.
+- 220 durable blocks; 6,532 trades; 772 distinct market conditions; `CTF_TOKEN` only.
+- Collector rate **0.7721 blocks/s**, chain rate **0.6654 blocks/s**; measured lag **529 → 500** (improved by 29).
+- **44 successful Collector batches, no fatal failures and no unexpected worker exits**.
+- **440** RPC calls, 0 retries; 17,899 raw log entries inspected; 6,532 persisted normalized trades (other logs are not all persisted fills).
+- **862 Gamma fallback observations**, 179.36 cumulative lookup seconds. Classification: **831 ACTIVE_OPEN**, **31 CLOSED_INACTIVE_HISTORICAL**, **0 classified lookup failures**. A fallback cache miss is NOT automatically a metadata resolution failure.
+- 74 unsupported V3 events logged, 0 V3 POSITION records committed. V3 coverage therefore cannot be inferred from legacy CTF counts.
+- Current Flow: 554 tokens, 0 verified; latest Diamond: 539 `DATA_RISK` classes; Risk: 0 PASS / 539 blocked; Focus IDLE/0 READY; Book not ready; zero Paper starts.
+- Learning database: 7,893 historical *generation observations* and 7,893 BLOCK decisions in this sandbox; these are NOT independent markets and must not be interpreted as 7,893 unique trades.
 
-## Assessment to apply to actual resulting JSON
+**Decision:** PASS for a *bounded 300s uninterrupted throughput smoke test while catching up*; **NOT** a near-tip PASS or economically usable signal pipeline. Even after rate > chain for this window, 500 blocks of backlog remained and all downstream trade-age gates remained blocked.
 
-- Track `lag_first`, `lag_last`, `lag_delta`, head/collector rates, and `unexpected_exits`.
-- If collector is behind, demand catch-up rate > chain rate and decreasing lag. Stationary tip operation demands stable, reasonably low lag instead.
-- For block identity, use the unchanged Collector durable checkpoint and canonical `tx_hash+log_index` primary key, but counts alone **do not** prove end-to-end chain completeness or correct identity.
-- `CTF_TOKEN` versus `POSITION` are research protocol groups, not a blanket guarantee Paper execution support. V3 Protocol V2 settlement remains excluded by existing gates.
-- A 300s time box is a runtime smoke gate, NOT sufficient on its own for signal return statistics or reliability guarantees.
+## Root cause discovery
+
+The intended `COLLECTOR_INITIAL_LOOKBACK_BLOCKS=30` was set in workflow YAML but was absent from the isolated child-process environment whitelist in `scripts/live_evidence_gate1.py`. The ~529-block initial head/checkpoint lag agrees with the untouched 500-block fallback plus confirmations/startup. The launcher now validates and forwards the collector's lookback, confirmation depth and optional batching switch, and records those settings in the sanitized report. This does NOT change the Collector's default or any trading/risk threshold.
+
+## Next evidence
+
+A third isolated public observation with *actual 30-block lookback*, expected in [near-tip GitHub Actions 41068606756](https://github.com/mudrjafar/PolymarketResearch/actions/runs/41068606756), is a separate experiment; do not combine its sample counts with 500-block catch-up runs. Results must be added only after the completed exact-HEAD artifact is read and validated.
+
+**Provisional Collector verdict: CONDITIONAL.** It demonstrated sustained above-chain throughput under one public-provider configuration but has not yet established near-tip fresh-signal coverage, fail-free repeatability or equivalence to the user's own Linux/QuickNode environment. Real-money and automatic Paper permissions remain NO-GO.
