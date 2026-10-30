@@ -187,12 +187,30 @@ def _collector_diagnostics(path):
     """Aggregate canonical LIVE-1C batch records; never return raw log content."""
     counts = Counter()
     totals = Counter()
+    stop_reasons = Counter()
+    gamma_categories = Counter()
     if not path.is_file():
         return {"status": "NO_LOG"}
     with path.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
             if "[COLLECTOR] RETRYABLE_BATCH" in line:
                 counts["RETRYABLE_LOG_LINE"] += 1
+            if "[COLLECTOR] Storage/chain history conflict:" in line:
+                reason = line.split("Storage/chain history conflict:", 1)[-1]
+                if "Gamma" in reason:
+                    stop_reasons["GAMMA_IDENTITY_OR_METADATA_CONFLICT"] += 1
+                elif "V3 Data API" in reason or "V3 position" in reason:
+                    stop_reasons["V3_IDENTITY_OR_METADATA_CONFLICT"] += 1
+                elif "Block range" in reason or "Checkpoint" in reason:
+                    stop_reasons["CHAIN_CHECKPOINT_OR_REORG_CONFLICT"] += 1
+                elif "RPC" in reason or "Log does not" in reason:
+                    stop_reasons["RPC_LOG_INTEGRITY_CONFLICT"] += 1
+                else:
+                    stop_reasons["OTHER_STORAGE_CONFLICT"] += 1
+            if "[COLLECTOR] Fatal configuration:" in line:
+                stop_reasons["FATAL_CONFIGURATION"] += 1
+            if "[COLLECTOR] Stopped safely (" in line:
+                stop_reasons["UNHANDLED_EXCEPTION_CLASS"] += 1
             if "[LIVE-1C] " not in line:
                 continue
             try:
@@ -210,14 +228,28 @@ def _collector_diagnostics(path):
                     value = row.get(key)
                     if isinstance(value, (float, int)) and not isinstance(value, bool):
                         totals[key] += value
-                totals["gamma_miss_count"] += len(row.get("gamma_misses") or [])
+                misses = row.get("gamma_misses") or []
+                totals["gamma_miss_count"] += len(misses)
+                for miss in misses:
+                    if not isinstance(miss, dict):
+                        continue
+                    success = miss.get("lookup_succeeded")
+                    kind = miss.get("market_classification")
+                    if success is False:
+                        gamma_categories["LOOKUP_FAILED"] += 1
+                    elif success is True and kind in ("ACTIVE_OPEN", "CLOSED_INACTIVE_HISTORICAL"):
+                        gamma_categories[kind] += 1
+                    else:
+                        gamma_categories["UNCLASSIFIED"] += 1
                 if isinstance(row.get("outer_retries"), int):
                     totals["max_outer_retry_streak"] = max(
                         totals["max_outer_retry_streak"], row["outer_retries"])
             except (ValueError, TypeError, IndexError):
                 counts["MALFORMED_DIAGNOSTIC"] += 1
     return {"status": "PARSED", "batch_statuses": dict(sorted(counts.items())),
-            "total_metrics": dict(sorted(totals.items()))}
+            "total_metrics": dict(sorted(totals.items())),
+            "fatal_reason_classes": dict(sorted(stop_reasons.items())),
+            "gamma_lookup_categories": dict(sorted(gamma_categories.items()))}
 
 
 def _env_rpc(env_file):
